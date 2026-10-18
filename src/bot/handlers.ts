@@ -1847,8 +1847,6 @@ New launches will appear here the instant they hit the chain.`, { parse_mode: "M
   }
   await ctx.reply(`🟡 *Fresh Deployments — ${deployments.length} new on Elysium*
 _🔍 scanned last ${depth} blocks · tap an address to copy · 🛡️ Safety or 📄 Card to inspect_`, { parse_mode: "Markdown" });
-  const top = C_YBOX.repeat(12);
-  const botLine = C_YBOX.repeat(12);
   const list = deployments.slice(0, 5);
   for (let i = 0; i < list.length; i++) {
     const d = list[i];
@@ -1864,23 +1862,20 @@ _🔍 scanned last ${depth} blocks · tap an address to copy · 🛡️ Safety o
     const idx = `${i + 1}/${list.length}`;
     const age = formatAge(d.ageSeconds);
     const kindIcon = kind === "token" ? "🪙" : kind === "nft" ? "🖼️" : "📄";
-    let block = `${top}
+    let block = `${kindIcon}  ${label}   ·   \`${idx}\`
 `;
-    block += `${C_YBOX}  ${kindIcon}  ${label}   ·   \`${idx}\`
+    if (description) block += `_${description}_
 `;
-    if (description) block += `${C_YBOX}  _${description}_
+    block += `\n`;
+    block += `📄 \`${d.address}\`
 `;
-    block += `${C_YBOX}
+    block += `👤 by \`${d.deployer}\`
 `;
-    block += `${C_YBOX}  📄 \`${d.address}\`
+    block += `🧱 block \`${d.blockNumber}\`  ·  ⏱ ${age}
 `;
-    block += `${C_YBOX}  👤 by \`${d.deployer}\`
+    block += `🔗 [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash})  ·  [address](${ELYSIUM.explorerUrl}/address/${d.address})
 `;
-    block += `${C_YBOX}  🧱 block \`${d.blockNumber}\`  ·  ⏱ ${age}
-`;
-    block += `${C_YBOX}  🔗 [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash})  ·  [address](${ELYSIUM.explorerUrl}/address/${d.address})
-`;
-    block += `${botLine}`;
+    block += `┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈`;
     const kb = new InlineKeyboard()
       .text(`🛡️ Safety  ${shortAddr(d.address)}`, `tok_safety_${d.address}`)
       .row()
