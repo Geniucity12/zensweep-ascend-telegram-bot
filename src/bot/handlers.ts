@@ -25,6 +25,20 @@ import {
 } from "./keyboards";
 import { formatEther, parseEther, parseUnits, type Address, type Hex } from "viem";
 
+// -- Zensweep theme: green=good, yellow=caution, red=bad --
+const C_GREEN = "🟢";
+const C_YELLOW = "🟡";
+const C_RED = "🔴";
+const C_YBOX = "🟨";
+function formatAge(s: number | null): string {
+  if (s == null) return "—";
+  if (s < 60) return Math.max(1, Math.round(s)) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return (s / 3600).toFixed(1) + "h ago";
+  return (s / 86400).toFixed(1) + "d ago";
+}
+function shortAddr(a: string): string { return a.slice(0, 6) + "…" + a.slice(-4); }
+
 // In-memory conversation state for multi-step prompts
 const userStates: Record<number, { step: string; data?: any }> = {};
 
@@ -37,7 +51,7 @@ export function registerHandlers(bot: Bot) {
     const chain = user?.selected_chain || DEFAULT_CHAIN_KEY;
     const chainConfig = getChainConfig(chain);
 
-    let message = `🚀 *Zensweep — Ascend & Elysium Launch Assistant*\n\n`;
+    let message = `🟢 *Zensweep — Ascend & Elysium Launch Assistant*\n\n`;
     message += `🌐 *Active Chain:* \`${chainConfig.name}\`\n`;
     message += `🧭 *Focus:* live Elysium launch tracking, mint-window countdowns, on-chain deployment and wallet monitoring for Ascend launches.\n\n`;
 
@@ -48,7 +62,7 @@ export function registerHandlers(bot: Bot) {
       message += `Use Zensweep to monitor launches, stay on top of launch status, and manage your wallet.`;
       await ctx.reply(message, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     } else {
-      message += `⚠️ *No wallet connected yet.*\n\nCreate a server-managed wallet to get started. Your signing key stays on-host and never leaves the bot server.`;
+      message += `🔴 *No wallet connected yet.*\n\nCreate a server-managed wallet to get started. Your signing key stays on-host and never leaves the bot server.`;
       await ctx.reply(message, { parse_mode: "Markdown", reply_markup: noWalletKeyboard });
     }
   });
@@ -298,7 +312,7 @@ export function registerHandlers(bot: Bot) {
     const chain = user?.selected_chain || DEFAULT_CHAIN_KEY;
     const chainConfig = getChainConfig(chain);
 
-    let message = `🚀 *Zensweep — Ascend & Elysium Launch Assistant*\n\n`;
+    let message = `🟢 *Zensweep — Ascend & Elysium Launch Assistant*\n\n`;
     message += `🌐 *Active Chain:* \`${chainConfig.name}\`\n`;
 
     if (user) {
@@ -308,7 +322,7 @@ export function registerHandlers(bot: Bot) {
       message += `Select an option:`;
       await ctx.editMessageText(message, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     } else {
-      message += `⚠️ *No wallet connected.*`;
+      message += `🔴 *No wallet connected.*`;
       await ctx.editMessageText(message, { parse_mode: "Markdown", reply_markup: noWalletKeyboard });
     }
   });
@@ -1185,7 +1199,7 @@ async function renderWalletMenu(ctx: Context, forceRefresh: boolean = false) {
 
   const user = dbService.getUser(userId);
   if (!user) {
-    await ctx.reply(`⚠️ No wallet connected. Generate or import one below:`, {
+    await ctx.reply(`🔴 *No wallet yet.* Generate or import one below:`, {
       reply_markup: noWalletKeyboard,
     });
     return;
@@ -1195,8 +1209,8 @@ async function renderWalletMenu(ctx: Context, forceRefresh: boolean = false) {
   const chainConfig = getChainConfig(chain);
   const balance = await walletManager.getBalance(user.wallet_address as Address, chain, forceRefresh);
 
-  let msg = `💳 *Your Trading Wallet*\n\n`;
-  msg += `🌐 *Current Chain:* \`${chainConfig.name}\`\n`;
+  let msg = `🟢 *Your Trading Wallet* — Elysium\n\n`;
+  msg += `🌐 *Chain:* \`${chainConfig.name}\`\n`;
   msg += `📫 *Address:* \`${user.wallet_address}\`\n`;
   msg += `💰 *Balance:* \`${balance.eth} ${balance.symbol}\`\n\n`;
   msg += `This is a server-managed wallet; its signing key stays on the bot host.\n`;
@@ -1720,9 +1734,9 @@ async function renderLaunchMenu(ctx: Context) {
     const projects = await fetchLaunchProjects();
     const liveCount = projects.filter((pr) => pr.status === "live" || pr.status === "minting").length;
     if (liveCount > 0) {
-      msg = `🚀 *Zensweep Projects — Launchboard*\n_Live now: ${liveCount} / ${projects.length}_ • source: built-in references (pre-launch)\n_Watches Elysium for real projects when they go live — for on-chain truth use 🆕 Deployments._\n\n`;
+      msg = `🟢 *Zensweep Projects — Launchboard*\n_Live now: ${liveCount} / ${projects.length}_ • source: built-in references (pre-launch)\n_Watches Elysium for real projects when they go live — for on-chain truth use 🆕 Deployments._\n\n`;
     } else {
-      msg = `🚀 *Zensweep Projects — Launchboard*\n_Built-in ecosystem references (pre-launch) • ${projects.length} entries_\n`;
+      msg = `🟢 *Zensweep Projects — Launchboard*\n_Built-in ecosystem references (pre-launch) • ${projects.length} entries_\n`;
       if (apiUrl) {
         msg += `_Source: launch API • ${projects.length} tracked projects_\n\n`;
       } else {
@@ -1768,7 +1782,7 @@ async function renderMintsMenu(ctx: Context) {
     return rank(a) - rank(b);
   });
 
-  let msg = `⏳ *Mint Windows*\n\n`;
+  let msg = `🟡 *Mint Windows*\n\n`;
   for (const p of ranked) {
     const emoji = getMintWindowState(p, now) === "live_now" ? "⏳" : getMintWindowState(p, now) === "opens_soon" ? "⏰" : "📅";
     msg += `${emoji} *${p.name}* — ${getLaunchStatusLabel(p.status)}\n`;
@@ -1787,13 +1801,13 @@ async function renderElysiumMenu(ctx: Context) {
     health = await getChainHealth(ELYSIUM.key);
   } catch (err) {
     await ctx.reply(
-      `⛓ *Elysium Live*\n\n⚠️ Could not reach the Elysium RPC right now. Try again in a moment.`,
+      `🔴 *Elysium Live*\n\n🔴️ Could not reach the Elysium RPC right now. Try again in a moment.`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
     return;
   }
 
-  let msg = `⛓ *Elysium Live* — ${health.chainName}\n\n`;
+  let msg = `🟢 *Elysium Live* — ${health.chainName}\n\n`;
   msg += `🧱 Block: \`${health.blockNumber}\`\n`;
   msg += `⛽ Gas: \`${health.gasPriceGwei} gwei\`\n`;
   msg += `⚡ Block time: \`${health.blockTimeSeconds !== null ? `${health.blockTimeSeconds.toFixed(2)}s measured` : "n/a"}\`\n`;
@@ -1809,55 +1823,79 @@ async function renderElysiumMenu(ctx: Context) {
 }
 
 async function renderDeploymentsMenu(ctx: Context, depth: number = 40) {
-  await ctx.reply(`🔍 Scanning Elysium for fresh contract deployments…`, { parse_mode: "Markdown" });
+  await ctx.reply(`🟡 *Scanning Elysium — hunting fresh deployments…*`, { parse_mode: "Markdown" });
   let deployments;
   try {
     deployments = await scanRecentDeployments(depth, ELYSIUM.key);
   } catch (err: any) {
-    await ctx.reply(`⚠️ Deployment scan failed: ${err?.message ?? "RPC unreachable"}`, {
+    await ctx.reply(`🔴 *Scan failed*
+
+⚠️ \`${(err?.message ?? "RPC unreachable").replace(/`/g, "'")}\`
+
+Try again in a moment.`, {
       parse_mode: "Markdown",
       reply_markup: mainKeyboard,
     });
     return;
   }
-
   if (deployments.length === 0) {
-    await ctx.reply(
-      `🆕 *Fresh Deployments*\n\nNo new contract deployments found in the last ${depth} Elysium blocks. New launches appearing on-chain will show up here.`,
-      { parse_mode: "Markdown", reply_markup: mainKeyboard }
-    );
+    await ctx.reply(`🟡 *Fresh Deployments*
+
+No new contracts in the last ${depth} blocks.
+New launches will appear here the instant they hit the chain.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     return;
   }
-
-  let msg = `🆕 *Fresh Deployments* — ${deployments.length} new on Elysium\n\n`;
-  msg += `_Tap any address to copy it. Tap 🛡️ Safety or 📄 Card to inspect._\n\n`;
-  const kb = new InlineKeyboard();
-  for (const d of deployments.slice(0, 5)) {
+  await ctx.reply(`🟡 *Fresh Deployments — ${deployments.length} new on Elysium*
+_🔍 scanned last ${depth} blocks · tap an address to copy · 🛡️ Safety or 📄 Card to inspect_`, { parse_mode: "Markdown" });
+  const top = C_YBOX.repeat(12);
+  const botLine = C_YBOX.repeat(12);
+  const list = deployments.slice(0, 5);
+  for (let i = 0; i < list.length; i++) {
+    const d = list[i];
     let label = "📄 Contract";
     let description: string | null = null;
+    let kind: string = "contract";
     try {
       const meta = await getDeploymentMeta(d.address, ELYSIUM.key);
       label = meta.label;
       description = (meta as any).description ?? null;
-    } catch { /* keep default */ }
-    const name = label.replace(/^[^\s]+\s/, "");
-    msg += `${label}\n`;
-    if (description) msg += `  _${description}_\n`;
-    msg += `\`${d.address}\`\n`;
-    msg += `  by \`${d.deployer}\` • block ${d.blockNumber}\n`;
-    msg += `  [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash}) • [address](${ELYSIUM.explorerUrl}/address/${d.address})\n`;
-    msg += `────────────────────\n\n`;
-    kb.text(`🛡️ ${name.slice(0, 24)}`, `tok_safety_${d.address}`).row();
-    kb.text(`📄 Card`, `tok_card_${d.address}`)
+      kind = (meta as any).kind ?? "contract";
+    } catch {}
+    const idx = `${i + 1}/${list.length}`;
+    const age = formatAge(d.ageSeconds);
+    const kindIcon = kind === "token" ? "🪙" : kind === "nft" ? "🖼️" : "📄";
+    let block = `${top}
+`;
+    block += `${C_YBOX}  ${kindIcon}  ${label}   ·   \`${idx}\`
+`;
+    if (description) block += `${C_YBOX}  _${description}_
+`;
+    block += `${C_YBOX}
+`;
+    block += `${C_YBOX}  📄 \`${d.address}\`
+`;
+    block += `${C_YBOX}  👤 by \`${d.deployer}\`
+`;
+    block += `${C_YBOX}  🧱 block \`${d.blockNumber}\`  ·  ⏱ ${age}
+`;
+    block += `${C_YBOX}  🔗 [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash})  ·  [address](${ELYSIUM.explorerUrl}/address/${d.address})
+`;
+    block += `${botLine}`;
+    const kb = new InlineKeyboard()
+      .text(`🛡️ Safety  ${shortAddr(d.address)}`, `tok_safety_${d.address}`)
+      .row()
+      .text(`📄 Card`, `tok_card_${d.address}`)
       .text(`👀 Watch`, `watch_add_${d.address}`)
       .row();
+    try { await ctx.reply(block, { parse_mode: "Markdown", reply_markup: kb }); }
+    catch { const plain = block.replace(/[`*_]/g, ""); await ctx.reply(plain, { reply_markup: kb }); }
   }
-  msg += `\n🔔 Auto-alerts: \`/mutedeploys\` stops these, \`/unmutedeploys\` turns them back on.`;
-  kb.text("🔔 Deployment Alerts: ON", "deploy_alert_toggle")
+  const footerKb = new InlineKeyboard()
+    .text("🟢 Alerts: ON", "deploy_alert_toggle")
     .text("🔕 Mute", "deploy_alert_toggle_off")
     .row()
     .text("🔙 Main Menu", "menu_main");
-  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+  await ctx.reply(`🟡 _Tip: \`/mutedeploys\` mutes auto-DMs · \`/unmutedeploys\` back on. Fresh blocks every ~0.2s_`, { parse_mode: "Markdown", reply_markup: footerKb });
 }
 
 async function renderWatchlistMenu(ctx: Context) {
@@ -1873,7 +1911,7 @@ async function renderWatchlistMenu(ctx: Context) {
     return;
   }
 
-  let msg = `👀 *Watchlist* — ${watches.length} tracked\n\n`;
+  let msg = `🟡 *Watchlist* — ${watches.length} tracked\n\n`;
   const kb = new InlineKeyboard();
   for (const w of watches) {
     const cfg = getChainConfig(w.chain);
@@ -2008,7 +2046,7 @@ async function renderAlertsMenu(ctx: Context) {
   const projects = await fetchLaunchProjects();
   const alertProjects = projects.filter((project) => project.status === "live" || project.status === "minting");
 
-  let msg = `🔔 *Zensweep Alerts*\n\n`;
+  let msg = `🟡 *Zensweep Alerts*\n\n`;
   const deployOn = dbService.isDeployAlertsEnabled(ctx.from?.id ?? 0);
   msg += `🆕 Deployment auto-alerts: ${deployOn ? "🔔 *ON* — you'll be DMed new contract drops" : "🔕 *MUTED* — no deployment DMs"}\n`;
   msg += `${deployOn ? "Tap 🔕 Mute below to stop." : "Tap 🔔 Unmute below to re-enable."}\n\n`;
@@ -2040,16 +2078,16 @@ async function renderStatusMenu(ctx: Context) {
   const chain = user?.selected_chain || DEFAULT_CHAIN_KEY;
   const chainConfig = getChainConfig(chain);
 
-  let healthLine = "chain unreachable";
+  let healthLine = "🔴 chain unreachable";
   try {
     const h = await getChainHealth(ELYSIUM.key);
-    healthLine = `block \`${h.blockNumber}\` • gas \`${h.gasPriceGwei} gwei\``;
+    healthLine = `🟢 block \`${h.blockNumber}\` • gas \`${h.gasPriceGwei} gwei\``;
   } catch {
     // keep fallback
   }
   const watches = userId ? dbService.getUserWatches(userId).length : 0;
 
-  let msg = `📊 *Zensweep Status*\n\n`;
+  let msg = `🟢 *Zensweep Status*\n\n`;
   msg += `🌐 Active network: \`${chainConfig.name}\`\n`;
   msg += `⛓ Elysium live: ${healthLine}\n`;
   msg += `🔐 Wallet status: ${user ? "connected" : "not connected"}\n`;
@@ -2292,10 +2330,10 @@ async function renderPortfolioMenu(ctx: Context) {
   if (!userId) return;
   const pos = dbService.getPositions(userId);
   if (pos.length === 0) {
-    await ctx.reply(`📊 *Portfolio*\n\nNo positions yet. Paste a token and buy to start.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+    await ctx.reply(`🟢 *Portfolio*\n\nNo positions yet. Paste a token and buy to start.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     return;
   }
-  let msg2 = `📊 *Portfolio* — ${pos.length} token(s)\n\n`;
+  let msg2 = `🟢 *Portfolio* — ${pos.length} token(s)\n\n`;
   let wins = 0, losses = 0; let totalPnlWei = 0n;
   for (const p of pos.slice(0, 10)) {
     const bal = BigInt(p.balance_wei); const spent = BigInt(p.total_spent_wei); const recv = BigInt(p.total_received_wei);
