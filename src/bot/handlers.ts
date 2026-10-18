@@ -1846,6 +1846,7 @@ async function renderDeploymentsMenu(ctx: Context, depth: number = 40) {
     msg += `\`${d.address}\`\n`;
     msg += `  by \`${d.deployer}\` • block ${d.blockNumber}\n`;
     msg += `  [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash}) • [address](${ELYSIUM.explorerUrl}/address/${d.address})\n`;
+    msg += `────────────────────\n\n`;
     kb.text(`🛡️ ${name.slice(0, 24)}`, `tok_safety_${d.address}`).row();
     kb.text(`📄 Card`, `tok_card_${d.address}`)
       .text(`👀 Watch`, `watch_add_${d.address}`)
