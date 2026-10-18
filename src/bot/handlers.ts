@@ -1875,7 +1875,6 @@ _🔍 scanned last ${depth} blocks · tap an address to copy · 🛡️ Safety o
 `;
     block += `🔗 [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash})  ·  [address](${ELYSIUM.explorerUrl}/address/${d.address})
 `;
-    block += `┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈`;
     const kb = new InlineKeyboard()
       .text(`🛡️ Safety  ${shortAddr(d.address)}`, `tok_safety_${d.address}`)
       .row()
