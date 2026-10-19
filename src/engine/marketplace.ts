@@ -1,6 +1,7 @@
-import { createPublicClient, http, type Address, type Hex } from "viem";
-import { SUPPORTED_CHAINS, getChainConfig } from "../config";
+import { createPublicClient, http, type Address, type Hex, formatEther } from "viem";
+import { SUPPORTED_CHAINS, getChainConfig, KALOS_MARKETPLACE_ADDRESS, ELYSIUM } from "../config";
 import { openseaGet, openseaSlugForChain } from "./opensea";
+import { kalosService } from "./kalos";
 
 /**
  * Marketplace service: chain auto-detection, collection stats, and NFT inventory.
