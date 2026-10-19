@@ -1885,25 +1885,27 @@ async function promptNftBuy(ctx: Context, raw?: string) {
   if (parts.length >= 2 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
     const collection = parts[0] as Address;
     const tokenId = parts[1];
-    let owner = (parts[2] && /^0x[a-fA-F0-9]{40}$/.test(parts[2])) ? (parts[2] as Address) : undefined;
-    let maxPriceHype = parts[3] ?? (owner ? undefined : parts[2]);
+    let manualSeller = (parts[2] && /^0x[a-fA-F0-9]{40}$/.test(parts[2])) ? (parts[2] as Address) : undefined;
+    let maxPriceHype = parts[3] ?? (manualSeller ? undefined : parts[2]);
 
-    // If owner not specified, try to read from contract
-    if (!owner) {
-      try {
-        const cfg = getChainConfig(ELYSIUM.key);
-        const { createPublicClient, http } = await import("viem");
-        const client = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
-        owner = await client.readContract({
-          address: collection,
-          abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }],
-          functionName: "ownerOf",
-          args: [BigInt(tokenId)],
-        }) as Address;
-      } catch {}
-    }
+    // Always resolve current owner from chain (prevents stale-listing revert)
+    let currentOwner: Address | undefined;
+    try {
+      const cfg = getChainConfig(ELYSIUM.key);
+      const { createPublicClient, http } = await import("viem");
+      const client = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+      currentOwner = await client.readContract({
+        address: collection,
+        abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }],
+        functionName: "ownerOf",
+        args: [BigInt(tokenId)],
+      }) as Address;
+    } catch {}
 
-    if (!owner) {
+    // The seller we'll query the listing for — prefer manually specified, fall back to current owner
+    const seller = manualSeller ?? currentOwner;
+
+    if (!seller) {
       await ctx.reply("⚠️ Could not detect token owner. Please provide seller address:\n`/nftbuy <collection> <tokenId> <seller_address> [maxPrice]`", { parse_mode: "Markdown" });
       return;
     }
@@ -1911,10 +1913,31 @@ async function promptNftBuy(ctx: Context, raw?: string) {
     // Check Kalos listing status on-chain before prompting confirmation
     let listing: { quantity: bigint; pricePerItem: bigint; expirationTime: bigint } | null = null;
     try {
-      listing = await kalosService.getListing(collection, BigInt(tokenId), owner);
+      listing = await kalosService.getListing(collection, BigInt(tokenId), seller);
     } catch {}
 
+    // If seller has a listing but no longer owns the token — stale listing, will revert on-chain
+    if (listing && listing.pricePerItem > 0n && currentOwner && seller.toLowerCase() !== currentOwner.toLowerCase()) {
+      const offerKb = new InlineKeyboard()
+        .text(`🤝 Make Offer on #${tokenId}`, `quick_offer_${collection}_${tokenId}${maxPriceHype ? `_${maxPriceHype}` : ""}`)
+        .row()
+        .text("❌ Cancel", "cancel_action");
+
+      await ctx.reply(
+        `⚠️ *Stale Listing on Kalos — Token Already Transferred!*\n\n` +
+        `📄 *Collection:* \`${collection}\`\n` +
+        `🏷 *Token ID:* \`#${tokenId}\`\n` +
+        `👤 *Listed By:* \`${seller}\` _(no longer the owner)_\n` +
+        `👤 *Current Owner:* \`${currentOwner}\`\n\n` +
+        `This NFT was sold or transferred after being listed. The listing is stale and any buy attempt would revert.\n\n` +
+        `You can place an offer to the current owner instead:`,
+        { parse_mode: "Markdown", reply_markup: offerKb }
+      );
+      return;
+    }
+
     if (!listing || listing.quantity === 0n || listing.pricePerItem === 0n) {
+      // The token has an owner but they haven't listed it (or listing is stale)
       const offerKb = new InlineKeyboard()
         .text(`🤝 Make Offer on #${tokenId}`, `quick_offer_${collection}_${tokenId}${maxPriceHype ? `_${maxPriceHype}` : ""}`)
         .row()
@@ -1923,9 +1946,9 @@ async function promptNftBuy(ctx: Context, raw?: string) {
       await ctx.reply(
         `⚠️ *Token #${tokenId} is not listed for sale on Kalos!*\n\n` +
         `📄 *Collection:* \`${collection}\`\n` +
-        `👤 *Owner:* \`${owner}\`\n\n` +
-        `The owner holds this NFT in their wallet, but hasn't put it up for sale on the marketplace contract yet.\n` +
-        `You cannot direct-buy an unlisted item, but you can place an offer using \`/nftoffer\` or tap below:`,
+        `👤 *Current Owner:* \`${currentOwner ?? seller}\`\n\n` +
+        `_This token may have recently been sold or transferred — the current owner hasn't listed it on Kalos, or the listing has been removed._\n\n` +
+        `You cannot direct-buy an unlisted token. You can place an offer instead:`,
         { parse_mode: "Markdown", reply_markup: offerKb }
       );
       return;
@@ -1951,7 +1974,7 @@ async function promptNftBuy(ctx: Context, raw?: string) {
 
     userStates[userId] = {
       step: "awaiting_nftbuy_confirmation",
-      data: { collection, tokenId, owner, maxPriceHype: maxPriceHype || listedPrice, expiresAt: Date.now() + 5 * 60_000 },
+      data: { collection, tokenId, owner: seller, maxPriceHype: maxPriceHype || listedPrice, expiresAt: Date.now() + 5 * 60_000 },
     };
 
     const kb = new InlineKeyboard()
@@ -1961,7 +1984,7 @@ async function promptNftBuy(ctx: Context, raw?: string) {
     let quote = `🛒 *Confirm Kalos NFT Purchase*\n\n`;
     quote += `📄 *Collection:* \`${collection}\`\n`;
     quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
-    quote += `👤 *Seller:* \`${owner}\`\n`;
+    quote += `👤 *Seller:* \`${seller}\`\n`;
     quote += `💰 *Listed Price:* \`${listedPrice} HYPE\`\n`;
     if (maxPriceHype && maxPriceHype !== listedPrice) {
       quote += `🛡 *Max Slippage Limit:* \`${maxPriceHype} HYPE\`\n`;
