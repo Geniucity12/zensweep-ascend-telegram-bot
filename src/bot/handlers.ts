@@ -44,6 +44,11 @@ function shortAddr(a: string): string { return a.slice(0, 6) + "…" + a.slice(-
 // In-memory conversation state for multi-step prompts
 const userStates: Record<number, { step: string; data?: any }> = {};
 
+function isUserConfirmation(text: string): boolean {
+  const norm = text.trim().toUpperCase();
+  return ["CONFIRM", "YES", "Y", "OK", "BUY", "MINT", "LIST", "PROCEED", "SURE", "CONFIRM BUY"].includes(norm);
+}
+
 export function registerHandlers(bot: Bot) {
   bot.command("start", async (ctx) => {
     const userId = ctx.from?.id;
@@ -554,6 +559,76 @@ export function registerHandlers(bot: Bot) {
     await promptMint(ctx, ctx.match[1]);
   });
 
+  bot.callbackQuery("confirm_nftbuy", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftBuy(ctx, data);
+  });
+
+  bot.callbackQuery("confirm_mint", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeMint(ctx, data);
+  });
+
+  bot.callbackQuery("confirm_nftlist", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftList(ctx, data);
+  });
+
+  bot.callbackQuery("confirm_nftdelist", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftDelist(ctx, data);
+  });
+
+  bot.callbackQuery("confirm_nftoffer", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftOffer(ctx, data);
+  });
+
+  bot.callbackQuery("confirm_nftaccept", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftAccept(ctx, data);
+  });
+
+  bot.callbackQuery(/^quick_offer_(0x[a-fA-F0-9]{40})_(\d+)(?:_(.+))?$/, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1];
+    const tid = ctx.match[2];
+    const price = ctx.match[3];
+    await promptNftOffer(ctx, price ? `${col} ${tid} ${price}` : `${col} ${tid}`);
+  });
+
+  bot.callbackQuery("cancel_action", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (userId && userStates[userId]) delete userStates[userId];
+    await ctx.reply("❌ Action cancelled.", { reply_markup: mainKeyboard });
+  });
+
+
 
   bot.callbackQuery("menu_markets", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
@@ -915,8 +990,8 @@ export function registerHandlers(bot: Bot) {
         await ctx.reply("Buy confirmation expired. Send /nftbuy to start again.");
         return;
       }
-      if (text.trim().toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Purchase cancelled.");
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Purchase cancelled.", { reply_markup: mainKeyboard });
         return;
       }
       await executeNftBuy(ctx, state.data);
@@ -935,8 +1010,8 @@ export function registerHandlers(bot: Bot) {
         await ctx.reply("Listing confirmation expired. Send /nftlist to try again.");
         return;
       }
-      if (text.trim().toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Listing cancelled.");
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Listing cancelled.", { reply_markup: mainKeyboard });
         return;
       }
       await executeNftList(ctx, state.data);
@@ -955,8 +1030,8 @@ export function registerHandlers(bot: Bot) {
         await ctx.reply("Cancellation confirmation expired.");
         return;
       }
-      if (text.trim().toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Delisting cancelled.");
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Delisting cancelled.", { reply_markup: mainKeyboard });
         return;
       }
       await executeNftDelist(ctx, state.data);
@@ -975,8 +1050,8 @@ export function registerHandlers(bot: Bot) {
         await ctx.reply("Offer confirmation expired.");
         return;
       }
-      if (text.trim().toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Offer cancelled.");
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Offer cancelled.", { reply_markup: mainKeyboard });
         return;
       }
       await executeNftOffer(ctx, state.data);
@@ -995,8 +1070,8 @@ export function registerHandlers(bot: Bot) {
         await ctx.reply("Acceptance confirmation expired.");
         return;
       }
-      if (text.trim().toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Acceptance cancelled.");
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Acceptance cancelled.", { reply_markup: mainKeyboard });
         return;
       }
       await executeNftAccept(ctx, state.data);
@@ -1030,8 +1105,8 @@ export function registerHandlers(bot: Bot) {
         await ctx.reply("Mint confirmation expired. Send /mint to start again.");
         return;
       }
-      if (text.trim().toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Mint cancelled. Send /mint when you are ready to try again.");
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Mint cancelled. Send /mint when you are ready to try again.", { reply_markup: mainKeyboard });
         return;
       }
       await executeMint(ctx, state.data);
@@ -1737,8 +1812,12 @@ async function handleMintParams(ctx: Context, text: string) {
   if (FEE_RECIPIENT_WALLET && FEE_PERCENTAGE > 0 && mintValueWei > 0n) {
     quote += `💸 *Service Fee:* \`${serviceFeeHype} ${cfg.symbol}\`\n`;
   }
-  quote += `\nGas uses native HYPE. Reply *CONFIRM* to submit, or \`/cancel\`.`;
-  await ctx.reply(quote, { parse_mode: "Markdown" });
+  const kb = new InlineKeyboard()
+    .text(`✅ Yes, Mint for ${totalCostHype} HYPE`, "confirm_mint")
+    .text("❌ Cancel", "cancel_action");
+
+  quote += `\nGas uses native HYPE.\nTap the button below or reply *YES* to submit:`;
+  await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 async function executeMint(ctx: Context, data: { contract: string; quantity: number; priceEth: string; chain: string }) {
@@ -1829,18 +1908,66 @@ async function promptNftBuy(ctx: Context, raw?: string) {
       return;
     }
 
+    // Check Kalos listing status on-chain before prompting confirmation
+    let listing: { quantity: bigint; pricePerItem: bigint; expirationTime: bigint } | null = null;
+    try {
+      listing = await kalosService.getListing(collection, BigInt(tokenId), owner);
+    } catch {}
+
+    if (!listing || listing.quantity === 0n || listing.pricePerItem === 0n) {
+      const offerKb = new InlineKeyboard()
+        .text(`🤝 Make Offer on #${tokenId}`, `quick_offer_${collection}_${tokenId}${maxPriceHype ? `_${maxPriceHype}` : ""}`)
+        .row()
+        .text("❌ Cancel", "cancel_action");
+
+      await ctx.reply(
+        `⚠️ *Token #${tokenId} is not listed for sale on Kalos!*\n\n` +
+        `📄 *Collection:* \`${collection}\`\n` +
+        `👤 *Owner:* \`${owner}\`\n\n` +
+        `The owner holds this NFT in their wallet, but hasn't put it up for sale on the marketplace contract yet.\n` +
+        `You cannot direct-buy an unlisted item, but you can place an offer using \`/nftoffer\` or tap below:`,
+        { parse_mode: "Markdown", reply_markup: offerKb }
+      );
+      return;
+    }
+
+    const listedPrice = formatEther(listing.pricePerItem);
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    if (listing.expirationTime > 0n && listing.expirationTime < nowSec) {
+      await ctx.reply(
+        `⚠️ *Listing Expired on Kalos!*\n\nToken #${tokenId} had a listing that expired. The owner needs to relist it.`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
+    if (maxPriceHype && Number(listedPrice) > Number(maxPriceHype)) {
+      await ctx.reply(
+        `⚠️ *Price Exceeds Max!*\n\nListed price is *${listedPrice} HYPE*, which exceeds your maximum of *${maxPriceHype} HYPE*.`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+
     userStates[userId] = {
       step: "awaiting_nftbuy_confirmation",
-      data: { collection, tokenId, owner, maxPriceHype: maxPriceHype || undefined, expiresAt: Date.now() + 5 * 60_000 },
+      data: { collection, tokenId, owner, maxPriceHype: maxPriceHype || listedPrice, expiresAt: Date.now() + 5 * 60_000 },
     };
+
+    const kb = new InlineKeyboard()
+      .text(`✅ Yes, Buy for ${listedPrice} HYPE`, "confirm_nftbuy")
+      .text("❌ Cancel", "cancel_action");
 
     let quote = `🛒 *Confirm Kalos NFT Purchase*\n\n`;
     quote += `📄 *Collection:* \`${collection}\`\n`;
     quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
-    quote += `👤 *Seller:* \`${owner}\` (auto-detected)\n`;
-    if (maxPriceHype) quote += `💰 *Max Price:* \`${maxPriceHype} HYPE\`\n`;
-    quote += `\nReply *CONFIRM* to buy on Kalos, or \`/cancel\`.`;
-    await ctx.reply(quote, { parse_mode: "Markdown" });
+    quote += `👤 *Seller:* \`${owner}\`\n`;
+    quote += `💰 *Listed Price:* \`${listedPrice} HYPE\`\n`;
+    if (maxPriceHype && maxPriceHype !== listedPrice) {
+      quote += `🛡 *Max Slippage Limit:* \`${maxPriceHype} HYPE\`\n`;
+    }
+    quote += `\nTap the button below or reply *YES* to proceed:`;
+    await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
     return;
   }
 
@@ -1905,13 +2032,18 @@ async function promptNftList(ctx: Context, raw?: string) {
       data: { contract, tokenId, priceHype, days, expiresAt: Date.now() + 5 * 60_000 },
     };
 
+    const kb = new InlineKeyboard()
+      .text(`✅ Yes, List for ${priceHype} HYPE`, "confirm_nftlist")
+      .text("❌ Cancel", "cancel_action");
+
     let quote = `🏷 *Confirm Kalos NFT Listing*\n\n`;
     quote += `📄 *Collection:* \`${contract}\`\n`;
     quote += `🔢 *Token ID:* \`#${tokenId}\`\n`;
     quote += `💰 *Listing Price:* \`${priceHype} HYPE\`\n`;
     quote += `⏱ *Duration:* \`${days} days\`\n\n`;
-    quote += `Will approve Kalos marketplace contract if not approved yet.\nReply *CONFIRM* to publish, or \`/cancel\`.`;
-    await ctx.reply(quote, { parse_mode: "Markdown" });
+    quote += `_Will approve Kalos marketplace contract if not approved yet._\n\n`;
+    quote += `Tap the button below or reply *YES* to publish:`;
+    await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
     return;
   }
 
@@ -1972,10 +2104,14 @@ async function promptNftDelist(ctx: Context, raw?: string) {
       data: { contract, tokenId, expiresAt: Date.now() + 5 * 60_000 },
     };
 
+    const kb = new InlineKeyboard()
+      .text("✅ Yes, Delist NFT", "confirm_nftdelist")
+      .text("❌ Keep Listing", "cancel_action");
+
     await ctx.reply(
       `❌ Cancel listing on Kalos for \`${contract} #${tokenId}\`?\n` +
-      `This executes an on-chain cancel transaction.\n\nReply *CONFIRM* to cancel listing, or \`/cancel\`.`,
-      { parse_mode: "Markdown" }
+      `This executes an on-chain cancel transaction.\n\nTap the button below or reply *YES* to proceed:`,
+      { parse_mode: "Markdown", reply_markup: kb }
     );
     return;
   }
@@ -2040,13 +2176,17 @@ async function promptNftOffer(ctx: Context, raw?: string) {
       data: { contract, tokenId, priceHype, days, expiresAt: Date.now() + 5 * 60_000 },
     };
 
+    const kb = new InlineKeyboard()
+      .text(`✅ Yes, Offer ${priceHype} HYPE`, "confirm_nftoffer")
+      .text("❌ Cancel", "cancel_action");
+
     let quote = `🤝 *Confirm Kalos Offer / Bid*\n\n`;
     quote += `📄 *Collection:* \`${contract}\`\n`;
     quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
     quote += `💰 *Offer Price:* \`${priceHype} HYPE\`\n`;
     quote += `⏱ *Expiry:* \`${days} days\`\n\n`;
-    quote += `Reply *CONFIRM* to place bid on Kalos, or \`/cancel\`.`;
-    await ctx.reply(quote, { parse_mode: "Markdown" });
+    quote += `Tap the button below or reply *YES* to proceed:`;
+    await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
     return;
   }
 
@@ -2106,13 +2246,17 @@ async function promptNftAccept(ctx: Context, raw?: string) {
       data: { contract, tokenId, bidder, priceHype, expiresAt: Date.now() + 5 * 60_000 },
     };
 
+    const kb = new InlineKeyboard()
+      .text("✅ Yes, Accept Bid", "confirm_nftaccept")
+      .text("❌ Cancel", "cancel_action");
+
     let quote = `🤝 *Accept Kalos Bid*\n\n`;
     quote += `📄 *Collection:* \`${contract}\`\n`;
     quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
     quote += `👤 *Bidder:* \`${bidder}\`\n`;
     if (priceHype) quote += `💰 *Expected Payout:* \`${priceHype} HYPE\`\n`;
-    quote += `\nReply *CONFIRM* to accept bid and transfer NFT, or \`/cancel\`.`;
-    await ctx.reply(quote, { parse_mode: "Markdown" });
+    quote += `\nTap the button below or reply *YES* to proceed:`;
+    await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
     return;
   }
 

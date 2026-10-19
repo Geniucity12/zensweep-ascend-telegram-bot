@@ -52,12 +52,25 @@ export const kalosService = {
   },
   async buy(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, owner: Address, opts?: { quantity?: number; maxPriceEth?: string }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1);
-    let value = opts?.maxPriceEth ? parseEther(opts.maxPriceEth) : 0n;
-    if (!value) { const listing = await this.getListing(nftAddress, tid, owner); if (!listing) throw new Error("No active listing"); value = listing.pricePerItem * qty; }
+    const listing = await this.getListing(nftAddress, tid, owner);
+    if (!listing || listing.pricePerItem === 0n) {
+      throw new Error(`Token #${tid} is not listed for sale on Kalos by ${owner.slice(0, 8)}…`);
+    }
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    if (listing.expirationTime > 0n && listing.expirationTime < now) {
+      throw new Error(`Listing for token #${tid} has expired on Kalos.`);
+    }
+    const price = listing.pricePerItem * qty;
+    if (opts?.maxPriceEth) {
+      const maxP = parseEther(opts.maxPriceEth);
+      if (price > maxP) throw new Error(`Listed price (${formatEther(price)} HYPE) exceeds your max price (${opts.maxPriceEth} HYPE).`);
+    }
+    const value = price;
     const wc = walletClient(privateKey); const pc = publicClient();
     const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "buyItems", args: [[{ nftAddress, tokenId: tid, owner, quantity: qty, maxPricePerItem: value, paymentToken: NATIVE, usingNative: true }]], value } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
+
   async createTokenBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
     const wc = walletClient(privateKey); const pc = publicClient();
