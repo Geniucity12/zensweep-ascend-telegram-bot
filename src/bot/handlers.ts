@@ -1837,7 +1837,7 @@ async function promptNftBuy(ctx: Context, raw?: string) {
     let quote = `🛒 *Confirm Kalos NFT Purchase*\n\n`;
     quote += `📄 *Collection:* \`${collection}\`\n`;
     quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
-    quote += `👤 *Seller:* \`${owner}\`\n`;
+    quote += `👤 *Seller:* \`${owner}\` (auto-detected)\n`;
     if (maxPriceHype) quote += `💰 *Max Price:* \`${maxPriceHype} HYPE\`\n`;
     quote += `\nReply *CONFIRM* to buy on Kalos, or \`/cancel\`.`;
     await ctx.reply(quote, { parse_mode: "Markdown" });
@@ -1847,14 +1847,17 @@ async function promptNftBuy(ctx: Context, raw?: string) {
   userStates[userId] = { step: "awaiting_nftbuy_params" };
   await ctx.reply(
     `🛒 *Buy NFT on Kalos*\n\n` +
-    `Send command like this:\n` +
-    `\`<collection_address> <token_id> [seller_address] [max_price_hype]\`\n\n` +
-    `*Example:*\n` +
-    `\`0x123... 4 0.1\`\n\n` +
-    `Or reply \`/cancel\`.`,
+    `Send the command like this:\n` +
+    `\`<collection_address> <token_id> [max_price_hype]\`\n\n` +
+    `*Examples:*\n` +
+    `• \`0x123... 1 0.1\` (buy token #1 at up to 0.1 HYPE)\n` +
+    `• \`0x123... 4\` (buy token #4 at current listing price)\n\n` +
+    `_The bot automatically resolves the seller address from the contract._\n` +
+    `Reply with the details above, or \`/cancel\`.`,
     { parse_mode: "Markdown" }
   );
 }
+
 
 async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId: string; owner: Address; maxPriceHype?: string }) {
   const userId = ctx.from?.id;
@@ -2871,25 +2874,33 @@ async function renderHelpMenu(ctx: Context) {
   msg += `• \`/watchlist\` — Your tracked addresses\n`;
   msg += `• \`/unwatch <id>\` — Stop tracking\n`;
   msg += `\n`;
-  msg += `*Trading (Elysium HYPE):*\n`;
+  msg += `*Token Trading (Elysium HYPE):*\n`;
   msg += `• Paste any \`0x…\` → Zensweep card + Safety → Buy/Sell\n`;
   msg += `• \`/buy <0x…> <HYPE>\` / \`/sell <0x…> [25|50|100]\` (+ Buy X custom)\n`;
   msg += `• \`/safety <0x…>\` — honeypot/mint/blacklist/proxy — score 0–100\n`;
   msg += `• \`/portfolio\` — results, history and a share card\n`;
   msg += `• \`/slippage\` — your price tolerance (1–50%)\n`;
   msg += `• \`/copy\` — Zensweep Auto-Follow up to 5 wallets (V2)\n`;
+  msg += `\n`;
+  msg += `*NFTs & Kalos Marketplace:*\n`;
+  msg += `• \`/collections\` — Live Kalos NFT collections & floor prices\n`;
+  msg += `• \`/nfts\` — Your Elysium NFT inventory & active listings\n`;
+  msg += `• \`/mint <0x…> [quantity] [price]\` — Direct contract mint in HYPE\n`;
+  msg += `• \`/nftbuy <0x…> <tokenId> [maxPrice]\` — Buy item on Kalos\n`;
+  msg += `• \`/nftlist <0x…> <tokenId> <price> [days]\` — List NFT for sale on Kalos\n`;
+  msg += `• \`/nftdelist <0x…> <tokenId>\` — Cancel listing on Kalos\n`;
+  msg += `• \`/nftoffer <0x…> <tokenId> <price> [days]\` — Place bid on Kalos\n`;
+  msg += `• \`/nftaccept <0x…> <tokenId> <bidder>\` — Accept Kalos bid\n`;
   msg += `\n*Safety — Zensweep engine*\n`;
   msg += `Pre-buy simulation FROM your wallet (your real amount). Flags honeypot, mint, blacklist, proxy. If it flags a scam, Zensweep blocks or asks you to confirm. No scan can guarantee safety.\n`;
   msg += `\n*Your funds*\n`;
   msg += `\`/withdraw\` sends HYPE out at any time. \`/export\` shows your private key: never share it with anyone.\n`;
   msg += `\n*Wallet:*\n`;
   msg += `• \`/wallet\` — Address, balance & withdraw\n`;
-  msg += `\n*Elysium note:*\n`;
-  msg += `Cross-chain secondary markets are archived in Elysium-only mode. Use /launch and /deployments for Elysium-native discovery.\n`;
-  msg += `\n`;
-  msg += `*Zensweep focus:*\n`;
+  msg += `\n*Zensweep focus:*\n`;
   msg += `- Live Elysium launch & deployment monitoring\n`;
-  msg += `- Mint-window countdowns and alerts\n`;
+  msg += `- Kalos NFT marketplace orderbook trading\n`;
+  msg += `- Mint-window countdowns and direct contract mints\n`;
   msg += `- On-chain wallet tracking for Ascend launches`;
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: mainKeyboard });
 }
