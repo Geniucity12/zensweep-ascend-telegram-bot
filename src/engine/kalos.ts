@@ -4,7 +4,7 @@ import { getChainConfig, KALOS_MARKETPLACE_ADDRESS, ELYSIUM } from "../config";
 import kalosAbi from "../abi/kalosMarketplace.json";
 const ZERO = "0x0000000000000000000000000000000000000000" as Address;
 const NATIVE = ZERO;
-function kalosAddr(): Address | null { const a = (KALOS_MARKETPLACE_ADDRESS || "").trim(); if (!a || !/^0x[a-fA-F0-9]{40}$/.test(a)) return null; return a as Address; }
+function kalosAddr(): Address | null { const a = (KALOS_MARKETPLACE_ADDRESS || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07").trim(); if (!a || !/^0x[a-fA-F0-9]{40}$/.test(a)) return null; return a as Address; }
 export function isKalosConfigured(): boolean { return !!kalosAddr(); }
 function publicClient() { const cfg = getChainConfig(ELYSIUM.key); return createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) }); }
 function walletClient(pk: Hex) { const cfg = getChainConfig(ELYSIUM.key); const account = privateKeyToAccount(pk); return createWalletClient({ account, chain: cfg.viemChain, transport: http(cfg.rpcUrl) }); }

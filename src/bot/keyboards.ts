@@ -69,23 +69,54 @@ export function makeSlippageKeyboard(currentBps: number): InlineKeyboard {
   kb.row().text("\uD83D\uDD19 Main Menu", "menu_main");
   return kb;
 }
-export function makeNftCardKeyboard(address: string, explorerUrl?: string): InlineKeyboard {
+export function makeNftCardKeyboard(address: string, explorerUrl?: string, floorHype?: string): InlineKeyboard {
   const k = new InlineKeyboard();
-  if (explorerUrl) k.url("View on Explorer", explorerUrl).row();
-  k.text("Watch", "watch_add_" + address).text("Main Menu", "menu_main");
+  k.text("🛒 Buy on Kalos", `kalos_buy_${address}`)
+   .text("🏷️ List Item", `kalos_list_${address}`).row()
+   .text("⚡ Mint", `kalos_mint_${address}`)
+   .text("🤝 Make Offer", `kalos_offer_${address}`).row();
+  if (explorerUrl) {
+    k.url("🔍 Explorer", explorerUrl);
+  }
+  k.url("🌐 Kalos", "https://kalos.fun");
+  k.text("👀 Watch", "watch_add_" + address).row();
+  k.text("🏷️ Collections", "menu_collections").text("🔙 Main Menu", "menu_main");
   return k;
 }
+
+export function makeNftActionsKeyboard(contract: string, tokenId: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(`🏷️ List #${tokenId}`, `kalos_list_${contract}_${tokenId}`)
+    .text(`❌ Cancel List`, `kalos_delist_${contract}_${tokenId}`).row()
+    .text(`🤝 Check Offer`, `kalos_checkoffer_${contract}_${tokenId}`)
+    .text(`⚡ Mint More`, `kalos_mint_${contract}`).row()
+    .text("🖼️ My NFTs", "menu_nfts")
+    .text("🔙 Main Menu", "menu_main");
+}
+
 export function makeChainKeyboard(selected: string): InlineKeyboard {
   const kb = new InlineKeyboard();
-  for (const chain of SUPPORTED_CHAINS) { const check = chain.key === selected ? " \u2705" : ""; kb.text(`${chain.name}${check}`, `chain_select_${chain.key}`).row(); }
-  kb.text("\uD83D\uDD19 Main Menu", "menu_main"); return kb;
+  for (const chain of SUPPORTED_CHAINS) { const check = chain.key === selected ? " ✅" : ""; kb.text(`${chain.name}${check}`, `chain_select_${chain.key}`).row(); }
+  kb.text("🔙 Main Menu", "menu_main"); return kb;
 }
+
 export function makeTaskKeyboard(taskId: number, isActive: boolean): InlineKeyboard {
   const kb = new InlineKeyboard();
-  if (isActive) kb.text("\u23F8 Pause", `task_toggle_${taskId}`); else kb.text("\u25B6\uFE0F Resume", `task_toggle_${taskId}`);
-  kb.text("\uD83D\uDDD1 Delete", `task_delete_${taskId}`).row();
-  kb.text("\uD83D\uDD19 Main Menu", "menu_main"); return kb;
+  if (isActive) kb.text("⏸ Pause", `task_toggle_${taskId}`); else kb.text("▶️ Resume", `task_toggle_${taskId}`);
+  kb.text("🗑 Delete", `task_delete_${taskId}`).row();
+  kb.text("🔙 Main Menu", "menu_main"); return kb;
 }
-export function makeCollectionKeyboard(contract: string, openSeaUrl?: string): InlineKeyboard {
-  const kb = new InlineKeyboard(); kb.text("\uD83C\uDFAF Snipe Floor", `snipe_col_${contract}`).row(); kb.text("\uD83E\uDDEC Snipe Trait", `snipe_trait_${contract}`).row(); if (openSeaUrl) kb.url("\uD83C\uDF0A View on OpenSea", openSeaUrl).row(); kb.text("\uD83D\uDD19 Main Menu", "menu_main"); return kb;
+
+export function makeCollectionKeyboard(contract: string): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  kb.text("🛒 Buy on Kalos", `kalos_buy_${contract}`)
+    .text("🏷️ List Item", `kalos_list_${contract}`).row()
+    .text("⚡ Direct Mint", `kalos_mint_${contract}`)
+    .text("🤝 Make Offer", `kalos_offer_${contract}`).row()
+    .url("🌐 View on Kalos", "https://kalos.fun")
+    .text("👀 Watch", `watch_add_${contract}`).row()
+    .text("🏷️ All Collections", "menu_collections")
+    .text("🔙 Main Menu", "menu_main");
+  return kb;
 }
+

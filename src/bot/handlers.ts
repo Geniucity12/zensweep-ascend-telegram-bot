@@ -5,6 +5,7 @@ import { walletManager } from "../wallet/manager";
 import { SUPPORTED_CHAINS, getChainConfig, FEE_PERCENTAGE, FEE_RECIPIENT_WALLET, ELYSIUM, DEFAULT_CHAIN_KEY, ZENSWEEP_LAUNCH_API_URL } from "../config";
 import { marketplaceService } from "../engine/marketplace";
 import { minterService } from "../engine/minter";
+import { kalosService } from "../engine/kalos";
 import { openSeaService } from "../engine/opensea";
 import { getChainHealth, scanRecentDeployments, getDeploymentMeta, getWalletActivity } from "../engine/elysium";
 import { analyzeToken, formatSafetyReport, formatSafetyInline } from "../engine/safety";
@@ -22,6 +23,7 @@ import {
   makeSafetyKeyboard,
   makeSlippageKeyboard,
   makeNftCardKeyboard,
+  makeNftActionsKeyboard,
 } from "./keyboards";
 import { formatEther, parseEther, parseUnits, type Address, type Hex } from "viem";
 
@@ -112,25 +114,71 @@ export function registerHandlers(bot: Bot) {
     await promptFloorCheck(ctx);
   });
 
+  bot.command("collections", async (ctx) => {
+    await renderCollectionsMenu(ctx);
+  });
+  bot.command("collection", async (ctx) => {
+    await renderCollectionsMenu(ctx);
+  });
+
   bot.command("nfts", async (ctx) => {
+    await renderNFTsMenu(ctx);
+  });
+  bot.command("inventory", async (ctx) => {
     await renderNFTsMenu(ctx);
   });
 
   bot.command("mint", async (ctx) => {
-    await promptMint(ctx);
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    if (raw) await handleMintParams(ctx, raw);
+    else await promptMint(ctx);
   });
 
+  bot.command("nftbuy", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftBuy(ctx, raw);
+  });
+  bot.command("buyitem", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftBuy(ctx, raw);
+  });
+
+  bot.command("nftlist", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftList(ctx, raw);
+  });
   bot.command("list", async (ctx) => {
-    await promptListNFT(ctx);
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftList(ctx, raw);
   });
 
-  bot.command("offer", async (ctx) => {
-    await promptAcceptOffer(ctx);
+  bot.command("nftdelist", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftDelist(ctx, raw);
   });
-
   bot.command("delist", async (ctx) => {
-    await renderListingsMenu(ctx);
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftDelist(ctx, raw);
   });
+
+  bot.command("nftoffer", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftOffer(ctx, raw);
+  });
+  bot.command("offer", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftOffer(ctx, raw);
+  });
+
+  bot.command("nftaccept", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftAccept(ctx, raw);
+  });
+  bot.command("accept", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftAccept(ctx, raw);
+  });
+
 
   // Elysium-native commands (the new center of gravity)
   bot.command("mints", async (ctx) => {
@@ -447,6 +495,11 @@ export function registerHandlers(bot: Bot) {
     await promptFloorCheck(ctx);
   });
 
+  bot.callbackQuery("menu_collections", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await renderCollectionsMenu(ctx);
+  });
+
   bot.callbackQuery("menu_nfts", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     await renderNFTsMenu(ctx);
@@ -456,6 +509,51 @@ export function registerHandlers(bot: Bot) {
     ctx.answerCallbackQuery().catch(() => {});
     await promptMint(ctx);
   });
+
+  bot.callbackQuery(/^col_inspect_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await renderCollectionDetail(ctx, ctx.match[1] as Address);
+  });
+
+  bot.callbackQuery("col_inspect_prompt", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    userStates[userId] = { step: "awaiting_collection_inspect" };
+    await ctx.reply("🔍 Send any NFT collection contract address (`0x...`) on Elysium:", { parse_mode: "Markdown" });
+  });
+
+  bot.callbackQuery(/^kalos_buy_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const tid = ctx.match[2];
+    await promptNftBuy(ctx, tid ? `${col} ${tid}` : col);
+  });
+
+  bot.callbackQuery(/^kalos_list_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const tid = ctx.match[2];
+    await promptNftList(ctx, tid ? `${col} ${tid}` : col);
+  });
+
+  bot.callbackQuery(/^kalos_delist_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await promptNftDelist(ctx, `${ctx.match[1]} ${ctx.match[2]}`);
+  });
+
+  bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const tid = ctx.match[2];
+    await promptNftOffer(ctx, tid ? `${col} ${tid}` : col);
+  });
+
+  bot.callbackQuery(/^kalos_mint_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await promptMint(ctx, ctx.match[1]);
+  });
+
 
   bot.callbackQuery("menu_markets", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
@@ -520,8 +618,7 @@ export function registerHandlers(bot: Bot) {
     const userId = ctx.from?.id;
     const nft = userId ? userStates[userId]?.data?.nfts?.[Number(ctx.match[1])] : undefined;
     if (!userId || !nft) return;
-    userStates[userId] = { step: "awaiting_nft_list_price", data: nft };
-    await ctx.reply(`Send the listing price in ETH for #${nft.tokenId}, for example \`0.25\`.`);
+    await promptNftList(ctx, `${nft.contract} ${nft.tokenId}`);
   });
 
   bot.callbackQuery(/^nft_offer_(\d+)$/, async (ctx) => {
@@ -529,13 +626,22 @@ export function registerHandlers(bot: Bot) {
     const userId = ctx.from?.id;
     const nft = userId ? userStates[userId]?.data?.nfts?.[Number(ctx.match[1])] : undefined;
     if (!userId || !nft) return;
-    await prepareOfferAcceptance(ctx, nft.contract, nft.tokenId);
+    await promptNftOffer(ctx, `${nft.contract} ${nft.tokenId}`);
   });
 
   bot.callbackQuery(/^listing_cancel_(\d+)$/, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
-    await handleListingCancellation(ctx, Number(ctx.match[1]));
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const listingId = Number(ctx.match[1]);
+    const listing = dbService.getUserListings(userId).find((item) => item.id === listingId);
+    if (!listing) {
+      await ctx.reply("Listing not found.");
+      return;
+    }
+    await executeNftDelist(ctx, { contract: listing.contract as Address, tokenId: listing.token_id, listingId });
   });
+
 
   bot.callbackQuery("menu_history", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
@@ -786,76 +892,117 @@ export function registerHandlers(bot: Bot) {
       return;
     }
 
-    if (state?.step === "awaiting_list_params") {
+    if (state?.step === "awaiting_collection_inspect") {
       delete userStates[userId];
-      const parts = text.split(/\s+/);
-      if (parts.length !== 3 || !/^0x[a-fA-F0-9]{40}$/.test(parts[0])) {
-        await ctx.reply("Format: `<contract_address> <token_id> <price_eth>`.", { parse_mode: "Markdown" });
-        return;
+      const clean = text.trim();
+      if (/^0x[a-fA-F0-9]{40}$/.test(clean)) {
+        await renderCollectionDetail(ctx, clean as Address);
+      } else {
+        await ctx.reply("❌ Invalid contract address. Please provide a 42-character `0x...` address.", { parse_mode: "Markdown" });
       }
-      await prepareListing(ctx, parts[0], parts[1], parts[2]);
       return;
     }
 
-    if (state?.step === "awaiting_offer_params") {
+    if (state?.step === "awaiting_nftbuy_params") {
       delete userStates[userId];
-      const parts = text.split(/\s+/);
-      if (parts.length !== 2 || !/^0x[a-fA-F0-9]{40}$/.test(parts[0]) || !/^\d+$/.test(parts[1])) {
-        await ctx.reply("Format: `<contract_address> <token_id>`.", { parse_mode: "Markdown" });
-        return;
-      }
-      await prepareOfferAcceptance(ctx, parts[0], parts[1]);
+      await promptNftBuy(ctx, text);
       return;
     }
 
-    if (state?.step === "awaiting_nft_list_price") {
-      const nft = state.data;
-      delete userStates[userId];
-      await prepareListing(ctx, nft?.contract, nft?.tokenId, text);
-      return;
-    }
-
-    if (state?.step === "awaiting_listing_confirmation") {
+    if (state?.step === "awaiting_nftbuy_confirmation") {
       delete userStates[userId];
       if (!state.data || Date.now() > state.data.expiresAt) {
-        await ctx.reply("Listing confirmation expired. Send /list to try again.");
+        await ctx.reply("Buy confirmation expired. Send /nftbuy to start again.");
         return;
       }
-      if (text.toUpperCase() !== "CONFIRM") {
+      if (text.trim().toUpperCase() !== "CONFIRM") {
+        await ctx.reply("Purchase cancelled.");
+        return;
+      }
+      await executeNftBuy(ctx, state.data);
+      return;
+    }
+
+    if (state?.step === "awaiting_nftlist_params" || state?.step === "awaiting_list_params") {
+      delete userStates[userId];
+      await promptNftList(ctx, text);
+      return;
+    }
+
+    if (state?.step === "awaiting_nftlist_confirmation" || state?.step === "awaiting_listing_confirmation") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Listing confirmation expired. Send /nftlist to try again.");
+        return;
+      }
+      if (text.trim().toUpperCase() !== "CONFIRM") {
         await ctx.reply("Listing cancelled.");
         return;
       }
-      await executeCreateListing(ctx, state.data);
+      await executeNftList(ctx, state.data);
       return;
     }
 
-    if (state?.step === "awaiting_offer_confirmation") {
+    if (state?.step === "awaiting_nftdelist_params") {
       delete userStates[userId];
-      if (!state.data || Date.now() > state.data.expiresAt) {
-        await ctx.reply("Offer confirmation expired. Start again from /nfts.");
-        return;
-      }
-      if (text.toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Offer acceptance cancelled.");
-        return;
-      }
-      await executeOfferAcceptance(ctx, state.data);
+      await promptNftDelist(ctx, text);
       return;
     }
 
-    if (state?.step === "awaiting_listing_cancel_confirmation") {
+    if (state?.step === "awaiting_nftdelist_confirmation" || state?.step === "awaiting_listing_cancel_confirmation") {
       delete userStates[userId];
       if (!state.data || Date.now() > state.data.expiresAt) {
-        await ctx.reply("Cancellation confirmation expired. Open /delist to try again.");
+        await ctx.reply("Cancellation confirmation expired.");
         return;
       }
-      if (text.toUpperCase() !== "CONFIRM") {
-        await ctx.reply("Listing cancellation cancelled.");
+      if (text.trim().toUpperCase() !== "CONFIRM") {
+        await ctx.reply("Delisting cancelled.");
         return;
       }
-      await executeListingCancellation(ctx, state.data.listingId);
+      await executeNftDelist(ctx, state.data);
       return;
     }
+
+    if (state?.step === "awaiting_nftoffer_params" || state?.step === "awaiting_offer_params") {
+      delete userStates[userId];
+      await promptNftOffer(ctx, text);
+      return;
+    }
+
+    if (state?.step === "awaiting_nftoffer_confirmation" || state?.step === "awaiting_offer_confirmation") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Offer confirmation expired.");
+        return;
+      }
+      if (text.trim().toUpperCase() !== "CONFIRM") {
+        await ctx.reply("Offer cancelled.");
+        return;
+      }
+      await executeNftOffer(ctx, state.data);
+      return;
+    }
+
+    if (state?.step === "awaiting_nftaccept_params") {
+      delete userStates[userId];
+      await promptNftAccept(ctx, text);
+      return;
+    }
+
+    if (state?.step === "awaiting_nftaccept_confirmation") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Acceptance confirmation expired.");
+        return;
+      }
+      if (text.trim().toUpperCase() !== "CONFIRM") {
+        await ctx.reply("Acceptance cancelled.");
+        return;
+      }
+      await executeNftAccept(ctx, state.data);
+      return;
+    }
+
 
     if (state?.step === "awaiting_buyx_amount") {
       const raw = text.trim();
@@ -1330,7 +1477,107 @@ async function handleFloorLookup(ctx: Context, contract: string) {
 
   await ctx.reply(msg, {
     parse_mode: "Markdown",
-    reply_markup: makeCollectionKeyboard(cleanContract, stats.openSeaUrl),
+    reply_markup: makeCollectionKeyboard(cleanContract),
+  });
+
+}
+
+async function renderCollectionsMenu(ctx: Context) {
+  const cfg = getChainConfig(ELYSIUM.key);
+  const kalosAddress = kalosService.address();
+
+  let msg = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
+  msg += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
+  msg += `🏛 *Marketplace:* \`${kalosAddress || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07"}\`\n`;
+  msg += `🔗 *Portal:* [kalos.fun](https://kalos.fun)\n\n`;
+
+  const projects = await fetchLaunchProjects();
+  const nftProjects = projects.filter((p) => p.contractAddress || p.tags.includes("nft") || p.tags.includes("collection") || p.status === "minting" || p.status === "live");
+
+  const kb = new InlineKeyboard();
+
+  if (nftProjects.length === 0) {
+    msg += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
+  } else {
+    msg += `*Featured & Tracked Collections:*\n\n`;
+    for (const p of nftProjects.slice(0, 8)) {
+      const addr = p.contractAddress;
+      let floorStr = "—";
+      if (addr && /^0x[a-fA-F0-9]{40}$/.test(addr)) {
+        try {
+          const fp = await kalosService.getMinPriceForCollection(addr as Address);
+          if (fp && fp > 0n) floorStr = `${kalosService.formatPrice(fp)} HYPE`;
+        } catch {}
+      }
+      msg += `• *${p.name}* [${p.stage}]\n`;
+      if (addr) msg += `  Contract: \`${addr}\`\n`;
+      msg += `  Floor: \`${floorStr}\` • Mint: \`${p.mintDate}\`\n\n`;
+
+      if (addr) {
+        kb.text(`🔍 ${p.name.slice(0, 16)}`, `col_inspect_${addr}`).row();
+      }
+    }
+  }
+
+  msg += `💡 *Kalos Commands:*\n`;
+  msg += `• \`/mint [contract] [qty] [price]\` — Direct mint\n`;
+  msg += `• \`/nftbuy [contract] [id]\` — Buy item on Kalos\n`;
+  msg += `• \`/nftlist [contract] [id] [price]\` — List on Kalos\n`;
+  msg += `• \`/nftdelist [contract] [id]\` — Cancel listing\n`;
+  msg += `• \`/nftoffer [contract] [id] [price]\` — Place bid\n`;
+
+  kb.text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row();
+  kb.text("⚡ Direct Mint", "menu_mint").text("🖼️ My NFTs", "menu_nfts").row();
+  kb.text("🔙 Main Menu", "menu_main");
+
+  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+async function renderCollectionDetail(ctx: Context, address: Address) {
+  let meta: Awaited<ReturnType<typeof getDeploymentMeta>> | null = null;
+  try { meta = await getDeploymentMeta(address, ELYSIUM.key); } catch {}
+
+  const name = meta?.name ?? "Elysium Collection";
+  const symbol = meta?.symbol ? ` ($${meta.symbol})` : "";
+  const explorer = getChainConfig(ELYSIUM.key).explorerUrl;
+  const explorerUrl = explorer ? `${explorer}/address/${address}` : undefined;
+
+  let floorStr = "No active listings";
+  try {
+    const minP = await kalosService.getMinPriceForCollection(address);
+    if (minP && minP > 0n) floorStr = `${kalosService.formatPrice(minP)} HYPE`;
+  } catch {}
+
+  let userBalStr = "0";
+  const userId = ctx.from?.id;
+  const user = userId ? dbService.getUser(userId) : undefined;
+  if (user?.wallet_address) {
+    try {
+      const cfg = getChainConfig(ELYSIUM.key);
+      const { createPublicClient, http } = await import("viem");
+      const client = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+      const bal = await client.readContract({
+        address,
+        abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] }],
+        functionName: "balanceOf",
+        args: [user.wallet_address as Address],
+      }) as bigint;
+      userBalStr = bal.toString();
+    } catch {}
+  }
+
+  let msg = `🖼️ *${name}${symbol}*\n`;
+  msg += `\`${address}\`\n\n`;
+  msg += `🏛 *Marketplace:* Kalos (Elysium L2)\n`;
+  msg += `💰 *Floor Price:* \`${floorStr}\`\n`;
+  msg += `💼 *Your Holdings:* \`${userBalStr} owned\`\n`;
+  if (meta?.bytecodeSize) msg += `📦 *Contract Size:* \`${meta.bytecodeSize} bytes\`\n`;
+  if (explorerUrl) msg += `🔗 [View on Explorer](${explorerUrl}) • [View on Kalos](https://kalos.fun)\n\n`;
+  msg += `*Kalos Actions:* Tap below to Buy on Kalos, List an item, Make an Offer, or Direct Mint.`;
+
+  await ctx.reply(msg, {
+    parse_mode: "Markdown",
+    reply_markup: makeCollectionKeyboard(address),
   });
 }
 
@@ -1345,35 +1592,64 @@ async function renderNFTsMenu(ctx: Context) {
   }
 
   const chain = user.selected_chain || DEFAULT_CHAIN_KEY;
-  await ctx.reply(`🔍 Loading NFTs in your wallet on *${chain.toUpperCase()}*...`, { parse_mode: "Markdown" });
+  await ctx.reply(`🔍 Scanning your wallet on *${chain.toUpperCase()}* for NFTs…`, { parse_mode: "Markdown" });
 
   const nfts = await marketplaceService.getNFTsForUser(user.wallet_address, chain);
-  if (nfts.length === 0) {
+  const activeListings = dbService.getUserListings(userId);
+
+  if (nfts.length === 0 && activeListings.length === 0) {
+    const kb = new InlineKeyboard()
+      .text("🏷️ Explore Collections", "menu_collections")
+      .text("⚡ Direct Mint", "menu_mint").row()
+      .text("🔙 Main Menu", "menu_main");
+
     await ctx.reply(
-      `🖼 *My Inventory (${chain.toUpperCase()})*\n\nNo NFTs found in your trading wallet on this chain.\n\n*Address:* \`${user.wallet_address}\``,
-      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      `🖼 *My NFT Inventory (${chain.toUpperCase()})*\n\n` +
+      `No NFTs detected in your wallet yet.\n\n` +
+      `*Address:* \`${user.wallet_address}\`\n\n` +
+      `💡 *Get started on Elysium:*\n` +
+      `• Browse live collections: \`/collections\`\n` +
+      `• Direct-to-contract minting: \`/mint\`\n` +
+      `• Buy from Kalos marketplace: \`/nftbuy\``,
+      { parse_mode: "Markdown", reply_markup: kb }
     );
     return;
   }
 
-  let msg = `🖼 *My Inventory (${chain.toUpperCase()})* — Found *${nfts.length}* NFT(s):\n\n`;
-  for (const nft of nfts.slice(0, 10)) {
-    msg += `• *${nft.title}*\n  Contract: \`${nft.contract}\`\n  ID: \`#${nft.tokenId}\`\n\n`;
-  }
-  const preview = nfts.slice(0, 5);
-  userStates[userId] = { step: "nft_actions", data: { nfts: preview } };
-  const keyboard = new InlineKeyboard();
-  preview.forEach((nft, index) => {
-    keyboard.text(`List #${nft.tokenId}`, `nft_list_${index}`)
-      .text(`Best offer #${nft.tokenId}`, `nft_offer_${index}`)
-      .row();
-  });
-  keyboard.text("🔙 Main Menu", "menu_main");
+  let msg = `🖼 *My NFT Inventory (${chain.toUpperCase()})*\n` +
+            `*Wallet:* \`${user.wallet_address}\`\n\n`;
 
-  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: keyboard });
+  if (nfts.length > 0) {
+    msg += `*Held NFTs (${nfts.length}):*\n`;
+    for (const nft of nfts.slice(0, 8)) {
+      msg += `• *${nft.title}*\n  Contract: \`${nft.contract}\`\n  Token ID: \`#${nft.tokenId}\`\n\n`;
+    }
+  }
+
+  if (activeListings.length > 0) {
+    msg += `*Active Kalos Listings (${activeListings.length}):*\n`;
+    for (const l of activeListings) {
+      msg += `• Listing #${l.id}: Token #${l.token_id} at \`${l.price_eth} HYPE\`\n  Contract: \`${l.contract}\`\n\n`;
+    }
+  }
+
+  const kb = new InlineKeyboard();
+  if (nfts.length > 0) {
+    const first = nfts[0];
+    kb.text(`🏷️ List #${first.tokenId}`, `kalos_list_${first.contract}_${first.tokenId}`)
+      .text(`🤝 Offer #${first.tokenId}`, `kalos_offer_${first.contract}_${first.tokenId}`).row();
+  }
+  if (activeListings.length > 0) {
+    kb.text(`❌ Cancel Listing #${activeListings[0].id}`, `listing_cancel_${activeListings[0].id}`).row();
+  }
+  kb.text("⚡ Direct Mint", "menu_mint")
+    .text("🏷️ Collections", "menu_collections").row()
+    .text("🔙 Main Menu", "menu_main");
+
+  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }
 
-async function promptMint(ctx: Context) {
+async function promptMint(ctx: Context, defaultContract?: string) {
   const userId = ctx.from?.id;
   if (!userId) return;
 
@@ -1384,11 +1660,15 @@ async function promptMint(ctx: Context) {
   }
 
   userStates[userId] = { step: "awaiting_mint_params" };
-  const feeNotice = FEE_RECIPIENT_WALLET && FEE_PERCENTAGE > 0
-    ? `A ${FEE_PERCENTAGE * 100}% service fee is quoted before submission and, if confirmed, sent as a separate transaction after a successful paid mint. That fee transaction also uses your wallet's gas.`
-    : "No service fee is currently configured.";
+  const prefill = defaultContract ? `\nPrefilled contract: \`${defaultContract}\`\nSend: \`${defaultContract} 1 0.05\`` : "";
   await ctx.reply(
-    `⚡ *Direct Contract Mint*\n\nSend your mint command like this:\n\`<contract_address> [quantity] [price_per_item_eth]\`\n\nExamples:\n\`0x123... 1 0.05\`\n\`0x123... 2 0\`\n\nThe bot does not read the contract's mint price; enter the exact required value. A wrong value may revert or behave according to that contract's rules.\n${feeNotice}\nMint calls the contract directly; it does not use OpenSea. Reply CONFIRM after reviewing the quote.`,
+    `⚡ *Direct Contract Mint (Elysium)*\n\n` +
+    `Send your mint command like this:\n` +
+    `\`<contract_address> [quantity] [price_per_item_hype]\`\n\n` +
+    `*Examples:*\n` +
+    `• \`0x123... 1 0.05\` (mint 1 for 0.05 HYPE each)\n` +
+    `• \`0x123... 2 0\` (mint 2 on a free mint)${prefill}\n\n` +
+    `Gas is paid in native HYPE. Reply *CONFIRM* after reviewing the quote.`,
     { parse_mode: "Markdown" }
   );
 }
@@ -1411,14 +1691,9 @@ async function handleMintParams(ctx: Context, text: string) {
     return;
   }
 
-  if (parts.length > 3) {
-    await ctx.reply("❌ Format: `<contract> [quantity] [price_per_item_eth]`.", { parse_mode: "Markdown" });
-    return;
-  }
-
   const contract = parts[0];
   let quantity = 1;
-  let priceEth = "0";
+  let priceHype = "0";
   if (parts[1] !== undefined) {
     if (!/^\d+$/.test(parts[1])) {
       await ctx.reply("❌ Quantity must be a positive whole number.");
@@ -1428,39 +1703,41 @@ async function handleMintParams(ctx: Context, text: string) {
   }
   if (parts[2] !== undefined) {
     if (!/^\d+(?:\.\d{1,18})?$/.test(parts[2])) {
-      await ctx.reply("❌ Price must be a non-negative ETH amount with up to 18 decimal places.");
+      await ctx.reply("❌ Price must be a non-negative HYPE amount.");
       return;
     }
-    priceEth = parts[2];
+    priceHype = parts[2];
   }
 
   if (!Number.isSafeInteger(quantity) || quantity < 1) {
-    await ctx.reply("❌ Quantity must be a positive whole number within the safe integer range.");
+    await ctx.reply("❌ Quantity must be a positive whole number.");
     return;
   }
 
-  const chain = dbService.getUser(userId)?.selected_chain || DEFAULT_CHAIN_KEY;
-  const mintValueWei = parseEther(priceEth) * BigInt(quantity);
-  const totalCostEth = formatEther(mintValueWei);
-  let serviceFeeEth = "0";
+  const chain = ELYSIUM.key;
+  const cfg = getChainConfig(chain);
+  const mintValueWei = parseEther(priceHype) * BigInt(quantity);
+  const totalCostHype = formatEther(mintValueWei);
+
+  let serviceFeeHype = "0";
   if (FEE_RECIPIENT_WALLET && FEE_PERCENTAGE > 0 && mintValueWei > 0n) {
     const feeBasisPoints = BigInt(Math.floor(FEE_PERCENTAGE * 10000));
-    serviceFeeEth = formatEther((mintValueWei * feeBasisPoints) / 10000n);
+    serviceFeeHype = formatEther((mintValueWei * feeBasisPoints) / 10000n);
   }
+
   userStates[userId] = {
     step: "awaiting_mint_confirmation",
-    data: { contract, quantity, priceEth, chain, expiresAt: Date.now() + 5 * 60_000 },
+    data: { contract, quantity, priceEth: priceHype, chain, expiresAt: Date.now() + 5 * 60_000 },
   };
 
-  let quote = `Mint ${quantity} item(s) from contract \`${contract}\` on *${getChainConfig(chain).name}*?\n`;
-  quote += `Entered mint value: *${totalCostEth} ${getChainConfig(chain).symbol}*\n`;
+  let quote = `⚡ *Confirm Mint on Elysium*\n\n`;
+  quote += `📄 *Contract:* \`${contract}\`\n`;
+  quote += `🎯 *Quantity:* \`${quantity}\` item(s)\n`;
+  quote += `💰 *Total Mint Cost:* \`${totalCostHype} ${cfg.symbol}\`\n`;
   if (FEE_RECIPIENT_WALLET && FEE_PERCENTAGE > 0 && mintValueWei > 0n) {
-    quote += `Service fee (separate transaction): *${serviceFeeEth} ${getChainConfig(chain).symbol}*\n`;
-    quote += `The fee transfer can fail after the mint succeeds; both transactions require gas.\n`;
-  } else {
-    quote += "Service fee: *0* (not configured or free mint)\n";
+    quote += `💸 *Service Fee:* \`${serviceFeeHype} ${cfg.symbol}\`\n`;
   }
-  quote += "Gas is additional. Reply *CONFIRM* to submit, or anything else to cancel.";
+  quote += `\nGas uses native HYPE. Reply *CONFIRM* to submit, or \`/cancel\`.`;
   await ctx.reply(quote, { parse_mode: "Markdown" });
 }
 
@@ -1484,7 +1761,7 @@ async function executeMint(ctx: Context, data: { contract: string; quantity: num
       data.priceEth,
       data.chain
     );
-    let feeLedgerError: string | undefined;
+
     if (result.serviceFeeEth !== "0") {
       try {
         dbService.recordServiceFee(
@@ -1498,28 +1775,16 @@ async function executeMint(ctx: Context, data: { contract: string; quantity: num
           result.serviceFeeError
         );
       } catch (error: any) {
-        feeLedgerError = error?.message || "Fee record could not be saved";
         console.error("Failed to record mint fee:", error);
       }
     }
 
-    let feeMessage = "";
-    if (result.serviceFeeEth !== "0") {
-      feeMessage = result.serviceFeePaid && result.serviceFeeTxHash
-        ? `\n💸 *Service Fee Paid:* \`${result.serviceFeeEth} ETH\` ([fee tx](${getChainConfig(data.chain).explorerUrl}/tx/${result.serviceFeeTxHash}))`
-        : `\n⚠️ *Service Fee Not Confirmed:* \`${result.serviceFeeEth} ETH\`` +
-          (result.serviceFeeTxHash ? ` ([fee tx](${getChainConfig(data.chain).explorerUrl}/tx/${result.serviceFeeTxHash}))` : "") +
-          `\nReason: ${result.serviceFeeError || "Fee transfer was not confirmed"}`;
-    }
-
     await ctx.reply(
-      `✅ *Mint Sent Successfully!*\n\n` +
-        `📄 *Contract:* \`${result.contract}\`\n` +
-        `🌐 *Chain:* \`${result.chainName}\`\n` +
-        `🎯 *Quantity:* \`${result.quantity}\`\n` +
-        `💰 *Entered Mint Value:* \`${result.totalCostEth} ETH\`\n` +
-        `🔗 *Explorer:* [View Tx](${result.explorerUrl})` + feeMessage +
-        (feeLedgerError ? `\n⚠️ Fee ledger write failed: ${feeLedgerError}` : ""),
+      `✅ *Mint Transaction Confirmed!*\n\n` +
+      `📄 *Contract:* \`${result.contract}\`\n` +
+      `🎯 *Quantity:* \`${result.quantity}\`\n` +
+      `💰 *Total Cost:* \`${result.totalCostEth} HYPE\`\n` +
+      `🔗 *Explorer:* [View Tx](${result.explorerUrl})`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (err: any) {
@@ -1527,205 +1792,360 @@ async function executeMint(ctx: Context, data: { contract: string; quantity: num
   }
 }
 
-async function promptListNFT(ctx: Context) {
+async function promptNftBuy(ctx: Context, raw?: string) {
   const userId = ctx.from?.id;
   if (!userId) return;
-  if (!walletManager.getUserWallet(userId)) {
-    await ctx.reply("Connect a wallet before creating a listing.", { reply_markup: noWalletKeyboard });
-    return;
-  }
-  userStates[userId] = { step: "awaiting_list_params" };
-  await ctx.reply("Send `<contract_address> <token_id> <price_eth>` to publish an OpenSea listing.", { parse_mode: "Markdown" });
-}
 
-async function promptAcceptOffer(ctx: Context) {
-  const userId = ctx.from?.id;
-  if (!userId) return;
-  userStates[userId] = { step: "awaiting_offer_params" };
-  await ctx.reply("Send `<contract_address> <token_id>` to check the best offer for that exact NFT.", { parse_mode: "Markdown" });
-}
-
-async function prepareListing(ctx: Context, contract?: string, tokenId?: string, priceEth?: string) {
-  const userId = ctx.from?.id;
-  if (!userId || !contract || !tokenId || !priceEth) return;
-  if (!/^0x[a-fA-F0-9]{40}$/.test(contract) || !/^\d+$/.test(tokenId) ||
-      !/^\d+(?:\.\d{1,18})?$/.test(priceEth) || Number(priceEth) <= 0) {
-    await ctx.reply("Invalid listing details. Use a contract, whole-number token ID, and positive ETH price.");
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) {
+    await ctx.reply("Connect a wallet first.", { reply_markup: noWalletKeyboard });
     return;
   }
 
-  const chain = dbService.getUser(userId)?.selected_chain || DEFAULT_CHAIN_KEY;
-  userStates[userId] = {
-    step: "awaiting_listing_confirmation",
-    data: { contract, tokenId, priceEth, chain, expiresAt: Date.now() + 5 * 60_000 },
-  };
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+    const collection = parts[0] as Address;
+    const tokenId = parts[1];
+    let owner = (parts[2] && /^0x[a-fA-F0-9]{40}$/.test(parts[2])) ? (parts[2] as Address) : undefined;
+    let maxPriceHype = parts[3] ?? (owner ? undefined : parts[2]);
+
+    // If owner not specified, try to read from contract
+    if (!owner) {
+      try {
+        const cfg = getChainConfig(ELYSIUM.key);
+        const { createPublicClient, http } = await import("viem");
+        const client = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+        owner = await client.readContract({
+          address: collection,
+          abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }],
+          functionName: "ownerOf",
+          args: [BigInt(tokenId)],
+        }) as Address;
+      } catch {}
+    }
+
+    if (!owner) {
+      await ctx.reply("⚠️ Could not detect token owner. Please provide seller address:\n`/nftbuy <collection> <tokenId> <seller_address> [maxPrice]`", { parse_mode: "Markdown" });
+      return;
+    }
+
+    userStates[userId] = {
+      step: "awaiting_nftbuy_confirmation",
+      data: { collection, tokenId, owner, maxPriceHype: maxPriceHype || undefined, expiresAt: Date.now() + 5 * 60_000 },
+    };
+
+    let quote = `🛒 *Confirm Kalos NFT Purchase*\n\n`;
+    quote += `📄 *Collection:* \`${collection}\`\n`;
+    quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
+    quote += `👤 *Seller:* \`${owner}\`\n`;
+    if (maxPriceHype) quote += `💰 *Max Price:* \`${maxPriceHype} HYPE\`\n`;
+    quote += `\nReply *CONFIRM* to buy on Kalos, or \`/cancel\`.`;
+    await ctx.reply(quote, { parse_mode: "Markdown" });
+    return;
+  }
+
+  userStates[userId] = { step: "awaiting_nftbuy_params" };
   await ctx.reply(
-    `List NFT \`${contract} #${tokenId}\` on *${getChainConfig(chain).name}* for *${priceEth} ${getChainConfig(chain).symbol}*?\n` +
-    "This creates a 30-day OpenSea listing. NFT approval may submit an on-chain transaction and cost gas. The NFT transfers only if a buyer fulfills the listing.\n" +
-    "Reply *CONFIRM* to continue, or anything else to cancel.",
+    `🛒 *Buy NFT on Kalos*\n\n` +
+    `Send command like this:\n` +
+    `\`<collection_address> <token_id> [seller_address] [max_price_hype]\`\n\n` +
+    `*Example:*\n` +
+    `\`0x123... 4 0.1\`\n\n` +
+    `Or reply \`/cancel\`.`,
     { parse_mode: "Markdown" }
   );
 }
 
-async function executeCreateListing(ctx: Context, data: { contract: string; tokenId: string; priceEth: string; chain: string }) {
+async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId: string; owner: Address; maxPriceHype?: string }) {
   const userId = ctx.from?.id;
   if (!userId) return;
   const wallet = walletManager.getUserWallet(userId);
-  if (!wallet) {
-    await ctx.reply("No wallet found.");
-    return;
-  }
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
 
   try {
-    await ctx.reply("⏳ Creating and publishing the Seaport listing...");
-    const listing = await openSeaService.createNftListing(
-      wallet.privateKey,
-      data.chain,
-      data.contract,
-      data.tokenId,
-      data.priceEth
-    );
-    const orderJson = JSON.stringify(listing.order, (_key, value) => typeof value === "bigint" ? value.toString() : value);
-    const localId = dbService.createListing(
-      userId,
-      data.chain,
-      data.contract,
-      data.tokenId,
-      Number(data.priceEth),
-      listing.orderHash,
-      orderJson
-    );
+    await ctx.reply(`⏳ Purchasing token #${data.tokenId} on Kalos…`, { parse_mode: "Markdown" });
+    const hash = await kalosService.buy(wallet.privateKey, data.collection, data.tokenId, data.owner, {
+      maxPriceEth: data.maxPriceHype,
+    });
+    const cfg = getChainConfig(ELYSIUM.key);
+    dbService.recordTrade(userId, ELYSIUM.key, data.collection, data.tokenId, Number(data.maxPriceHype || "0"), hash, "buy");
     await ctx.reply(
-      `✅ *Listing published* (record #${localId})\n\n` +
-      `💰 Price: \`${data.priceEth} ${getChainConfig(data.chain).symbol}\`\n` +
-      `🔖 Order: \`${listing.orderHash}\`\n` +
-      `📝 The signed order is live on OpenSea until it expires or you cancel it.`,
+      `✅ *NFT Purchased Successfully on Kalos!*\n\n` +
+      `📄 *Collection:* \`${data.collection}\`\n` +
+      `🏷 *Token ID:* \`#${data.tokenId}\`\n` +
+      `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
-  } catch (error: any) {
-    await ctx.reply(`❌ Listing failed: ${error?.shortMessage || error?.message || "OpenSea rejected the listing."}`);
+  } catch (err: any) {
+    await ctx.reply(`❌ Buy failed: ${err?.shortMessage || err?.message || "Contract reverted"}`);
   }
 }
 
-async function prepareOfferAcceptance(ctx: Context, contract: string, tokenId: string) {
+async function promptNftList(ctx: Context, raw?: string) {
   const userId = ctx.from?.id;
   if (!userId) return;
   const wallet = walletManager.getUserWallet(userId);
   if (!wallet) {
-    await ctx.reply("Connect a wallet before accepting an offer.", { reply_markup: noWalletKeyboard });
+    await ctx.reply("Connect a wallet before listing an NFT.", { reply_markup: noWalletKeyboard });
     return;
   }
 
-  try {
-    const chain = dbService.getUser(userId)?.selected_chain || DEFAULT_CHAIN_KEY;
-    const stats = await marketplaceService.autoDetectAndGetStats(contract);
-    if (!stats.openSeaSlug) throw new Error("This NFT has no OpenSea collection slug.");
-    const offer = await openSeaService.getBestOfferForNft(chain, stats.openSeaSlug, contract, tokenId);
-    if (!offer) throw new Error("No supported offer for this exact NFT was found.");
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1]) && /^\d+(?:\.\d{1,18})?$/.test(parts[2])) {
+    const contract = parts[0] as Address;
+    const tokenId = parts[1];
+    const priceHype = parts[2];
+    const days = parts[3] ? Number(parts[3]) : 7;
+
     userStates[userId] = {
-      step: "awaiting_offer_confirmation",
-      data: { contract, tokenId, chain, offer, expiresAt: Date.now() + 5 * 60_000 },
+      step: "awaiting_nftlist_confirmation",
+      data: { contract, tokenId, priceHype, days, expiresAt: Date.now() + 5 * 60_000 },
     };
+
+    let quote = `🏷 *Confirm Kalos NFT Listing*\n\n`;
+    quote += `📄 *Collection:* \`${contract}\`\n`;
+    quote += `🔢 *Token ID:* \`#${tokenId}\`\n`;
+    quote += `💰 *Listing Price:* \`${priceHype} HYPE\`\n`;
+    quote += `⏱ *Duration:* \`${days} days\`\n\n`;
+    quote += `Will approve Kalos marketplace contract if not approved yet.\nReply *CONFIRM* to publish, or \`/cancel\`.`;
+    await ctx.reply(quote, { parse_mode: "Markdown" });
+    return;
+  }
+
+  userStates[userId] = { step: "awaiting_nftlist_params" };
+  await ctx.reply(
+    `🏷 *List NFT on Kalos*\n\n` +
+    `Send listing details:\n` +
+    `\`<collection_address> <token_id> <price_hype> [duration_days]\`\n\n` +
+    `*Example:*\n` +
+    `\`0x123... 1 0.25 7\`\n\n` +
+    `Or reply \`/cancel\`.`,
+    { parse_mode: "Markdown" }
+  );
+}
+
+async function executeNftList(ctx: Context, data: { contract: Address; tokenId: string; priceHype: string; days: number }) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
+
+  try {
+    await ctx.reply(`⏳ Approving & creating listing on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
+    const hash = await kalosService.createListing(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
+    const localId = dbService.createListing(userId, ELYSIUM.key, data.contract, data.tokenId, Number(data.priceHype), hash, null);
+    const cfg = getChainConfig(ELYSIUM.key);
+
     await ctx.reply(
-      `Accept the best offer for NFT \`${contract} #${tokenId}\`?\n` +
-      `💰 Offer: *${offer.price} ${offer.currency}*\n` +
-      "This transfers the NFT after confirmation. Any required NFT approval and the sale transaction use your wallet and require gas.\n" +
-      "Reply *CONFIRM* to accept, or anything else to cancel.",
+      `✅ *Listing Published on Kalos!* (Record #${localId})\n\n` +
+      `📄 *Collection:* \`${data.contract}\`\n` +
+      `🏷 *Token ID:* \`#${data.tokenId}\`\n` +
+      `💰 *Price:* \`${data.priceHype} HYPE\`\n` +
+      `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})\n\n` +
+      `Buyers can now purchase your NFT directly via Kalos on Telegram!`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Listing failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+  }
+}
+
+async function promptNftDelist(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) {
+    await ctx.reply("Connect a wallet first.", { reply_markup: noWalletKeyboard });
+    return;
+  }
+
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+    const contract = parts[0] as Address;
+    const tokenId = parts[1];
+
+    userStates[userId] = {
+      step: "awaiting_nftdelist_confirmation",
+      data: { contract, tokenId, expiresAt: Date.now() + 5 * 60_000 },
+    };
+
+    await ctx.reply(
+      `❌ Cancel listing on Kalos for \`${contract} #${tokenId}\`?\n` +
+      `This executes an on-chain cancel transaction.\n\nReply *CONFIRM* to cancel listing, or \`/cancel\`.`,
       { parse_mode: "Markdown" }
     );
-  } catch (error: any) {
-    await ctx.reply(`❌ Could not prepare offer acceptance: ${error?.message || "Unknown error"}`);
+    return;
   }
+
+  const activeListings = dbService.getUserListings(userId);
+  if (activeListings.length === 0) {
+    await ctx.reply("No active local listings found. Send `/nftdelist <collection> <token_id>` to cancel directly.", { parse_mode: "Markdown" });
+    return;
+  }
+
+  let msg = `📋 *Active Kalos Listings*\n\nSelect a listing to cancel:\n`;
+  const kb = new InlineKeyboard();
+  activeListings.forEach((l) => {
+    msg += `• Listing #${l.id}: Token #${l.token_id} at \`${l.price_eth} HYPE\`\n  Contract: \`${l.contract}\`\n`;
+    kb.text(`Cancel #${l.id} (${l.contract.slice(0, 6)}… #${l.token_id})`, `listing_cancel_${l.id}`).row();
+  });
+  kb.text("🔙 Main Menu", "menu_main");
+  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }
 
-async function executeOfferAcceptance(ctx: Context, data: { contract: string; tokenId: string; chain: string; offer: any }) {
+async function executeNftDelist(ctx: Context, data: { contract: Address; tokenId: string; listingId?: number }) {
   const userId = ctx.from?.id;
   if (!userId) return;
   const wallet = walletManager.getUserWallet(userId);
-  if (!wallet) {
-    await ctx.reply("No wallet found.");
-    return;
-  }
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
+
   try {
-    await ctx.reply("⏳ Accepting the verified NFT offer...");
-    const txHash = await openSeaService.acceptNftOffer(wallet.privateKey, data.chain, data.offer);
-    dbService.recordTrade(userId, data.chain, data.contract, data.tokenId, Number(data.offer.price), txHash, "sell");
+    await ctx.reply(`⏳ Cancelling listing on Kalos...`, { parse_mode: "Markdown" });
+    const hash = await kalosService.cancelListing(wallet.privateKey, data.contract, data.tokenId);
+    if (data.listingId) {
+      dbService.delist(data.listingId, userId);
+    }
+    const cfg = getChainConfig(ELYSIUM.key);
     await ctx.reply(
-      `✅ *Offer accepted*\n\n💰 ${data.offer.price} ${data.offer.currency}\n` +
-      `🔗 [View transaction](${getChainConfig(data.chain).explorerUrl}/tx/${txHash})`,
+      `✅ *Listing Cancelled on Kalos!*\n\n` +
+      `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
-  } catch (error: any) {
-    await ctx.reply(`❌ Offer acceptance failed: ${error?.shortMessage || error?.message || "Unknown error"}`);
+  } catch (err: any) {
+    await ctx.reply(`❌ Delisting failed: ${err?.shortMessage || err?.message || "Reverted"}`);
   }
 }
 
-async function handleListingCancellation(ctx: Context, listingId: number) {
+async function promptNftOffer(ctx: Context, raw?: string) {
   const userId = ctx.from?.id;
   if (!userId) return;
-  const listing = dbService.getUserListings(userId).find((item) => item.id === listingId);
-  if (!listing || !listing.order_json) {
-    await ctx.reply("This listing has no saved Seaport order to cancel.");
-    return;
-  }
-  userStates[userId] = {
-    step: "awaiting_listing_cancel_confirmation",
-    data: { listingId, expiresAt: Date.now() + 5 * 60_000 },
-  };
-  await ctx.reply(`Cancel listing #${listingId} on-chain? This requires a transaction and gas. Reply *CONFIRM* to proceed.`, {
-    parse_mode: "Markdown",
-  });
-}
-
-async function executeListingCancellation(ctx: Context, listingId: number) {
-  const userId = ctx.from?.id;
-  if (!userId) return;
-  const listing = dbService.getUserListings(userId).find((item) => item.id === listingId);
-  if (!listing || !listing.order_json) {
-    await ctx.reply("This listing has no saved Seaport order to cancel.");
-    return;
-  }
   const wallet = walletManager.getUserWallet(userId);
   if (!wallet) {
-    await ctx.reply("No wallet found.");
+    await ctx.reply("Connect a wallet before making an offer.", { reply_markup: noWalletKeyboard });
     return;
   }
-  try {
-    const txHash = await openSeaService.cancelListing(wallet.privateKey, listing.chain, JSON.parse(listing.order_json));
-    dbService.delist(listingId, userId);
-    await ctx.reply(`✅ Listing cancelled on-chain.\n🔗 [View transaction](${getChainConfig(listing.chain).explorerUrl}/tx/${txHash})`, {
-      parse_mode: "Markdown",
-      reply_markup: mainKeyboard,
-    });
-  } catch (error: any) {
-    await ctx.reply(`❌ Listing cancellation failed: ${error?.shortMessage || error?.message || "Unknown error"}`);
+
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1]) && /^\d+(?:\.\d{1,18})?$/.test(parts[2])) {
+    const contract = parts[0] as Address;
+    const tokenId = parts[1];
+    const priceHype = parts[2];
+    const days = parts[3] ? Number(parts[3]) : 7;
+
+    userStates[userId] = {
+      step: "awaiting_nftoffer_confirmation",
+      data: { contract, tokenId, priceHype, days, expiresAt: Date.now() + 5 * 60_000 },
+    };
+
+    let quote = `🤝 *Confirm Kalos Offer / Bid*\n\n`;
+    quote += `📄 *Collection:* \`${contract}\`\n`;
+    quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
+    quote += `💰 *Offer Price:* \`${priceHype} HYPE\`\n`;
+    quote += `⏱ *Expiry:* \`${days} days\`\n\n`;
+    quote += `Reply *CONFIRM* to place bid on Kalos, or \`/cancel\`.`;
+    await ctx.reply(quote, { parse_mode: "Markdown" });
+    return;
   }
+
+  userStates[userId] = { step: "awaiting_nftoffer_params" };
+  await ctx.reply(
+    `🤝 *Make Offer on Kalos*\n\n` +
+    `Send offer details:\n` +
+    `\`<collection_address> <token_id> <price_hype> [days]\`\n\n` +
+    `*Example:*\n` +
+    `\`0x123... 1 0.1 7\`\n\n` +
+    `Or reply \`/cancel\`.`,
+    { parse_mode: "Markdown" }
+  );
 }
 
-async function renderListingsMenu(ctx: Context) {
+async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId: string; priceHype: string; days: number }) {
   const userId = ctx.from?.id;
   if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
 
-  const listings = dbService.getUserListings(userId);
-  if (listings.length === 0) {
-    await ctx.reply("📋 *Saved Listing Records*\n\nNo local records. Marketplace listings are not currently supported.", {
-      parse_mode: "Markdown",
-      reply_markup: mainKeyboard,
-    });
+  try {
+    await ctx.reply(`⏳ Placing token bid on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
+    const hash = await kalosService.createTokenBid(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
+    const cfg = getChainConfig(ELYSIUM.key);
+    await ctx.reply(
+      `✅ *Offer Placed on Kalos!*\n\n` +
+      `📄 *Collection:* \`${data.contract}\`\n` +
+      `🏷 *Token ID:* \`#${data.tokenId}\`\n` +
+      `💰 *Bid:* \`${data.priceHype} HYPE\`\n` +
+      `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Offer failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+  }
+}
+
+async function promptNftAccept(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) {
+    await ctx.reply("Connect a wallet first.", { reply_markup: noWalletKeyboard });
     return;
   }
 
-  let msg = `📋 *Your OpenSea Listings:*\n\n`;
-  const keyboard = new InlineKeyboard();
-  listings.forEach((l) => {
-    msg += `• Listing #${l.id} [${l.chain.toUpperCase()}]: Token #${l.token_id} at *${l.price_eth} ETH*\n`;
-    if (l.order_hash) msg += `  Order: \`${l.order_hash.slice(0, 12)}...\`\n`;
-    keyboard.text(`Cancel #${l.id}`, `listing_cancel_${l.id}`).row();
-  });
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1]) && /^0x[a-fA-F0-9]{40}$/.test(parts[2])) {
+    const contract = parts[0] as Address;
+    const tokenId = parts[1];
+    const bidder = parts[2] as Address;
+    const priceHype = parts[3];
 
-  keyboard.text("🔙 Main Menu", "menu_main");
-  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: keyboard });
+    userStates[userId] = {
+      step: "awaiting_nftaccept_confirmation",
+      data: { contract, tokenId, bidder, priceHype, expiresAt: Date.now() + 5 * 60_000 },
+    };
+
+    let quote = `🤝 *Accept Kalos Bid*\n\n`;
+    quote += `📄 *Collection:* \`${contract}\`\n`;
+    quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
+    quote += `👤 *Bidder:* \`${bidder}\`\n`;
+    if (priceHype) quote += `💰 *Expected Payout:* \`${priceHype} HYPE\`\n`;
+    quote += `\nReply *CONFIRM* to accept bid and transfer NFT, or \`/cancel\`.`;
+    await ctx.reply(quote, { parse_mode: "Markdown" });
+    return;
+  }
+
+  userStates[userId] = { step: "awaiting_nftaccept_params" };
+  await ctx.reply(
+    `🤝 *Accept Offer on Kalos*\n\n` +
+    `Send details:\n` +
+    `\`<collection_address> <token_id> <bidder_address> [expected_price_hype]\`\n\n` +
+    `*Example:*\n` +
+    `\`0x123... 1 0xBidder... 0.1\`\n\n` +
+    `Or reply \`/cancel\`.`,
+    { parse_mode: "Markdown" }
+  );
 }
+
+async function executeNftAccept(ctx: Context, data: { contract: Address; tokenId: string; bidder: Address; priceHype?: string }) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
+
+  try {
+    await ctx.reply(`⏳ Accepting bid and executing transfer on Kalos...`, { parse_mode: "Markdown" });
+    const hash = await kalosService.acceptBid(wallet.privateKey, data.contract, data.tokenId, data.bidder, { priceEth: data.priceHype });
+    const cfg = getChainConfig(ELYSIUM.key);
+    dbService.recordTrade(userId, ELYSIUM.key, data.contract, data.tokenId, Number(data.priceHype || "0"), hash, "sell");
+    await ctx.reply(
+      `✅ *Bid Accepted on Kalos!*\n\n` +
+      `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Accept failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+  }
+}
+
 
 async function renderLaunchMenu(ctx: Context) {
   let msg: string;
@@ -2103,10 +2523,16 @@ async function renderTokenCard(ctx: Context, token: Address) {
     const sym = meta.symbol ? ` ($${meta.symbol})` : "";
     const short = `\`${token.slice(0, 10)}…\``;
     const url = explorer ? `${explorer}/address/${token}` : undefined;
-    const msg = `🖼️ *${name}${sym}* — NFT\n${short} ${token}\n\n*Collection on Elysium* — not a fungible token.\n${url ? `🔍 [View on Explorer](${url}) • ` : ""}👀 Tap Watch to track holders.\n\n*This is an NFT — trading via Kalos, not HYPE swaps.* No Price / Liquidity / Slippage here. Use \`/watch\` or hunter feed \`/deployments\`.`;
+    let floorLine = "No active listings";
+    try {
+      const minP = await kalosService.getMinPriceForCollection(token);
+      if (minP && minP > 0n) floorLine = `\`${kalosService.formatPrice(minP)} HYPE\``;
+    } catch {}
+    const msg = `🖼️ *${name}${sym}* — NFT Collection\n${short} \`${token}\`\n\n🏛 *Marketplace:* Kalos (Elysium L2)\n💰 *Floor Price:* ${floorLine}\n${url ? `🔍 [View on Explorer](${url}) • ` : ""}🌐 [View on Kalos](https://kalos.fun)\n\n*Tap Buy on Kalos to purchase, or List Item to sell directly in Telegram.*`;
     await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: makeNftCardKeyboard(token, url) });
     return;
   }
+
   if (meta && meta.kind === "contract") {
     const sz = meta.bytecodeSize ? `${meta.bytecodeSize} bytes` : "—";
     await ctx.reply(`📄 *Not a tradable token* — \`${token}\`\n\nKind: Contract • Size: ${sz}\nTry hunter feed \`/deployments\` or \`/watch\` to track it.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });

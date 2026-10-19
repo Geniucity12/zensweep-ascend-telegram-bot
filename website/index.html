@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZenSweep | The Elysium Network Telegram Trading & Discovery Terminal</title>
+  <meta name="description" content="ZenSweep is the all-in-one Telegram bot for Elysium — launch tracking, contract deployment discovery, wallet monitoring, safety checks, and HYPE-native trading.">
+  
+  <!-- Open Graph / Meta -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ZenSweep | Elysium Telegram Terminal">
+  <meta property="og:description" content="Scan deployments, verify token safety, monitor smart money, and trade HYPE natively right inside Telegram.">
+  <meta property="og:image" content="https://zensweep.netlify.app/og-preview.png">
+  <meta name="twitter:card" content="summary_large_image">
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Ambient background glow elements -->
+  <div class="glow-orb orb-1"></div>
+  <div class="glow-orb orb-2"></div>
+  <div class="grid-overlay"></div>
+
+  <!-- Navigation -->
+  <header class="navbar">
+    <div class="container nav-content">
+      <a href="#" class="brand-logo">
+        <div class="logo-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" fill="url(#brand-grad)" stroke="#00F2FE" stroke-width="1.5" stroke-linejoin="round"/>
+            <defs>
+              <linearGradient id="brand-grad" x1="3" y1="2" x2="21" y2="22" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#00F2FE"/>
+                <stop offset="1" stop-color="#9d4edd"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <span class="brand-text">Zen<span>Sweep</span></span>
+        <span class="chain-badge">Elysium L2</span>
+      </a>
+
+      <nav class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how-it-works">How It Works</a>
+        <a href="#commands">Commands</a>
+        <a href="#faq">FAQ</a>
+      </nav>
+
+      <div class="nav-actions">
+        <!-- REPLACE WITH YOUR TWITTER LINK -->
+        <a href="https://twitter.com/YOUR_TWITTER_HANDLE" target="_blank" rel="noopener noreferrer" class="social-icon-btn" title="Follow on X (Twitter)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+          </svg>
+        </a>
+
+        <!-- TELEGRAM BOT LINK -->
+        <a href="https://t.me/zensweep_bot" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.75-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/>
+          </svg>
+          <span>Open Bot</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <section class="hero-section">
+    <div class="container hero-container">
+      <div class="hero-text">
+        <div class="hero-pill">
+          <span class="pulsing-dot"></span>
+          <span>Live on Elysium Testnet (Chain ID 99801)</span>
+        </div>
+        <h1 class="hero-title">
+          The On-Chain Radar & Trading Terminal for <span class="highlight">Elysium</span>
+        </h1>
+        <p class="hero-subtitle">
+          Discover newly deployed contracts in real time, analyze token safety scores before trading, monitor smart money wallets, and execute HYPE-native swaps — all directly inside Telegram.
+        </p>
+
+        <div class="hero-cta-group">
+          <a href="https://t.me/zensweep_bot" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-lg pulse-glow">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.75-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/>
+            </svg>
+            <span>Launch @zensweep_bot</span>
+          </a>
+
+          <!-- REPLACE WITH YOUR TWITTER LINK -->
+          <a href="https://twitter.com/YOUR_TWITTER_HANDLE" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-lg">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+            </svg>
+            <span>Follow on X</span>
+          </a>
+        </div>
+
+        <!-- Metric Badges -->
+        <div class="hero-stats">
+          <div class="stat-item">
+            <span class="stat-value">Instant</span>
+            <span class="stat-label">Contract Scan</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat-item">
+            <span class="stat-value">0–100</span>
+            <span class="stat-label">Safety Scored</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat-item">
+            <span class="stat-value">AES-256</span>
+            <span class="stat-label">Encrypted Keys</span>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat-item">
+            <span class="stat-value">HYPE</span>
+            <span class="stat-label">Native Gas</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Telegram Bot Preview Window Mockup -->
+      <div class="hero-visual">
+        <div class="tg-window">
+          <div class="tg-window-header">
+            <div class="tg-window-controls">
+              <span class="ctrl close"></span>
+              <span class="ctrl min"></span>
+              <span class="ctrl max"></span>
+            </div>
+            <div class="tg-window-user">
+              <div class="tg-avatar">⚡</div>
+              <div class="tg-user-info">
+                <span class="tg-user-name">ZenSweep Bot</span>
+                <span class="tg-user-status">bot • online</span>
+              </div>
+            </div>
+            <div class="tg-window-badge">Elysium 99801</div>
+          </div>
+
+          <div class="tg-chat-body">
+            <!-- User Prompt -->
+            <div class="tg-msg user-msg">
+              <span class="tg-msg-text">0x71c8...a839</span>
+              <span class="tg-msg-time">23:48</span>
+            </div>
+
+            <!-- Bot Response: Token Card -->
+            <div class="tg-msg bot-msg">
+              <div class="bot-card">
+                <div class="bot-card-header">
+                  <div class="token-title">
+                    <span class="token-ticker">$HYPEX</span>
+                    <span class="token-fullname">Hyper Elysium Express</span>
+                  </div>
+                  <span class="score-badge score-high">Safety 96/100</span>
+                </div>
+
+                <div class="card-details">
+                  <div class="detail-row">
+                    <span class="lbl">Honeypot Check:</span>
+                    <span class="val success">✓ Clean / Pass</span>
+                  </div>
+                  <div class="detail-row">
+                    <span class="lbl">Mint Privilege:</span>
+                    <span class="val success">✓ Renounced</span>
+                  </div>
+                  <div class="detail-row">
+                    <span class="lbl">Liquidity:</span>
+                    <span class="val">18.4k HYPE (Locked)</span>
+                  </div>
+                  <div class="detail-row">
+                    <span class="lbl">Price:</span>
+                    <span class="val highlight-val">0.0034 HYPE (~$0.12)</span>
+                  </div>
+                </div>
+
+                <!-- Bot Buttons Simulated -->
+                <div class="tg-keyboard">
+                  <div class="tg-btn-row">
+                    <button class="tg-kbd-btn buy">Buy 0.1 HYPE</button>
+                    <button class="tg-kbd-btn buy">Buy 0.5 HYPE</button>
+                    <button class="tg-kbd-btn buy">Buy 1 HYPE</button>
+                  </div>
+                  <div class="tg-btn-row">
+                    <button class="tg-kbd-btn sell">Sell 25%</button>
+                    <button class="tg-kbd-btn sell">Sell 50%</button>
+                    <button class="tg-kbd-btn sell">Sell 100%</button>
+                  </div>
+                  <div class="tg-btn-row">
+                    <button class="tg-kbd-btn secondary">🔍 Refresh</button>
+                    <button class="tg-kbd-btn secondary">📊 Chart</button>
+                    <button class="tg-kbd-btn secondary">💼 Wallet</button>
+                  </div>
+                </div>
+              </div>
+              <span class="tg-msg-time">23:48</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Feature Grid -->
+  <section class="section" id="features">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Powerful Capabilities</span>
+        <h2 class="section-title">Built for Speed and Safety on Elysium</h2>
+        <p class="section-subtitle">Everything you need to navigate Arbitrum Orbit L2 and HyperEVM ecosystem in one conversation.</p>
+      </div>
+
+      <div class="features-grid">
+        <!-- Feature 1 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper cyan">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="2" y1="12" x2="22" y2="12"></line>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </svg>
+          </div>
+          <h3>Deployment Discovery</h3>
+          <p>Scans every new block on Elysium for newly deployed smart contracts so you catch early tokens and mints before anyone else.</p>
+          <div class="card-cmd"><code>/deployments</code></div>
+        </div>
+
+        <!-- Feature 2 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper emerald">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              <polyline points="9 12 11 14 15 10"></polyline>
+            </svg>
+          </div>
+          <h3>Instant Safety Analysis</h3>
+          <p>Evaluates contract code, proxy status, honeypot locks, blacklists, and owner powers. Returns an objective 0–100 risk score.</p>
+          <div class="card-cmd"><code>/safety 0x...</code></div>
+        </div>
+
+        <!-- Feature 3 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper purple">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+          </div>
+          <h3>HYPE-Native Trading</h3>
+          <p>Execute fast swaps using native HYPE gas. Features testnet paper trading mode so you can practice strategies risk-free.</p>
+          <div class="card-cmd"><code>1-Click Buy / Sell</code></div>
+        </div>
+
+        <!-- Feature 4 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper gold">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+          </div>
+          <h3>Wallet Watchlist & Alerts</h3>
+          <p>Track team treasuries, whales, or influential wallets. Receive automatic Telegram DM notifications whenever their balance shifts.</p>
+          <div class="card-cmd"><code>/watch 0x... [label]</code></div>
+        </div>
+
+        <!-- Feature 5 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper red">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+          </div>
+          <h3>Launch Board & Mint Timers</h3>
+          <p>Curated Ascend & Elysium launches with countdown clocks, direct links, and scheduled reminder pings right before mint opens.</p>
+          <div class="card-cmd"><code>/launch & /mints</code></div>
+        </div>
+
+        <!-- Feature 6 -->
+        <div class="feature-card">
+          <div class="feature-icon-wrapper blue">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </div>
+          <h3>AES-256 Custodial Security</h3>
+          <p>Personal non-custodial-style custodial wallet per user with keys encrypted at rest. Withdraw anytime or export your private key.</p>
+          <div class="card-cmd"><code>/wallet & /export</code></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How It Works Section -->
+  <section class="section bg-darker" id="how-it-works">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Getting Started</span>
+        <h2 class="section-title">Start in 30 Seconds</h2>
+        <p class="section-subtitle">No browser extensions, no seed phrase setups. Ready on mobile and desktop.</p>
+      </div>
+
+      <div class="steps-wrapper">
+        <div class="step-card">
+          <div class="step-num">01</div>
+          <h4>Start the Bot</h4>
+          <p>Click <a href="https://t.me/zensweep_bot" target="_blank" rel="noopener">@zensweep_bot</a> in Telegram and tap <strong>/start</strong> to immediately initialize your Elysium wallet.</p>
+        </div>
+
+        <div class="step-card">
+          <div class="step-num">02</div>
+          <h4>Paste Any Token Address</h4>
+          <p>Drop any contract address (<code>0x...</code>) into the chat. ZenSweep runs automated audits and returns the interactive trading card.</p>
+        </div>
+
+        <div class="step-card">
+          <div class="step-num">03</div>
+          <h4>Trade & Monitor</h4>
+          <p>Execute 1-tap buys, set auto-alerts on team wallets, track your live portfolio PnL, and discover new launches in real time.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interactive Commands Explorer -->
+  <section class="section" id="commands">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Command Center</span>
+        <h2 class="section-title">Commands at Your Fingertips</h2>
+        <p class="section-subtitle">Simple, intuitive commands built for quick execution in Telegram chat.</p>
+      </div>
+
+      <div class="commands-table-wrapper">
+        <table class="commands-table">
+          <thead>
+            <tr>
+              <th>Command</th>
+              <th>Action</th>
+              <th>Example / Usage</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>/start</code></td>
+              <td>Open the main ZenSweep dashboard and quick actions</td>
+              <td>Initialize or view status</td>
+            </tr>
+            <tr>
+              <td><code>0x...</code></td>
+              <td>Paste any contract address to open the Token Card</td>
+              <td>Instant safety check & buy/sell</td>
+            </tr>
+            <tr>
+              <td><code>/deployments</code></td>
+              <td>Scans recent Elysium blocks for newly created contracts</td>
+              <td>Find early launches</td>
+            </tr>
+            <tr>
+              <td><code>/safety 0x...</code></td>
+              <td>Run full safety & anti-rug analysis on any token</td>
+              <td>0–100 scored audit</td>
+            </tr>
+            <tr>
+              <td><code>/watch 0x...</code></td>
+              <td>Monitor an EVM address and receive DM alerts on balance updates</td>
+              <td>Track whale / team movements</td>
+            </tr>
+            <tr>
+              <td><code>/portfolio</code></td>
+              <td>View your active balances, realized PnL, and shareable card</td>
+              <td>Real-time profit tracking</td>
+            </tr>
+            <tr>
+              <td><code>/launch</code></td>
+              <td>Browse curated upcoming & active Elysium/Ascend launches</td>
+              <td>Launch board & mint links</td>
+            </tr>
+            <tr>
+              <td><code>/mints</code></td>
+              <td>View active mint windows with countdown timers</td>
+              <td>DM alert reminders</td>
+            </tr>
+            <tr>
+              <td><code>/elysium</code></td>
+              <td>Live chain health (block height, gas price, block speed)</td>
+              <td>Elysium network telemetry</td>
+            </tr>
+            <tr>
+              <td><code>/wallet</code></td>
+              <td>View your address, deposit address, balance & withdrawal options</td>
+              <td>Manage funds securely</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ Section -->
+  <section class="section bg-darker" id="faq">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">Got Questions?</span>
+        <h2 class="section-title">Frequently Asked Questions</h2>
+      </div>
+
+      <div class="faq-accordion">
+        <div class="faq-item">
+          <button class="faq-question">
+            <span>What is ZenSweep?</span>
+            <span class="faq-icon">+</span>
+          </button>
+          <div class="faq-answer">
+            <p>ZenSweep is a high-speed Telegram bot tailored specifically for the Elysium network (an Arbitrum Orbit L2 settling to HyperEVM using HYPE for gas). It lets users discover fresh deployments, audit contract safety, monitor wallets, and trade directly in chat.</p>
+          </div>
+        </div>
+
+        <div class="faq-item">
+          <button class="faq-question">
+            <span>Do I need real money or HYPE to test it out?</span>
+            <span class="faq-icon">+</span>
+          </button>
+          <div class="faq-answer">
+            <p>No! On Elysium Testnet, ZenSweep features built-in synthetic paper trading. You can execute buys and sells, test trading strategies, and track your portfolio without risking real funds. You can also claim free testnet HYPE from the faucet.</p>
+          </div>
+        </div>
+
+        <div class="faq-item">
+          <button class="faq-question">
+            <span>How are my private keys secured?</span>
+            <span class="faq-icon">+</span>
+          </button>
+          <div class="faq-answer">
+            <p>Your wallet keys are encrypted at rest using military-grade AES-256-GCM encryption. Keys are never exposed through Telegram except via your own explicit /export command. You have 100% control to withdraw funds or export your keys at any time.</p>
+          </div>
+        </div>
+
+        <div class="faq-item">
+          <button class="faq-question">
+            <span>How does the Safety Score work?</span>
+            <span class="faq-icon">+</span>
+          </button>
+          <div class="faq-answer">
+            <p>ZenSweep inspects the bytecode and ABI of the target contract. It checks for known honeypot traps, blacklist functions, unrenounced mint privileges, proxy delegate calls, and liquidity locks, yielding an objective score from 0 to 100.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Call To Action Banner -->
+  <section class="cta-banner-section">
+    <div class="container">
+      <div class="cta-banner">
+        <h2>Ready to Master the Elysium Network?</h2>
+        <p>Join traders scanning new deployments, verifying contracts, and executing trades directly in Telegram.</p>
+        <div class="cta-banner-btns">
+          <a href="https://t.me/zensweep_bot" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-lg pulse-glow">
+            <span>Launch @zensweep_bot</span>
+          </a>
+          <!-- REPLACE WITH YOUR TWITTER LINK -->
+          <a href="https://twitter.com/YOUR_TWITTER_HANDLE" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-lg">
+            <span>Follow on X (Twitter)</span>
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container footer-content">
+      <div class="footer-left">
+        <div class="brand-logo">
+          <div class="logo-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+              <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" fill="url(#brand-grad-footer)" stroke="#00F2FE" stroke-width="1.5" stroke-linejoin="round"/>
+              <defs>
+                <linearGradient id="brand-grad-footer" x1="3" y1="2" x2="21" y2="22" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#00F2FE"/>
+                  <stop offset="1" stop-color="#9d4edd"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+          <span class="brand-text">Zen<span>Sweep</span></span>
+        </div>
+        <p class="footer-desc">
+          The ultimate on-chain Telegram assistant for Elysium — deployment scanner, token safety auditor, and trading companion.
+        </p>
+      </div>
+
+      <div class="footer-links-group">
+        <div class="footer-col">
+          <h5>Product</h5>
+          <a href="https://t.me/zensweep_bot" target="_blank" rel="noopener">Telegram Bot</a>
+          <a href="#features">Features</a>
+          <a href="#commands">Commands</a>
+          <a href="#faq">FAQ</a>
+        </div>
+
+        <div class="footer-col">
+          <h5>Community</h5>
+          <!-- REPLACE WITH YOUR TWITTER LINK -->
+          <a href="https://twitter.com/YOUR_TWITTER_HANDLE" target="_blank" rel="noopener">Twitter / X</a>
+          <a href="https://t.me/zensweep_bot" target="_blank" rel="noopener">Telegram</a>
+          <a href="https://elysium.kinetiq.xyz" target="_blank" rel="noopener">Elysium Network</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="container footer-bottom">
+      <p>&copy; 2026 ZenSweep. Built for Elysium & HyperEVM.</p>
+      <p class="disclaimer">Disclaimer: Trading digital assets involves significant risk. ZenSweep provides analytical tools and paper-trading simulation. Always conduct your own research.</p>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
+

@@ -84,7 +84,7 @@ export const MINT_FUNCTION_ABI = env("MINT_FUNCTION_ABI", "function mint(uint256
 export const ELYSIUM_ROUTER_ADDRESS = env("ELYSIUM_ROUTER_ADDRESS", "");
 export const ELYSIUM_WHYPE_ADDRESS = env("ELYSIUM_WHYPE_ADDRESS", "");
 export const KALOS_API_URL = env("KALOS_API_URL", "");
-export const KALOS_MARKETPLACE_ADDRESS = env("KALOS_MARKETPLACE_ADDRESS", "");
+export const KALOS_MARKETPLACE_ADDRESS = env("KALOS_MARKETPLACE_ADDRESS", "0x0ff8b7afc288ac42f82320f54a49c400f233bf07");
 export const ALERT_POLL_INTERVAL_MS = Number(env("ALERT_POLL_INTERVAL_MS", String(5 * 60_000)));
 export const OPENSEA_API_KEY = env("OPENSEA_API_KEY", "");
 

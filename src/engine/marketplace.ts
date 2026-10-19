@@ -87,10 +87,28 @@ export const marketplaceService = {
       // ignore; fall back to defaults
     }
 
-    // OpenSea enrichment (optional).
-    let openSeaSlug: string | undefined;
+    // Enrichment variables
     let floorPrice: number | undefined;
     let floorCurrency: string | undefined;
+
+    // Kalos marketplace enrichment for Elysium
+    if (chainKey === ELYSIUM.key) {
+      try {
+        const minPriceWei = await kalosService.getMinPriceForCollection(addr);
+        if (minPriceWei && minPriceWei > 0n) {
+          floorPrice = Number(formatEther(minPriceWei));
+          floorCurrency = "HYPE";
+        }
+      } catch {
+        // Kalos read failed or no floor set
+      }
+    }
+
+    // OpenSea enrichment (fallback for cross-chain).
+    let openSeaSlug: string | undefined;
+
+    let floorPriceOs: number | undefined;
+    let floorCurrencyOs: string | undefined;
     let openSeaUrl: string | undefined;
     const osChain = openseaSlugForChain(chainKey);
     if (osChain) {
@@ -99,10 +117,10 @@ export const marketplaceService = {
           `/chain/${osChain}/contract/${addr}`
         );
         if (col?.collection) {
-          openSeaSlug = undefined; // slug not returned here; derived below
+          openSeaSlug = undefined;
           if (typeof col.collection.floor_price === "number") {
-            floorPrice = col.collection.floor_price;
-            floorCurrency = cfg.symbol;
+            floorPriceOs = col.collection.floor_price;
+            floorCurrencyOs = cfg.symbol;
           }
           if (col.collection.name) name = col.collection.name;
         }
@@ -119,8 +137,8 @@ export const marketplaceService = {
       chain: cfg.name,
       chainKey,
       contract: addr,
-      floorPrice,
-      floorCurrency,
+      floorPrice: floorPrice ?? floorPriceOs,
+      floorCurrency: floorCurrency ?? floorCurrencyOs,
       explorerUrl: `${cfg.explorerUrl}/address/${addr}`,
       openSeaUrl,
       openSeaSlug,
@@ -128,6 +146,80 @@ export const marketplaceService = {
   },
 
   async getNFTsForUser(address: string, chainKey: string): Promise<UserNft[]> {
+    if (chainKey === ELYSIUM.key) {
+      const results: UserNft[] = [];
+      const cfg = getChainConfig(ELYSIUM.key);
+      try {
+        const client = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+        // Check known / tracked launches and contracts
+        const { kiwiLaunches } = await import("../data/launches");
+        const candidates = new Set<string>();
+        for (const l of kiwiLaunches) {
+          if (l.contractAddress && /^0x[a-fA-F0-9]{40}$/.test(l.contractAddress)) {
+            candidates.add(l.contractAddress.toLowerCase());
+          }
+        }
+        // Also check any active user listings from local DB
+        const { dbService } = await import("../db");
+        for (const row of dbService.getUserListings(0)) {
+          if (row.contract && /^0x[a-fA-F0-9]{40}$/.test(row.contract)) {
+            candidates.add(row.contract.toLowerCase());
+          }
+        }
+
+        const balAbi = [
+          { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] },
+          { name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+          { name: "tokenOfOwnerByIndex", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "index", type: "uint256" }], outputs: [{ type: "uint256" }] },
+        ] as const;
+
+        for (const col of Array.from(candidates)) {
+          try {
+            const colAddr = col as Address;
+            const bal = await client.readContract({
+              address: colAddr,
+              abi: balAbi,
+              functionName: "balanceOf",
+              args: [address as Address],
+            }) as bigint;
+
+            if (bal > 0n) {
+              let colName = "Elysium NFT";
+              try {
+                colName = await client.readContract({ address: colAddr, abi: balAbi, functionName: "name" }) as string;
+              } catch {}
+
+              const count = Number(bal);
+              for (let i = 0; i < Math.min(count, 5); i++) {
+                let tid = String(i + 1);
+                try {
+                  const onChainTid = await client.readContract({
+                    address: colAddr,
+                    abi: balAbi,
+                    functionName: "tokenOfOwnerByIndex",
+                    args: [address as Address, BigInt(i)],
+                  }) as bigint;
+                  tid = onChainTid.toString();
+                } catch {
+                  // Not ERC721Enumerable, use sequential index placeholder
+                }
+                results.push({
+                  title: `${colName} #${tid}`,
+                  contract: colAddr,
+                  tokenId: tid,
+                });
+              }
+            }
+          } catch {
+            // Ignore non-NFT contracts or failed queries
+          }
+        }
+      } catch {
+        // Fall back gracefully
+      }
+      return results;
+    }
+
     const osChain = openseaSlugForChain(chainKey);
     if (!osChain) return [];
     try {
@@ -144,4 +236,5 @@ export const marketplaceService = {
     }
   },
 };
+
 
