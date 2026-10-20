@@ -125,6 +125,14 @@ export function registerHandlers(bot: Bot) {
   bot.command("collection", async (ctx) => {
     await renderCollectionsMenu(ctx);
   });
+  bot.command("sweep", async (ctx) => {
+    const arg = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await handleSweepCommand(ctx, arg);
+  });
+  bot.command("floor", async (ctx) => {
+    const arg = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await handleSweepCommand(ctx, arg);
+  });
 
   bot.command("nfts", async (ctx) => {
     await renderNFTsMenu(ctx);
@@ -552,6 +560,19 @@ export function registerHandlers(bot: Bot) {
     const col = ctx.match[1] as Address;
     const tid = ctx.match[2];
     await promptNftOffer(ctx, tid ? `${col} ${tid}` : col);
+  });
+  bot.callbackQuery(/^kalos_sweep_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await handleSweepCommand(ctx, ctx.match[1]);
+  });
+  bot.callbackQuery(/^kalos_sweepbuy_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const tid = ctx.match[2];
+    await promptNftBuy(ctx, `${col} ${tid}`);
+  });
+  bot.callbackQuery("noop", async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Already showing the cheapest live listing." }).catch(() => {});
   });
 
   bot.callbackQuery(/^kalos_mint_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
@@ -1078,6 +1099,32 @@ export function registerHandlers(bot: Bot) {
       return;
     }
 
+    if (state?.step === "awaiting_sweep_contract") {
+      delete userStates[userId];
+      const parts = text.trim().split(/\s+/).filter(Boolean);
+      const contract = parts[0] ?? "";
+      const maxPrice = parts[1];
+      if (!contract || !/^0x[a-fA-F0-9]{40}$/.test(contract)) {
+        await ctx.reply("That doesn't look like an EVM address. Send `<0x…> [maxHYPE]`.", { parse_mode: "Markdown" });
+        return;
+      }
+      await renderSweepResults(ctx, contract as Address, maxPrice);
+      return;
+    }
+
+    if (state?.step === "awaiting_sweep_confirm") {
+      if (/^(yes|y|buy|sweep|confirm)$/i.test(text.trim())) {
+        const data = state.data;
+        delete userStates[userId];
+        if (!data || Date.now() > data.expiresAt) {
+          await ctx.reply("Sweep expired. Tap 🧹 Re-scan floor to refresh.", { parse_mode: "Markdown" });
+          return;
+        }
+        await promptNftBuy(ctx, `${data.contract} ${data.tokenId}`);
+        return;
+      }
+    }
+
 
     if (state?.step === "awaiting_buyx_amount") {
       const raw = text.trim();
@@ -1557,9 +1604,116 @@ async function handleFloorLookup(ctx: Context, contract: string) {
 
 }
 
+async function handleSweepCommand(ctx: Context, arg: string) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const parts = (arg ?? "").trim().split(/\s+/).filter(Boolean);
+  const contract = parts[0] ?? "";
+  const maxPrice = parts[1];
+  if (!contract || !/^0x[a-fA-F0-9]{40}$/.test(contract)) {
+    userStates[userId] = { step: "awaiting_sweep_contract" };
+    await ctx.reply(
+      `🧹 *Sweep Floor on Kalos*\n\nReply with a collection + optional max price:\n\n\`<0x…> [maxHYPE]\`\n\n*Examples:*\n\`0xd0e6…5d95 0.15\` — cheapest Azuki under 0.15\n\`0xd0e6…5d95\` — cheapest at any price`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+  await renderSweepResults(ctx, contract as Address, maxPrice);
+}
+
+async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?: string) {
+  const userId = ctx.from?.id;
+  const cfg = getChainConfig(ELYSIUM.key);
+  await ctx.reply(`🔍 Scanning Kalos for the cheapest live listing…`, { parse_mode: "Markdown" });
+  // Balance pre-check
+  if (userId) {
+    try {
+      const w0 = walletManager.getUserWallet(userId);
+      if (w0) {
+        const b = await walletManager.getBalance(w0.address, ELYSIUM.key, true);
+        if (Number(b.eth) <= 0) {
+          await ctx.reply(
+            `🔴 *No HYPE to sweep with*\n\nYour wallet \`${w0.address}\` holds \`0 ${b.symbol}\`.\n\nTap 💧 Get Testnet HYPE on /wallet, then try /sweep again.`,
+            { parse_mode: "Markdown", reply_markup: mainKeyboard }
+          );
+          return;
+        }
+      }
+    } catch {}
+  }
+  let cheapest: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
+  try {
+    cheapest = await kalosService.findCheapestListings(contract, { maxScan: 60, maxResults: 5, maxPriceEth: maxPriceEth });
+  } catch (e: any) {
+    await ctx.reply(`🔴 Kalos scan failed: ${e?.shortMessage ?? e?.message ?? "unknown"}`, { parse_mode: "Markdown" });
+    return;
+  }
+  if (cheapest.length === 0) {
+    let floorLine = "No active listings";
+    try {
+      const minP = await kalosService.getMinPriceForCollection(contract);
+      if (minP && minP > 0n) floorLine = `${kalosService.formatPrice(minP)} HYPE`;
+    } catch {}
+    await ctx.reply(
+      `🧹 *Sweep Floor — no match*\n\nContract: \`${contract}\`\nKalos floor: \`${floorLine}\`\n${maxPriceEth ? `Max filter: \`${maxPriceEth} HYPE\`\n` : ""}\nNo live listing found in the first 60 tokenIds. The floor may be stale, expired, or above your max. Try without a max or tap Collections to browse.`,
+      { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("🏷️ Collections", "menu_collections").text("🔙 Main Menu", "menu_main") }
+    );
+    return;
+  }
+  const best = cheapest[0];
+  const bestPrice = kalosService.formatPrice(best.price);
+  let ownerNow: string = best.seller;
+  try {
+    const { createPublicClient, http } = await import("viem");
+    const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+    ownerNow = (await pc.readContract({
+      address: contract, abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as any,
+      functionName: "ownerOf", args: [best.tokenId],
+    } as any)) as string;
+  } catch {}
+  for (const c of cheapest.slice(0, 3)) {
+    const p = kalosService.formatPrice(c.price);
+    const isBest = c.tokenId === best.tokenId && c.seller.toLowerCase() === best.seller.toLowerCase();
+    const kb = new InlineKeyboard()
+      .text(isBest ? `🛒 Buy #${c.tokenId} — ${p} HYPE` : `Buy #${c.tokenId} — ${p}`, `kalos_sweepbuy_${contract}_${c.tokenId}`)
+      .row()
+      .text("🧹 Re-scan floor", `kalos_sweep_${contract}`)
+      .text("🏷️ Collections", "menu_collections")
+      .row()
+      .text("🔙 Main Menu", "menu_main");
+    const expLine = c.expiration > 0n ? ` · ends ${new Date(Number(c.expiration) * 1000).toLocaleDateString()}` : "";
+    await ctx.reply(
+      `${isBest ? "🏆 *Cheapest live listing*" : "💰 *Also listed*"}\n\n🖼️ \`${contract.slice(0, 10)}…\` #${c.tokenId}\n💰 Price: \`${p} HYPE\`${expLine}\n👤 Seller: \`${c.seller}\`\n🔗 [View on Kalos](https://kalos.fun/collections/azuki/${c.tokenId}) · [Explorer](${cfg.explorerUrl}/address/${contract})${isBest && ownerNow.toLowerCase() !== best.seller.toLowerCase() ? `\n\n⚠️ Owner changed since listing — re-check before buying.` : ""}`,
+      { parse_mode: "Markdown", reply_markup: kb }
+    );
+  }
+  if (userId) {
+    // Remember the best hit so a bare "yes" confirms the sweep
+    userStates[userId] = { step: "awaiting_sweep_confirm", data: { contract, tokenId: best.tokenId.toString(), seller: best.seller, price: bestPrice, expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(`Reply \`yes\` to buy #${best.tokenId} for ~${bestPrice} HYPE, or tap Buy above.`, { parse_mode: "Markdown" });
+  }
+}
+
+const KNOWN_KALOS_COLLECTIONS: Array<{ name: string; address: Address; tag?: string }> = [
+  { name: "Azuki", address: "0xd0e627cd8e3197503cc1283fdb7f97fb3d6c5d95" as Address, tag: "Art · 10k" },
+];
+
 async function renderCollectionsMenu(ctx: Context) {
   const cfg = getChainConfig(ELYSIUM.key);
   const kalosAddress = kalosService.address();
+
+  // Live floors for known collections
+  const floors = new Map<string, string>();
+  await Promise.all(
+    KNOWN_KALOS_COLLECTIONS.map(async (kc) => {
+      try {
+        const minP = await kalosService.getMinPriceForCollection(kc.address);
+        floors.set(kc.address.toLowerCase(), minP && minP > 0n ? `${kalosService.formatPrice(minP)} HYPE` : "No active listings");
+      } catch {
+        floors.set(kc.address.toLowerCase(), "unreadable");
+      }
+    })
+  );
 
   let msg = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
   msg += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
@@ -1570,6 +1724,13 @@ async function renderCollectionsMenu(ctx: Context) {
   const nftProjects = projects.filter((p) => p.contractAddress || p.tags.includes("nft") || p.tags.includes("collection") || p.status === "minting" || p.status === "live");
 
   const kb = new InlineKeyboard();
+  msg += `*Live on Kalos (floor = cheapest on-chain ask):*\n\n`;
+  for (const kc of KNOWN_KALOS_COLLECTIONS) {
+    const floor = floors.get(kc.address.toLowerCase()) ?? "…";
+    msg += `• *${kc.name}* — \`${floor}\`${kc.tag ? ` · ${kc.tag}` : ""}\n  \`${kc.address}\`\n`;
+    kb.text(`🧹 Sweep ${kc.name} floor`, `kalos_sweep_${kc.address}`).row();
+  }
+  msg += `\n`;
 
   if (nftProjects.length === 0) {
     msg += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
@@ -1594,8 +1755,8 @@ async function renderCollectionsMenu(ctx: Context) {
     }
   }
 
-  msg += `💡 *Kalos Commands:*\n`;
-  msg += `• \`/mint [contract] [qty] [price]\` — Direct mint\n`;
+  msg += `💡 *Kalos Commands (manual still works):*\n`;
+  msg += `• \`/sweep <0x…> [maxHYPE]\` — auto-find cheapest + 1-tap Buy\n`;
   msg += `• \`/nftbuy [contract] [id]\` — Buy item on Kalos\n`;
   msg += `• \`/nftlist [contract] [id] [price]\` — List on Kalos\n`;
   msg += `• \`/nftdelist [contract] [id]\` — Cancel listing\n`;

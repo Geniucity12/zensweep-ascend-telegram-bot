@@ -93,4 +93,33 @@ export const kalosService = {
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
   formatPrice(bi: bigint): string { return formatEther(bi); },
+  async findCheapestListings(collection: Address, opts?: { maxScan?: number; maxResults?: number; maxPriceEth?: string }): Promise<Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }>> {
+    const maxScan = opts?.maxScan ?? 60;
+    const maxResults = opts?.maxResults ?? 5;
+    const maxPrice = opts?.maxPriceEth ? parseEther(opts.maxPriceEth) : undefined;
+    const client = publicClient();
+    const out: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
+    // Bound concurrency: 10 at a time
+    const ownerAbi = [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as const;
+    for (let start = 1; start <= maxScan; start += 10) {
+      const batch: Array<Promise<void>> = [];
+      for (let tid = start; tid < start + 10 && tid <= maxScan; tid++) {
+        batch.push((async () => {
+          try {
+            const owner = (await client.readContract({ address: collection, abi: ownerAbi as any, functionName: "ownerOf", args: [BigInt(tid)] } as any)) as Address;
+            const listing = await this.getListing(collection, BigInt(tid), owner);
+            if (!listing || listing.pricePerItem === 0n) return;
+            if (maxPrice !== undefined && listing.pricePerItem > maxPrice) return;
+            const now = BigInt(Math.floor(Date.now() / 1000));
+            if (listing.expirationTime > 0n && listing.expirationTime < now) return;
+            out.push({ tokenId: BigInt(tid), seller: owner, price: listing.pricePerItem, expiration: listing.expirationTime });
+          } catch { /* skip missing tokenIds / unlisted */ }
+        })());
+      }
+      await Promise.all(batch);
+      if (out.length >= maxResults * 2) break;
+    }
+    out.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+    return out.slice(0, maxResults);
+  },
 };

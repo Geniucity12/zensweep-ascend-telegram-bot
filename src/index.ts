@@ -46,6 +46,7 @@ async function main() {
     { command: "portfolio", description: "What you hold — PnL & share card" },
     { command: "slippage", description: "Your price tolerance (1–50%)" },
     { command: "collections", description: "Live Kalos NFT collections" },
+    { command: "sweep", description: "Sweep floor — cheapest live listing" },
     { command: "nfts", description: "Your Elysium NFT inventory" },
     { command: "mint", description: "Mint an NFT — /mint [contract]" },
     { command: "nftbuy", description: "Buy NFT on Kalos — /nftbuy [col] [id]" },
