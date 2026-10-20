@@ -571,6 +571,17 @@ export function registerHandlers(bot: Bot) {
     const tid = ctx.match[2];
     await promptNftBuy(ctx, `${col} ${tid}`);
   });
+  bot.callbackQuery(/^kalos_sweepbuyN_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const st = userStates[userId];
+    if (!st || st.step !== "awaiting_sweepN_confirm" || !st.data) {
+      await ctx.reply("Sweep expired. Tap 🧹 Re-scan floor to refresh.", { parse_mode: "Markdown" });
+      return;
+    }
+    await executeSweepBuy(ctx, st.data.contract as Address, st.data.items as Array<{ tokenId: string; seller: string; price: string }>);
+  });
   bot.callbackQuery("noop", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Already showing the cheapest live listing." }).catch(() => {});
   });
@@ -1125,6 +1136,19 @@ export function registerHandlers(bot: Bot) {
       }
     }
 
+    if (state?.step === "awaiting_sweepN_confirm") {
+      if (/^(yes|y|buy|sweep|confirm)$/i.test(text.trim())) {
+        const data = state.data;
+        delete userStates[userId];
+        if (!data || Date.now() > data.expiresAt) {
+          await ctx.reply("Sweep expired. Tap 🧹 Re-scan floor to refresh.", { parse_mode: "Markdown" });
+          return;
+        }
+        await executeSweepBuy(ctx, data.contract as Address, data.items as Array<{ tokenId: string; seller: string; price: string }>);
+        return;
+      }
+    }
+
 
     if (state?.step === "awaiting_buyx_amount") {
       const raw = text.trim();
@@ -1609,22 +1633,33 @@ async function handleSweepCommand(ctx: Context, arg: string) {
   if (!userId) return;
   const parts = (arg ?? "").trim().split(/\s+/).filter(Boolean);
   const contract = parts[0] ?? "";
-  const maxPrice = parts[1];
+  // /sweep <contract> [count] [maxHYPE] — e.g. /sweep 0x… 3 10
+  let count = 1;
+  let maxPrice: string | undefined;
+  const nums = parts.slice(1).map((p) => Number(p)).filter((n) => Number.isFinite(n) && n > 0);
+  if (nums.length === 1) {
+    // Ambiguous: integer 1-10 = count, otherwise max price
+    if (Number.isInteger(nums[0]) && nums[0] <= 10 && !parts[1].includes(".")) count = Math.min(10, Math.floor(nums[0]));
+    else maxPrice = parts[1];
+  } else if (nums.length >= 2) {
+    count = Math.max(1, Math.min(10, Math.floor(nums[0])));
+    maxPrice = parts[2];
+  }
   if (!contract || !/^0x[a-fA-F0-9]{40}$/.test(contract)) {
     userStates[userId] = { step: "awaiting_sweep_contract" };
     await ctx.reply(
-      `🧹 *Sweep Floor on Kalos*\n\nReply with a collection + optional max price:\n\n\`<0x…> [maxHYPE]\`\n\n*Examples:*\n\`0xd0e6…5d95 0.15\` — cheapest Azuki under 0.15\n\`0xd0e6…5d95\` — cheapest at any price`,
+      `🧹 *Sweep Floor on Kalos*\n\nReply with a collection + how many + max each:\n\n\`<0x…> [count] [maxHYPE]\`\n\n*Examples:*\n\`0xd0e6…5d95\` — cheapest 1\n\`0xd0e6…5d95 3\` — cheapest 3 in one tx\n\`0xd0e6…5d95 3 10\` — 3 cheapest under 10 HYPE each`,
       { parse_mode: "Markdown" }
     );
     return;
   }
-  await renderSweepResults(ctx, contract as Address, maxPrice);
+  await renderSweepResults(ctx, contract as Address, maxPrice, count);
 }
 
-async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?: string) {
+async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?: string, count: number = 1) {
   const userId = ctx.from?.id;
   const cfg = getChainConfig(ELYSIUM.key);
-  await ctx.reply(`🔍 Scanning Kalos for the cheapest live listing…`, { parse_mode: "Markdown" });
+  await ctx.reply(`🔍 Scanning Kalos for the ${count > 1 ? `${count} cheapest live listings` : "cheapest live listing"}…`, { parse_mode: "Markdown" });
   // Balance pre-check
   if (userId) {
     try {
@@ -1641,9 +1676,10 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
       }
     } catch {}
   }
+  const want = Math.max(1, Math.min(10, Math.floor(count)));
   let cheapest: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
   try {
-    cheapest = await kalosService.findCheapestListings(contract, { maxScan: 60, maxResults: 5, maxPriceEth: maxPriceEth });
+    cheapest = await kalosService.findCheapestListings(contract, { maxScan: 500, maxResults: Math.max(want, 5), maxPriceEth: maxPriceEth });
   } catch (e: any) {
     await ctx.reply(`🔴 Kalos scan failed: ${e?.shortMessage ?? e?.message ?? "unknown"}`, { parse_mode: "Markdown" });
     return;
@@ -1660,8 +1696,11 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
     );
     return;
   }
-  const best = cheapest[0];
+  const take = cheapest.slice(0, want);
+  const best = take[0];
   const bestPrice = kalosService.formatPrice(best.price);
+  const totalWei = take.reduce((s, h) => s + h.price, 0n);
+  const totalStr = kalosService.formatPrice(totalWei);
   let ownerNow: string = best.seller;
   try {
     const { createPublicClient, http } = await import("viem");
@@ -1671,7 +1710,7 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
       functionName: "ownerOf", args: [best.tokenId],
     } as any)) as string;
   } catch {}
-  for (const c of cheapest.slice(0, 3)) {
+  for (const c of take.slice(0, 3)) {
     const p = kalosService.formatPrice(c.price);
     const isBest = c.tokenId === best.tokenId && c.seller.toLowerCase() === best.seller.toLowerCase();
     const kb = new InlineKeyboard()
@@ -1683,18 +1722,36 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
       .text("🔙 Main Menu", "menu_main");
     const expLine = c.expiration > 0n ? ` · ends ${new Date(Number(c.expiration) * 1000).toLocaleDateString()}` : "";
     await ctx.reply(
-      `${isBest ? "🏆 *Cheapest live listing*" : "💰 *Also listed*"}\n\n🖼️ \`${contract.slice(0, 10)}…\` #${c.tokenId}\n💰 Price: \`${p} HYPE\`${expLine}\n👤 Seller: \`${c.seller}\`\n🔗 [View on Kalos](https://kalos.fun/collections/azuki/${c.tokenId}) · [Explorer](${cfg.explorerUrl}/address/${contract})${isBest && ownerNow.toLowerCase() !== best.seller.toLowerCase() ? `\n\n⚠️ Owner changed since listing — re-check before buying.` : ""}`,
+      `${isBest ? "🏆 *Cheapest live listing*" : "💰 *Also listed*"}\n\n🖼️ \`${contract.slice(0, 10)}…\` #${c.tokenId}\n💰 Price: \`${p} HYPE\`${expLine}\n👤 Seller: \`${c.seller}\`\n🔗 [Explorer](${cfg.explorerUrl}/address/${contract})${isBest && ownerNow.toLowerCase() !== best.seller.toLowerCase() ? `\n\n⚠️ Owner changed since listing — re-check before buying.` : ""}`,
       { parse_mode: "Markdown", reply_markup: kb }
     );
   }
   if (userId) {
-    // Remember the best hit so a bare "yes" confirms the sweep
-    userStates[userId] = { step: "awaiting_sweep_confirm", data: { contract, tokenId: best.tokenId.toString(), seller: best.seller, price: bestPrice, expiresAt: Date.now() + 5 * 60_000 } };
-    await ctx.reply(`Reply \`yes\` to buy #${best.tokenId} for ~${bestPrice} HYPE, or tap Buy above.`, { parse_mode: "Markdown" });
+    if (want > 1 && take.length > 1) {
+      const listLine = take.map((t) => `#${t.tokenId} (${kalosService.formatPrice(t.price)})`).join(" + ");
+      const sweepKb = new InlineKeyboard()
+        .text(`🧹 Sweep ${take.length} for ~${totalStr} HYPE`, `kalos_sweepbuyN_${contract}_${take.length}`)
+        .row()
+        .text("🧹 Re-scan floor", `kalos_sweep_${contract}`)
+        .text("🏷️ Collections", "menu_collections")
+        .row()
+        .text("🔙 Main Menu", "menu_main");
+      userStates[userId] = {
+        step: "awaiting_sweepN_confirm",
+        data: { contract, items: take.map((t) => ({ tokenId: t.tokenId.toString(), seller: t.seller, price: t.price.toString() })), total: totalStr, expiresAt: Date.now() + 5 * 60_000 },
+      };
+      await ctx.reply(
+        `🧹 *Sweep ${take.length}:* ${listLine}\n\nTotal ~\`${totalStr} HYPE\` in one tx. Reply \`yes\` or tap Sweep above.`,
+        { parse_mode: "Markdown", reply_markup: sweepKb }
+      );
+    } else {
+      userStates[userId] = { step: "awaiting_sweep_confirm", data: { contract, tokenId: best.tokenId.toString(), seller: best.seller, price: bestPrice, expiresAt: Date.now() + 5 * 60_000 } };
+      await ctx.reply(`Reply \`yes\` to buy #${best.tokenId} for ~${bestPrice} HYPE, or tap Buy above.`, { parse_mode: "Markdown" });
+    }
   }
 }
 
-const KNOWN_KALOS_COLLECTIONS: Array<{ name: string; address: Address; tag?: string }> = [
+const FALLBACK_KALOS_COLLECTIONS: Array<{ name: string; address: Address; tag?: string }> = [
   { name: "Azuki", address: "0xd0e627cd8e3197503cc1283fdb7f97fb3d6c5d95" as Address, tag: "Art · 10k" },
 ];
 
@@ -1702,18 +1759,66 @@ async function renderCollectionsMenu(ctx: Context) {
   const cfg = getChainConfig(ELYSIUM.key);
   const kalosAddress = kalosService.address();
 
-  // Live floors for known collections
-  const floors = new Map<string, string>();
-  await Promise.all(
-    KNOWN_KALOS_COLLECTIONS.map(async (kc) => {
-      try {
-        const minP = await kalosService.getMinPriceForCollection(kc.address);
-        floors.set(kc.address.toLowerCase(), minP && minP > 0n ? `${kalosService.formatPrice(minP)} HYPE` : "No active listings");
-      } catch {
-        floors.set(kc.address.toLowerCase(), "unreadable");
+  // Discover every live Kalos collection on-chain — no hardcoding.
+  // 1) On-chain ItemListed events, 2) watched contracts, 3) hardcoded fallback.
+  let discovered: Address[] = [];
+  try {
+    discovered = await kalosService.discoverCollections({ blocksBack: 500_000 });
+  } catch {}
+  const watched: Address[] = [];
+  try {
+    const { dbService: _db } = await import("../db");
+    for (const row of _db.getUserListings(0)) {
+      if (row.contract && /^0x[a-fA-F0-9]{40}$/.test(row.contract)) watched.push(row.contract as Address);
+    }
+  } catch {}
+  const merged: Address[] = [];
+  const seenAddr = new Set<string>();
+  for (const a of [...discovered, ...watched, ...FALLBACK_KALOS_COLLECTIONS.map((k) => k.address)]) {
+    const k = a.toLowerCase();
+    if (seenAddr.has(k)) continue;
+    seenAddr.add(k);
+    merged.push(a);
+  }
+  // Resolve names + real floors via cheapest-live-listing scan (getMinPrice is stale on Kalos)
+  type ColRow = { address: Address; name: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number };
+  const rows: ColRow[] = await Promise.all(
+    merged.slice(0, 15).map(async (addr) => {
+      let name = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+      let tag: string | undefined;
+      const fb = FALLBACK_KALOS_COLLECTIONS.find((k) => k.address.toLowerCase() === addr.toLowerCase());
+      if (fb) { name = fb.name; tag = fb.tag; }
+      else {
+        try {
+          const { createPublicClient, http } = await import("viem");
+          const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+          const n = (await pc.readContract({
+            address: addr,
+            abi: [{ name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }] as any,
+            functionName: "name",
+          } as any)) as string;
+          if (n) name = n;
+        } catch {}
       }
+      let floorWei: bigint | null = null;
+      let count = 0;
+      try {
+        const hits = await kalosService.findCheapestListings(addr, { maxScan: 200, maxResults: 3 });
+        count = hits.length;
+        if (hits.length > 0) floorWei = hits[0].price;
+        else {
+          const minP = await kalosService.getMinPriceForCollection(addr);
+          if (minP && minP > 0n) floorWei = minP;
+        }
+      } catch {}
+      return { address: addr, name, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count };
     })
   );
+  rows.sort((a, b) => {
+    const af = a.floorWei ?? 10n ** 30n;
+    const bf = b.floorWei ?? 10n ** 30n;
+    return af < bf ? -1 : af > bf ? 1 : 0;
+  });
 
   let msg = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
   msg += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
@@ -1724,13 +1829,17 @@ async function renderCollectionsMenu(ctx: Context) {
   const nftProjects = projects.filter((p) => p.contractAddress || p.tags.includes("nft") || p.tags.includes("collection") || p.status === "minting" || p.status === "live");
 
   const kb = new InlineKeyboard();
-  msg += `*Live on Kalos (floor = cheapest on-chain ask):*\n\n`;
-  for (const kc of KNOWN_KALOS_COLLECTIONS) {
-    const floor = floors.get(kc.address.toLowerCase()) ?? "…";
-    msg += `• *${kc.name}* — \`${floor}\`${kc.tag ? ` · ${kc.tag}` : ""}\n  \`${kc.address}\`\n`;
-    kb.text(`🧹 Sweep ${kc.name} floor`, `kalos_sweep_${kc.address}`).row();
+  if (rows.length === 0) {
+    msg += `No live Kalos collections found in recent blocks. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
+  } else {
+    msg += `*Live on Kalos (floor = cheapest verified ask):*\n\n`;
+    for (const r of rows.slice(0, 10)) {
+      msg += `• *${r.name}* — \`${r.floorStr}\`${r.tag ? ` · ${r.tag}` : ""}${r.count > 1 ? ` · ${r.count} live` : ""}\n  \`${r.address}\`\n`;
+      if (r.floorWei && r.floorWei > 0n) kb.text(`🧹 Sweep ${r.name.slice(0, 14)} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
+      else kb.text(`🔍 Inspect ${r.name.slice(0, 14)}`, `col_inspect_${r.address}`).row();
+    }
+    msg += `\n`;
   }
-  msg += `\n`;
 
   if (nftProjects.length === 0) {
     msg += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
@@ -2169,6 +2278,36 @@ async function promptNftBuy(ctx: Context, raw?: string) {
   );
 }
 
+
+async function executeSweepBuy(ctx: Context, contract: Address, items: Array<{ tokenId: string; seller: string; price: string }>) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  delete userStates[userId];
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) {
+    await ctx.reply("No wallet found. Use /wallet to create one first.", { reply_markup: noWalletKeyboard });
+    return;
+  }
+  const n = Math.max(1, Math.min(10, items.length));
+  const take = items.slice(0, n);
+  const listLine = take.map((t) => `#${t.tokenId} (${t.price} HYPE)`).join(" + ");
+  try {
+    await ctx.reply(`⏳ Sweeping ${take.length} on Kalos (${listLine})…`, { parse_mode: "Markdown" });
+    const { hash, totalWei } = await kalosService.sweepBuy(
+      wallet.privateKey,
+      contract,
+      take.length,
+      undefined
+    );
+    const cfg = getChainConfig(ELYSIUM.key);
+    await ctx.reply(
+      `✅ *Sweep complete — ${take.length} NFT${take.length > 1 ? "s" : ""} bought!*\n\n${listLine}\nTotal: \`${kalosService.formatPrice(totalWei)} HYPE\`\nTx: \`${hash}\`\n🔗 [View](${cfg.explorerUrl}/tx/${hash})`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  } catch (e: any) {
+    await ctx.reply(`❌ Sweep failed: ${e?.shortMessage ?? e?.message ?? "unknown"}\n\nListings may have sold. Tap 🧹 Re-scan floor and try again.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+  }
+}
 
 async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId: string; owner: Address; maxPriceHype?: string }) {
   const userId = ctx.from?.id;
