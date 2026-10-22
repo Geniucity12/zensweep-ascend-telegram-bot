@@ -129,10 +129,7 @@ export function registerHandlers(bot: Bot) {
     const arg = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
     await handleSweepCommand(ctx, arg);
   });
-  bot.command("floor", async (ctx) => {
-    const arg = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
-    await handleSweepCommand(ctx, arg);
-  });
+  // /floor is the legacy read-only floor check (prompt → lookup via Kalos).
 
   bot.command("nfts", async (ctx) => {
     await renderNFTsMenu(ctx);
@@ -1687,8 +1684,8 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
   if (cheapest.length === 0) {
     let floorLine = "No active listings";
     try {
-      const minP = await kalosService.getMinPriceForCollection(contract);
-      if (minP && minP > 0n) floorLine = `${kalosService.formatPrice(minP)} HYPE`;
+      const fp = await kalosService.getVerifiedFloor(contract);
+      if (fp && fp > 0n) floorLine = `${kalosService.formatPrice(fp)} HYPE`;
     } catch {}
     await ctx.reply(
       `🧹 *Sweep Floor — no match*\n\nContract: \`${contract}\`\nKalos floor: \`${floorLine}\`\n${maxPriceEth ? `Max filter: \`${maxPriceEth} HYPE\`\n` : ""}\nNo live listing found in the first 60 tokenIds. The floor may be stale, expired, or above your max. Try without a max or tap Collections to browse.`,
@@ -1751,20 +1748,22 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
   }
 }
 
-const FALLBACK_KALOS_COLLECTIONS: Array<{ name: string; address: Address; tag?: string }> = [
-  { name: "Azuki", address: "0xd0e627cd8e3197503cc1283fdb7f97fb3d6c5d95" as Address, tag: "Art · 10k" },
-];
-
 async function renderCollectionsMenu(ctx: Context) {
   const cfg = getChainConfig(ELYSIUM.key);
   const kalosAddress = kalosService.address();
+  const sentScanning = await ctx.reply(`🔍 Scanning Kalos — discovering live collections…`, { parse_mode: "Markdown" }).catch(() => null);
 
-  // Discover every live Kalos collection on-chain — no hardcoding.
-  // 1) On-chain ItemListed events, 2) watched contracts, 3) hardcoded fallback.
+  // Discover EVERY live Kalos collection on-chain — no hardcoding.
+  // One shared scan feeds discovery AND all floor rows (cached 45s).
   let discovered: Address[] = [];
+  let sharedEvents: Awaited<ReturnType<typeof kalosService.cachedScan>> = [];
+  let scanFailed = false;
   try {
-    discovered = await kalosService.discoverCollections({ blocksBack: 500_000 });
-  } catch {}
+    sharedEvents = await kalosService.cachedScan({ blocksBack: 50_000 });
+    const seen = new Set<string>();
+    for (const e of sharedEvents) seen.add(e.nftAddress.toLowerCase());
+    discovered = [...seen] as Address[];
+  } catch { scanFailed = true; }
   const watched: Address[] = [];
   try {
     const { dbService: _db } = await import("../db");
@@ -1774,108 +1773,219 @@ async function renderCollectionsMenu(ctx: Context) {
   } catch {}
   const merged: Address[] = [];
   const seenAddr = new Set<string>();
-  for (const a of [...discovered, ...watched, ...FALLBACK_KALOS_COLLECTIONS.map((k) => k.address)]) {
+  for (const a of [...discovered, ...watched]) {
     const k = a.toLowerCase();
     if (seenAddr.has(k)) continue;
     seenAddr.add(k);
     merged.push(a);
   }
-  // Resolve names + real floors via cheapest-live-listing scan (getMinPrice is stale on Kalos)
-  type ColRow = { address: Address; name: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number };
-  const rows: ColRow[] = await Promise.all(
-    merged.slice(0, 15).map(async (addr) => {
+  // Resolve names (fast) in parallel…
+  const nameRows: Array<{ address: Address; name: string }> = await Promise.all(
+    merged.slice(0, 20).map(async (addr) => {
       let name = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
-      let tag: string | undefined;
-      const fb = FALLBACK_KALOS_COLLECTIONS.find((k) => k.address.toLowerCase() === addr.toLowerCase());
-      if (fb) { name = fb.name; tag = fb.tag; }
-      else {
-        try {
-          const { createPublicClient, http } = await import("viem");
-          const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
-          const n = (await pc.readContract({
-            address: addr,
-            abi: [{ name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }] as any,
-            functionName: "name",
-          } as any)) as string;
-          if (n) name = n;
-        } catch {}
-      }
-      let floorWei: bigint | null = null;
-      let count = 0;
       try {
-        const hits = await kalosService.findCheapestListings(addr, { maxScan: 200, maxResults: 3 });
-        count = hits.length;
-        if (hits.length > 0) floorWei = hits[0].price;
-        else {
-          const minP = await kalosService.getMinPriceForCollection(addr);
-          if (minP && minP > 0n) floorWei = minP;
-        }
+        const { createPublicClient, http } = await import("viem");
+        const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+        const n = (await pc.readContract({
+          address: addr,
+          abi: [{ name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }] as any,
+          functionName: "name",
+        } as any)) as string;
+        if (n) name = n;
       } catch {}
-      return { address: addr, name, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count };
+      return { address: addr, name };
     })
   );
+  // …then verified floors from ONE batched call (no per-collection scans).
+  // Two-phase menu: instant event-price estimates first, verified floors edited in.
+  let floors = new Map<string, { floor: bigint | null; liveCount: number }>();
+  const eventFloor = (addr: Address): bigint | null => {
+    let best: bigint | null = null;
+    for (const e of sharedEvents) {
+      try {
+        if (e.nftAddress.toLowerCase() !== addr.toLowerCase()) continue;
+        if (e.tokenId <= 0n || e.pricePerItem <= 0n) continue;
+        if (best === null || e.pricePerItem < best) best = e.pricePerItem;
+      } catch {}
+    }
+    return best;
+  };
+  const eventCount = (addr: Address): number => {
+    let n = 0;
+    for (const e of sharedEvents) {
+      try { if (e.nftAddress.toLowerCase() === addr.toLowerCase()) n++; } catch {}
+    }
+    return n;
+  };
+  // Resolve names + VERIFIED floors (cheapest live ask — getMinPrice returns 0 on Kalos)
+  type ColRow = { address: Address; name: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number; live: number; unverified: boolean };
+  const rows: ColRow[] = nameRows.map(({ address: addr, name }) => {
+    const f = floors.get(addr.toLowerCase());
+    const floorWei = f?.floor ?? null;
+    const live = f?.liveCount ?? 0;
+    const tag = undefined;
+    return { address: addr, name, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count: live, live, unverified: false };
+  });
+  const sortRows = () => rows.sort((a, b) => {
+    const af = a.floorWei ?? 10n ** 30n;
+    const bf = b.floorWei ?? 10n ** 30n;
+    return af < bf ? -1 : af > bf ? 1 : 0;
+  });
+  const buildMenuText = (verified: boolean): string => {
+    let m = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
+    m += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
+    m += `🏛 *Marketplace:* \`${kalosAddress || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07"}\`\n`;
+    m += `🔗 *Portal:* [kalos.fun](https://kalos.fun)\n\n`;
+    if (rows.length === 0) {
+      m += scanFailed
+        ? `⚠️ *Kalos data temporarily unavailable* — the testnet RPC is not responding. This is usually brief maintenance; try again shortly. You can still paste any NFT contract \`0x…\` to inspect it directly.\n\n`
+        : `No live Kalos collections found in recent blocks. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
+    } else {
+      m += verified
+        ? `*Live on Kalos (floor = cheapest verified ask):*\n\n`
+        : `*Live on Kalos (floor ≈ recent ask — verifying…):*\n\n`;
+      for (const r of rows.slice(0, 10)) {
+        m += `• *${r.name}* — \`${r.floorStr}\`${r.tag ? ` · ${r.tag}` : ""}${r.count > 1 ? ` · ${r.count} live` : ""}${r.unverified ? ` ⏳` : ""}\n  \`${r.address}\`\n`;
+      }
+      m += `\n`;
+    }
+    return m;
+  };
+  const buildMenuKeyboard = (): InlineKeyboard => {
+    const k = new InlineKeyboard();
+    for (const r of rows.slice(0, 10)) {
+      if (r.floorWei && r.floorWei > 0n) k.text(`🧹 Sweep ${r.name.slice(0, 14)} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
+      else k.text(`🔍 Inspect ${r.name.slice(0, 14)}`, `col_inspect_${r.address}`).row();
+    }
+    return k;
+  };
   rows.sort((a, b) => {
     const af = a.floorWei ?? 10n ** 30n;
     const bf = b.floorWei ?? 10n ** 30n;
     return af < bf ? -1 : af > bf ? 1 : 0;
   });
-
-  let msg = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
-  msg += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
-  msg += `🏛 *Marketplace:* \`${kalosAddress || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07"}\`\n`;
-  msg += `🔗 *Portal:* [kalos.fun](https://kalos.fun)\n\n`;
+  // Phase 1: instant menu from event prices (marked ⏳ unverified).
+  for (const r of rows) {
+    const ef = eventFloor(r.address);
+    if (ef && ef > 0n) {
+      r.floorWei = ef;
+      r.floorStr = `${kalosService.formatPrice(ef)} HYPE`;
+      r.count = eventCount(r.address);
+      r.unverified = true;
+    }
+  }
+  sortRows();
 
   const projects = await fetchLaunchProjects();
   const nftProjects = projects.filter((p) => p.contractAddress || p.tags.includes("nft") || p.tags.includes("collection") || p.status === "minting" || p.status === "live");
 
+  const footerText =
+    `\n💡 *Kalos Commands (manual still works):*\n` +
+    `• \`/sweep <0x…> [maxHYPE]\` — auto-find cheapest + 1-tap Buy\n` +
+    `• \`/nftbuy [contract] [id]\` — Buy item on Kalos\n` +
+    `• \`/nftlist [contract] [id] [price]\` — List on Kalos\n` +
+    `• \`/nftdelist [contract] [id]\` — Cancel listing\n` +
+    `• \`/nftoffer [contract] [id] [price]\` — Place bid\n`;
+  const footerKeyboard = (): InlineKeyboard => new InlineKeyboard()
+    .text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row()
+    .text("⚡ Direct Mint", "menu_mint").text("🖼️ My NFTs", "menu_nfts").row()
+    .text("🔙 Main Menu", "menu_main");
+  const combineKb = (menu: InlineKeyboard, foot: InlineKeyboard): InlineKeyboard => {
+    const combined = new InlineKeyboard();
+    try {
+      const raw: any = (menu as any).inline_keyboard ?? [];
+      for (const row of raw) for (const btn of row) combined.text(btn.text, btn.callback_data).row();
+      const fraw: any = (foot as any).inline_keyboard ?? [];
+      for (const row of fraw) for (const btn of row) combined.text(btn.text, btn.callback_data).row();
+    } catch {}
+    return combined;
+  };
+
+  let menuMsgId: number | undefined;
+  try {
+    if (sentScanning) { try { await ctx.api.deleteMessage(ctx.chat!.id, sentScanning.message_id); } catch {} }
+  } catch {}
+  if (rows.length === 0 && scanFailed) {
+    await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(buildMenuKeyboard(), footerKeyboard()) });
+    return;
+  }
+  try {
+    const sent = await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(buildMenuKeyboard(), footerKeyboard()) });
+    menuMsgId = sent.message_id;
+  } catch {}
+
+  // Launch-board floors use the shared scan (no extra RPC scans).
+  const launchFloors = new Map<string, string>();
+  for (const p of nftProjects.slice(0, 8)) {
+    const addr = p.contractAddress;
+    if (addr && /^0x[a-fA-F0-9]{40}$/.test(addr)) {
+      const ef = eventFloor(addr as Address);
+      launchFloors.set(addr.toLowerCase(), ef && ef > 0n ? `${kalosService.formatPrice(ef)} HYPE` : "—");
+    }
+  }
+
+  // Phase 2 (background): verify floors, then edit the menu in place.
+  (async () => {
+    try {
+      floors = await kalosService.getCollectionFloors(nameRows.map((r) => r.address), { events: sharedEvents, perCollection: 80 });
+    } catch { floors = new Map(); }
+    for (const r of rows) {
+      const f = floors.get(r.address.toLowerCase());
+      if (f?.floor && f.floor > 0n) {
+        r.floorWei = f.floor;
+        r.floorStr = `${kalosService.formatPrice(f.floor)} HYPE`;
+        r.count = f.liveCount;
+        r.unverified = false;
+      } else {
+        r.floorWei = null;
+        r.floorStr = "No active listings";
+        r.count = 0;
+        r.unverified = false;
+      }
+      const lf = launchFloors.get(r.address.toLowerCase());
+      if (lf && lf !== "—") launchFloors.set(r.address.toLowerCase(), r.floorStr);
+    }
+    sortRows();
+    if (menuMsgId && ctx.chat) {
+      try {
+        let m = buildMenuText(true);
+        if (nftProjects.length === 0) {
+          m += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
+        } else {
+          m += `*Featured & Tracked Collections:*\n\n`;
+          for (const p of nftProjects.slice(0, 8)) {
+            const addr = p.contractAddress;
+            const fl = addr ? (launchFloors.get(addr.toLowerCase()) ?? "—") : "—";
+            m += `• *${p.name}* [${p.stage}]\n`;
+            if (addr) m += `  Contract: \`${addr}\`\n`;
+            m += `  Floor: \`${fl}\` • Mint: \`${p.mintDate}\`\n\n`;
+          }
+        }
+        m += footerText;
+        const kb = combineKb(buildMenuKeyboard(), footerKeyboard());
+        // Re-add launch-board inspect buttons
+        for (const p of nftProjects.slice(0, 8)) {
+          if (p.contractAddress) {
+            try { (kb as any).inline_keyboard.splice(kbLen(kb), 0, [{ text: `🔍 ${p.name.slice(0, 16)}`, callback_data: `col_inspect_${p.contractAddress}` }]); } catch {}
+          }
+        }
+        await ctx.api.editMessageText(ctx.chat.id, menuMsgId, m, { parse_mode: "Markdown", reply_markup: kb });
+      } catch {}
+    }
+  })();
+  if (menuMsgId) return; // phase-2 edit will complete the menu
+
+  // Fallback: phase-1 send failed (e.g. callback context) — send synchronously.
   const kb = new InlineKeyboard();
   if (rows.length === 0) {
-    msg += `No live Kalos collections found in recent blocks. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
+    await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(kb, footerKeyboard()) });
   } else {
-    msg += `*Live on Kalos (floor = cheapest verified ask):*\n\n`;
-    for (const r of rows.slice(0, 10)) {
-      msg += `• *${r.name}* — \`${r.floorStr}\`${r.tag ? ` · ${r.tag}` : ""}${r.count > 1 ? ` · ${r.count} live` : ""}\n  \`${r.address}\`\n`;
-      if (r.floorWei && r.floorWei > 0n) kb.text(`🧹 Sweep ${r.name.slice(0, 14)} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
-      else kb.text(`🔍 Inspect ${r.name.slice(0, 14)}`, `col_inspect_${r.address}`).row();
-    }
-    msg += `\n`;
+    await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(buildMenuKeyboard(), footerKeyboard()) });
   }
+}
 
-  if (nftProjects.length === 0) {
-    msg += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
-  } else {
-    msg += `*Featured & Tracked Collections:*\n\n`;
-    for (const p of nftProjects.slice(0, 8)) {
-      const addr = p.contractAddress;
-      let floorStr = "—";
-      if (addr && /^0x[a-fA-F0-9]{40}$/.test(addr)) {
-        try {
-          const fp = await kalosService.getMinPriceForCollection(addr as Address);
-          if (fp && fp > 0n) floorStr = `${kalosService.formatPrice(fp)} HYPE`;
-        } catch {}
-      }
-      msg += `• *${p.name}* [${p.stage}]\n`;
-      if (addr) msg += `  Contract: \`${addr}\`\n`;
-      msg += `  Floor: \`${floorStr}\` • Mint: \`${p.mintDate}\`\n\n`;
-
-      if (addr) {
-        kb.text(`🔍 ${p.name.slice(0, 16)}`, `col_inspect_${addr}`).row();
-      }
-    }
-  }
-
-  msg += `💡 *Kalos Commands (manual still works):*\n`;
-  msg += `• \`/sweep <0x…> [maxHYPE]\` — auto-find cheapest + 1-tap Buy\n`;
-  msg += `• \`/nftbuy [contract] [id]\` — Buy item on Kalos\n`;
-  msg += `• \`/nftlist [contract] [id] [price]\` — List on Kalos\n`;
-  msg += `• \`/nftdelist [contract] [id]\` — Cancel listing\n`;
-  msg += `• \`/nftoffer [contract] [id] [price]\` — Place bid\n`;
-
-  kb.text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row();
-  kb.text("⚡ Direct Mint", "menu_mint").text("🖼️ My NFTs", "menu_nfts").row();
-  kb.text("🔙 Main Menu", "menu_main");
-
-  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+function kbLen(kb: InlineKeyboard): number {
+  try { return ((kb as any).inline_keyboard ?? []).length; } catch { return 0; }
 }
 
 async function renderCollectionDetail(ctx: Context, address: Address) {
@@ -1889,8 +1999,8 @@ async function renderCollectionDetail(ctx: Context, address: Address) {
 
   let floorStr = "No active listings";
   try {
-    const minP = await kalosService.getMinPriceForCollection(address);
-    if (minP && minP > 0n) floorStr = `${kalosService.formatPrice(minP)} HYPE`;
+    const fp = await kalosService.getVerifiedFloor(address);
+    if (fp && fp > 0n) floorStr = `${kalosService.formatPrice(fp)} HYPE`;
   } catch {}
 
   let userBalStr = "0";
@@ -2995,8 +3105,8 @@ async function renderTokenCard(ctx: Context, token: Address) {
     const url = explorer ? `${explorer}/address/${token}` : undefined;
     let floorLine = "No active listings";
     try {
-      const minP = await kalosService.getMinPriceForCollection(token);
-      if (minP && minP > 0n) floorLine = `\`${kalosService.formatPrice(minP)} HYPE\``;
+      const fp = await kalosService.getVerifiedFloor(token);
+      if (fp && fp > 0n) floorLine = `\`${kalosService.formatPrice(fp)} HYPE\``;
     } catch {}
     const msg = `🖼️ *${name}${sym}* — NFT Collection\n${short} \`${token}\`\n\n🏛 *Marketplace:* Kalos (Elysium L2)\n💰 *Floor Price:* ${floorLine}\n${url ? `🔍 [View on Explorer](${url}) • ` : ""}🌐 [View on Kalos](https://kalos.fun)\n\n*Tap Buy on Kalos to purchase, or List Item to sell directly in Telegram.*`;
     await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: makeNftCardKeyboard(token, url) });

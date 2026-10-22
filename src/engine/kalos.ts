@@ -14,6 +14,26 @@ const erc721Abi = [
   { name: "setApprovalForAll", type: "function", stateMutability: "nonpayable", inputs: [{ name: "operator", type: "address" }, { name: "approved", type: "bool" }], outputs: [] },
 ] as const;
 export interface KalosListing { quantity: bigint; pricePerItem: bigint; expirationTime: bigint; paymentTokenAddress: Address; }
+/** A decoded Kalos ItemListed event. */
+export interface ListedEvent { seller: Address; nftAddress: Address; tokenId: bigint; quantity: bigint; pricePerItem: bigint; expirationTime: bigint; paymentToken: Address; blockNumber?: bigint; }
+/** Module-level scan cache (shared across all kalosService calls in this process). */
+let scanCache: { at: number; blocksBack: number; events: ListedEvent[] } | null = null;
+/**
+ * Bounded-parallel map. The public testnet RPC rate-limits aggressively, so
+ * verification batches must NOT fire hundreds of concurrent eth_calls.
+ */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let i = 0;
+  const workers = new Array(Math.max(1, Math.min(limit, items.length))).fill(0).map(async () => {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 export const kalosService = {
   address(): Address | null { return kalosAddr(); },
   async getListing(collection: Address, tokenId: bigint, seller: Address): Promise<KalosListing | null> {
@@ -95,35 +115,204 @@ export const kalosService = {
   formatPrice(bi: bigint): string { return formatEther(bi); },
   /** Discover every collection with ItemListed events in recent blocks (no hardcoding). */
   async discoverCollections(opts?: { blocksBack?: number; chunkSize?: number }): Promise<Address[]> {
+    const events = await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 50_000 });
+    const seen = new Set<string>();
+    for (const e of events) seen.add(e.nftAddress.toLowerCase());
+    return [...seen] as Address[];
+  },
+  /**
+   * Scan recent ItemListed events with proper viem decoding (getContractEvents).
+   * Chunked so the RPC range limit is never hit. Returns raw decoded events.
+   */
+  async scanListedEvents(opts?: { blocksBack?: number; chunkSize?: number }): Promise<ListedEvent[]> {
     const addr = kalosAddr();
     if (!addr) return [];
     const client = publicClient();
-    try {
-      const latest = await client.getBlockNumber();
-      const blocksBack = BigInt(opts?.blocksBack ?? 500_000);
-      const chunk = BigInt(opts?.chunkSize ?? 50_000);
-      const from = latest > blocksBack ? latest - blocksBack : 0n;
-      const ranges: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
-      for (let s = from; s <= latest; s += chunk + 1n) {
-        const e = s + chunk > latest ? latest : s + chunk;
-        ranges.push({ fromBlock: s, toBlock: e });
-      }
-      const seen = new Set<string>();
-      await Promise.all(
-        ranges.map(async (r) => {
-          try {
-            const logs = (await client.getLogs({ address: addr, abi: kalosAbi as any, eventName: "ItemListed", fromBlock: r.fromBlock, toBlock: r.toBlock } as any)) as Array<any>;
-            for (const l of logs) {
-              const nft = (l?.args?.nftAddress ?? l?.args?.nftaddress) as string | undefined;
-              if (nft && /^0x[a-fA-F0-9]{40}$/.test(nft)) seen.add(nft.toLowerCase());
-            }
-          } catch { /* skip failed chunks */ }
-        })
-      );
-      return [...seen] as Address[];
-    } catch {
-      return [];
+    const latest = await client.getBlockNumber();
+    const blocksBack = BigInt(opts?.blocksBack ?? 50_000);
+    const chunk = BigInt(opts?.chunkSize ?? 25_000);
+    const from = latest > blocksBack ? latest - blocksBack : 0n;
+    const ranges: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+    for (let s = from; s <= latest; s += chunk + 1n) {
+      const e = s + chunk > latest ? latest : s + chunk;
+      ranges.push({ fromBlock: s, toBlock: e });
     }
+    const out: ListedEvent[] = [];
+    await Promise.all(
+      ranges.map(async (r) => {
+        try {
+          const logs = await client.getContractEvents({
+            address: addr, abi: kalosAbi as any, eventName: "ItemListed",
+            fromBlock: r.fromBlock, toBlock: r.toBlock,
+          });
+          for (const l of logs as Array<any>) {
+            const a = l?.args as any;
+            if (!a?.nftAddress || !/^0x[a-fA-F0-9]{40}$/.test(a.nftAddress)) continue;
+            try {
+              out.push({
+                seller: a.seller as Address,
+                nftAddress: a.nftAddress as Address,
+                tokenId: BigInt(a.tokenId ?? 0),
+                quantity: BigInt(a.quantity ?? 0),
+                pricePerItem: BigInt(a.pricePerItem ?? 0),
+                expirationTime: BigInt(a.expirationTime ?? 0),
+                paymentToken: a.paymentToken as Address,
+                blockNumber: typeof l?.blockNumber === "bigint" ? l.blockNumber : undefined,
+              });
+            } catch { /* skip malformed */ }
+          }
+        } catch { /* skip failed chunks */ }
+      })
+    );
+    return out;
+  },
+  /** Verify one (collection, tokenId, seller) is still a live ask. Returns the live price or null. */
+  async verifyListing(collection: Address, tokenId: bigint, seller: Address, opts?: { maxAgeSec?: number }): Promise<bigint | null> {
+    try {
+      const listing = await this.getListing(collection, tokenId, seller);
+      if (!listing || listing.pricePerItem === 0n) return null;
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      if (listing.expirationTime > 0n && listing.expirationTime < now) return null;
+      const client = publicClient();
+      const ownerNow = (await client.readContract({
+        address: collection,
+        abi: erc721Abi as any,
+        functionName: "ownerOf", args: [tokenId],
+      } as any).catch(() => null)) as Address | null;
+      if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) return null; // sold or transferred
+      return listing.pricePerItem;
+    } catch { return null; }
+  },
+  /**
+   * Verify a batch of (tokenId, seller) candidates for one collection.
+   * Two phases to save RPC calls: getListing for all in parallel first (dead
+   * listings return price 0 and are dropped), then ownerOf only for survivors.
+   * Concurrency is bounded (RPC_CONCURRENCY) to avoid testnet rate limits.
+   * Returns verified live listings sorted cheapest-first.
+   */
+  async verifyCandidateListings(
+    collection: Address,
+    candidates: Array<{ tokenId: bigint; seller: Address; price?: bigint; blockNumber?: bigint }>,
+    opts?: { maxPrice?: bigint; limit?: number; concurrency?: number }
+  ): Promise<Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }>> {
+    const maxPrice = opts?.maxPrice;
+    const limit = opts?.limit ?? 60;
+    const conc = opts?.concurrency ?? 6;
+    const phase1 = await mapLimit(candidates.slice(0, limit), conc, async (c) => {
+      try {
+        if (c.tokenId <= 0n) return null;
+        const listing = await this.getListing(collection, c.tokenId, c.seller);
+        if (!listing || listing.pricePerItem === 0n) return null;
+        if (maxPrice !== undefined && listing.pricePerItem > maxPrice) return null;
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        if (listing.expirationTime > 0n && listing.expirationTime < now) return null;
+        return { tokenId: c.tokenId, seller: c.seller, price: listing.pricePerItem, expiration: listing.expirationTime };
+      } catch { return null; }
+    });
+    const survivors = phase1.filter((x): x is NonNullable<typeof x> => !!x);
+    if (survivors.length === 0) return [];
+    const client = publicClient();
+    const checked = await mapLimit(survivors, conc, async (s) => {
+      try {
+        const ownerNow = (await client.readContract({
+          address: collection, abi: erc721Abi as any,
+          functionName: "ownerOf", args: [s.tokenId],
+        } as any).catch(() => null)) as Address | null;
+        if (!ownerNow || ownerNow.toLowerCase() !== s.seller.toLowerCase()) return null;
+        return s;
+      } catch { return null; }
+    });
+    return checked
+      .filter((x): x is NonNullable<typeof x> => !!x)
+      .sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+  },
+  /**
+   * Order candidates so verification finds live asks fast: cheapest-first AND
+   * most-recent-first interleaved. Stale cheap listings (already sold) cluster
+   * at the old end; fresh listings cluster at the recent end. De-dupe by
+   * tokenId+seller, keeping the newest event for recency and the min price
+   * for ordering info.
+   */
+  orderCandidates(
+    events: ListedEvent[],
+    opts?: { maxPrice?: bigint }
+  ): Array<{ tokenId: bigint; seller: Address; price: bigint; blockNumber: bigint }> {
+    const maxPrice = opts?.maxPrice;
+    const byKey = new Map<string, { tokenId: bigint; seller: Address; price: bigint; blockNumber: bigint }>();
+    for (const e of events) {
+      if (e.tokenId <= 0n || e.pricePerItem <= 0n) continue;
+      if (maxPrice !== undefined && e.pricePerItem > maxPrice) continue;
+      const key = `${e.tokenId.toString()}:${e.seller.toLowerCase()}`;
+      const bn = e.blockNumber ?? 0n;
+      const prev = byKey.get(key);
+      if (!prev) {
+        byKey.set(key, { tokenId: e.tokenId, seller: e.seller, price: e.pricePerItem, blockNumber: bn });
+      } else {
+        if (e.pricePerItem < prev.price) prev.price = e.pricePerItem;
+        if (bn > prev.blockNumber) { prev.blockNumber = bn; prev.seller = e.seller; }
+      }
+    }
+    const all = [...byKey.values()];
+    const byPrice = [...all].sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+    const byBlock = [...all].sort((a, b) => (a.blockNumber < b.blockNumber ? 1 : a.blockNumber > b.blockNumber ? -1 : 0));
+    const out: typeof all = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < Math.max(byPrice.length, byBlock.length); i++) {
+      for (const c of [byPrice[i], byBlock[i]]) {
+        if (!c) continue;
+        const key = `${c.tokenId.toString()}:${c.seller.toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(c);
+      }
+    }
+    return out;
+  },
+  /**
+   * Cheapest VERIFIED live ask for a collection. Scans recent ItemListed events,
+   * verifies candidates (getListing + ownerOf + expiry), returns the minimum.
+   * Replaces getMinPriceForCollection, which returns 0 on-chain for all collections.
+   * Pass pre-scanned events to share one scan across many collections.
+   */
+  async getVerifiedFloor(
+    collection: Address,
+    opts?: { blocksBack?: number; candidates?: number; events?: ListedEvent[] }
+  ): Promise<bigint | null> {
+    const maxCandidates = opts?.candidates ?? 80;
+    const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 50_000 });
+    const mine = events.filter((e) => e.nftAddress.toLowerCase() === collection.toLowerCase());
+    const sorted = this.orderCandidates(mine);
+    const verified = await this.verifyCandidateListings(collection, sorted, { limit: maxCandidates });
+    if (verified.length === 0) return null;
+    return verified[0].price;
+  },
+  /**
+   * Verified live-listing counts + floors for MANY collections from ONE scan.
+   * This is what /collections uses — one RPC scan, then batched verification.
+   * Collections are verified SEQUENTIALLY (bounded inner concurrency) so the
+   * public testnet RPC is never hammered into rate-limit errors.
+   */
+  async getCollectionFloors(
+    collections: Address[],
+    opts?: { blocksBack?: number; perCollection?: number; events?: ListedEvent[]; concurrency?: number }
+  ): Promise<Map<string, { floor: bigint | null; liveCount: number }>> {
+    const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 50_000 });
+    const perCollection = opts?.perCollection ?? 80;
+    const conc = opts?.concurrency ?? 6;
+    const out = new Map<string, { floor: bigint | null; liveCount: number }>();
+    for (const col of collections) {
+      try {
+        const mine = events.filter((e) => e.nftAddress.toLowerCase() === col.toLowerCase());
+        if (mine.length === 0) { out.set(col.toLowerCase(), { floor: null, liveCount: 0 }); continue; }
+        const cands = this.orderCandidates(mine);
+        const verified = await this.verifyCandidateListings(col, cands, { limit: perCollection, concurrency: conc });
+        out.set(col.toLowerCase(), {
+          floor: verified.length > 0 ? verified[0].price : null,
+          liveCount: verified.length,
+        });
+      } catch { out.set(col.toLowerCase(), { floor: null, liveCount: 0 }); }
+    }
+    return out;
   },
   /** Sweep N cheapest live listings in one batch buyItems tx. */
   async sweepBuy(
@@ -153,59 +342,27 @@ export const kalosService = {
     await pc.waitForTransactionReceipt({ hash });
     return { hash, items: take.map((h) => ({ tokenId: h.tokenId, seller: h.seller, price: h.price })), totalWei: total };
   },
-  async findCheapestListings(collection: Address, opts?: { maxScan?: number; maxResults?: number; maxPriceEth?: string }): Promise<Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }>> {
+  async findCheapestListings(
+    collection: Address,
+    opts?: { maxScan?: number; maxResults?: number; maxPriceEth?: string; events?: ListedEvent[] }
+  ): Promise<Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }>> {
     const maxScan = opts?.maxScan ?? 500;
     const maxResults = opts?.maxResults ?? 5;
     const maxPrice = opts?.maxPriceEth ? parseEther(opts.maxPriceEth) : undefined;
     const client = publicClient();
     const out: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
-    // 1) Prefer on-chain event discovery: exact tokenIds with listings
+    // 1) On-chain event discovery: exact tokenIds with listings (properly decoded)
     try {
-      const addr = kalosAddr();
-      if (addr) {
-        const latest = await client.getBlockNumber();
-        const back = 500_000n;
-        const from = latest > back ? latest - back : 0n;
-        const logs = (await client.getLogs({ address: addr, abi: kalosAbi as any, eventName: "ItemListed", fromBlock: from, toBlock: latest } as any)) as Array<any>;
-        const seen = new Map<string, { seller: Address; price: bigint; expiration: bigint }>();
-        for (const l of logs) {
-          try {
-            const nft = (l?.args?.nftAddress ?? "") as string;
-            if (nft.toLowerCase() !== collection.toLowerCase()) continue;
-            const tid = BigInt(l?.args?.tokenId ?? 0);
-            const price = BigInt(l?.args?.pricePerItem ?? 0);
-            if (tid <= 0n || price <= 0n) continue;
-            if (maxPrice !== undefined && price > maxPrice) continue;
-            const seller = (l?.args?.seller ?? "") as Address;
-            const exp = BigInt(l?.args?.expirationTime ?? 0);
-            const key = `${tid.toString()}:${seller.toLowerCase()}`;
-            const prev = seen.get(key);
-            if (!prev || price < prev.price) seen.set(key, { seller, price, expiration: exp });
-          } catch {}
-        }
-        // Verify each is still listed + owned by seller
-        const ownerAbi = [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as const;
-        const entries = [...seen.entries()].slice(0, 40);
-        await Promise.all(
-          entries.map(async ([key, v]) => {
-            try {
-              const tid = BigInt(key.split(":")[0]);
-              const [ownerNow, listing] = await Promise.all([
-                client.readContract({ address: collection, abi: ownerAbi as any, functionName: "ownerOf", args: [tid] } as any) as Promise<Address>,
-                this.getListing(collection, tid, v.seller),
-              ]);
-              if (!listing || listing.pricePerItem === 0n) return;
-              if (ownerNow.toLowerCase() !== v.seller.toLowerCase()) return;
-              const now = BigInt(Math.floor(Date.now() / 1000));
-              if (listing.expirationTime > 0n && listing.expirationTime < now) return;
-              out.push({ tokenId: tid, seller: v.seller, price: listing.pricePerItem, expiration: listing.expirationTime });
-            } catch {}
-          })
-        );
-        if (out.length > 0) {
-          out.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
-          return out.slice(0, maxResults);
-        }
+      const events = opts?.events ?? await this.cachedScan({ blocksBack: 50_000 });
+      const mine = events.filter((e) => {
+        try { return e.nftAddress.toLowerCase() === collection.toLowerCase(); } catch { return false; }
+      });
+      // Verify: cheapest + most-recent interleaved, getListing first, ownerOf only for survivors
+      const cands = this.orderCandidates(mine, { maxPrice });
+      const verified = await this.verifyCandidateListings(collection, cands, { maxPrice, limit: 80 });
+      for (const v of verified) out.push(v);
+      if (out.length > 0) {
+        return out.slice(0, maxResults);
       }
     } catch {}
     // 2) Fallback: sequential tokenId scan
@@ -230,5 +387,15 @@ export const kalosService = {
     }
     out.sort((a, b) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
     return out.slice(0, maxResults);
+  },
+  /** Short-lived scan cache so burst UI actions (menu + detail + sweep) share one scan. */
+  async cachedScan(opts?: { blocksBack?: number; ttlMs?: number }): Promise<ListedEvent[]> {
+    const blocksBack = opts?.blocksBack ?? 50_000;
+    const ttlMs = opts?.ttlMs ?? 45_000;
+    const now = Date.now();
+    if (scanCache && scanCache.blocksBack === blocksBack && now - scanCache.at < ttlMs) return scanCache.events;
+    const events = await this.scanListedEvents({ blocksBack });
+    scanCache = { at: Date.now(), blocksBack, events };
+    return events;
   },
 };

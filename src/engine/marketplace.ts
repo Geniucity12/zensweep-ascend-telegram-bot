@@ -91,16 +91,18 @@ export const marketplaceService = {
     let floorPrice: number | undefined;
     let floorCurrency: string | undefined;
 
-    // Kalos marketplace enrichment for Elysium
+    // Kalos marketplace enrichment for Elysium.
+    // NOTE: getMinPriceForCollection returns 0 on-chain for all collections,
+    // so the floor is the cheapest VERIFIED live ask from recent ItemListed events.
     if (chainKey === ELYSIUM.key) {
       try {
-        const minPriceWei = await kalosService.getMinPriceForCollection(addr);
-        if (minPriceWei && minPriceWei > 0n) {
-          floorPrice = Number(formatEther(minPriceWei));
+        const floorWei = await kalosService.getVerifiedFloor(addr, { candidates: 40 });
+        if (floorWei && floorWei > 0n) {
+          floorPrice = Number(formatEther(floorWei));
           floorCurrency = "HYPE";
         }
       } catch {
-        // Kalos read failed or no floor set
+        // Kalos read failed or no live listings
       }
     }
 
