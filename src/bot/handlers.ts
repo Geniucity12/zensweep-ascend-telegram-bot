@@ -551,7 +551,10 @@ export function registerHandlers(bot: Bot) {
     ctx.answerCallbackQuery().catch(() => {});
     const col = ctx.match[1] as Address;
     const tid = ctx.match[2];
-    await promptNftBuy(ctx, tid ? `${col} ${tid}` : col);
+    // No tokenId (e.g. "Buy" on a collection card) = buy the floor:
+    // auto-find the cheapest verified live listing instead of asking for params.
+    if (tid) await promptNftBuy(ctx, `${col} ${tid}`);
+    else await handleSweepCommand(ctx, col);
   });
 
   bot.callbackQuery(/^kalos_list_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
