@@ -1,9 +1,13 @@
-import { createPublicClient, createWalletClient, http, parseEther, formatEther, type Address, type Hex, type Hash } from "viem";
+import { createPublicClient, createWalletClient, http, parseEther, formatEther, decodeErrorResult, type Address, type Hex, type Hash } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { getChainConfig, KALOS_MARKETPLACE_ADDRESS, ELYSIUM } from "../config";
 import kalosAbi from "../abi/kalosMarketplace.json";
 const ZERO = "0x0000000000000000000000000000000000000000" as Address;
 const NATIVE = ZERO;
+/** WHYPE on Elysium testnet (verified on-chain: wnative() + paymentToken()). */
+const WHYPE_FALLBACK = "0x41051f27c609dB70af05b7128f15155Dc8E49Ac7" as Address;
+/** Module-level wnative cache (verified live: equals WHYPE_FALLBACK). */
+let cachedWnative: Address | null = null;
 function kalosAddr(): Address | null { const a = (KALOS_MARKETPLACE_ADDRESS || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07").trim(); if (!a || !/^0x[a-fA-F0-9]{40}$/.test(a)) return null; return a as Address; }
 export function isKalosConfigured(): boolean { return !!kalosAddr(); }
 function publicClient() { const cfg = getChainConfig(ELYSIUM.key); return createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) }); }
@@ -36,6 +40,16 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
 }
 export const kalosService = {
   address(): Address | null { return kalosAddr(); },
+  /** Marketplace-level wnative (the WHYPE the contract treats as native). Cached. */
+  async wnative(): Promise<Address> {
+    if (cachedWnative) return cachedWnative;
+    const addr = kalosAddr()!;
+    const client = publicClient();
+    try {
+      cachedWnative = (await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "wnative" } as any)) as Address;
+    } catch { cachedWnative = WHYPE_FALLBACK; }
+    return cachedWnative;
+  },
   async getListing(collection: Address, tokenId: bigint, seller: Address): Promise<KalosListing | null> {
     const addr = kalosAddr(); if (!addr) throw new Error("Kalos not configured");
     const client = publicClient();
@@ -70,6 +84,21 @@ export const kalosService = {
     const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "cancelListings", args: [[{ nftAddress, tokenId: BigInt(tokenId) }]] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
+  /** Build one buy-item param exactly like kalos.fun: listing's paymentToken + usingNative=(token==wnative). */
+  async buildBuyItem(
+    collection: Address, tokenId: bigint, seller: Address, qty: bigint, listing: KalosListing
+  ): Promise<{ nftAddress: Address; tokenId: bigint; owner: Address; quantity: bigint; maxPricePerItem: bigint; paymentToken: Address; usingNative: boolean }> {
+    const wnative = (await this.wnative()).toLowerCase();
+    const payToken = (listing.paymentTokenAddress ?? ZERO) as Address;
+    const usingNative = payToken.toLowerCase() === wnative || payToken.toLowerCase() === ZERO.toLowerCase();
+    return {
+      nftAddress: collection, tokenId, owner: seller, quantity: qty,
+      maxPricePerItem: listing.pricePerItem,
+      // Mirror kalos.fun: pass the LISTING's paymentToken, not hardcoded zero.
+      paymentToken: payToken,
+      usingNative,
+    };
+  },
   async buy(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, owner: Address, opts?: { quantity?: number; maxPriceEth?: string }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1);
     const listing = await this.getListing(nftAddress, tid, owner);
@@ -85,9 +114,23 @@ export const kalosService = {
       const maxP = parseEther(opts.maxPriceEth);
       if (price > maxP) throw new Error(`Listed price (${formatEther(price)} HYPE) exceeds your max price (${opts.maxPriceEth} HYPE).`);
     }
-    const value = price;
+    // Re-check owner at execution time (kills the stale-seller revert before it costs gas).
+    try {
+      const client = publicClient();
+      const ownerNow = (await client.readContract({
+        address: nftAddress, abi: erc721Abi as any, functionName: "ownerOf", args: [tid],
+      } as any).catch(() => null)) as Address | null;
+      if (!ownerNow) throw new Error(`Token #${tid} no longer exists (ownerOf reverted). It may have been burned or moved.`);
+      if (ownerNow.toLowerCase() !== owner.toLowerCase()) {
+        throw new Error(`Seller changed for #${tid}: listed by ${owner.slice(0, 10)}… but now owned by ${ownerNow.slice(0, 10)}…. Re-scan and buy the live listing.`);
+      }
+    } catch (e: any) {
+      if (e?.message?.startsWith("Seller changed") || e?.message?.includes("no longer exists")) throw e;
+      // ownerOf read failed (RPC) — proceed; the contract will revert honestly if stale.
+    }
+    const item = await this.buildBuyItem(nftAddress, tid, owner, qty, listing);
     const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "buyItems", args: [[{ nftAddress, tokenId: tid, owner, quantity: qty, maxPricePerItem: value, paymentToken: NATIVE, usingNative: true }]], value } as any);
+    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "buyItems", args: [[item]], value: price } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
 
@@ -182,6 +225,54 @@ export const kalosService = {
       if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) return null; // sold or transferred
       return listing.pricePerItem;
     } catch { return null; }
+  },
+  /** Decode the contract's custom error from a reverted buy simulation. Returns e.g. "NotListed()" or null. */
+  decodeBuyError(err: any): string | null {
+    try {
+      const data = err?.cause?.data ?? err?.data;
+      if (!data || data === "0x") return null;
+      const dec = decodeErrorResult({ abi: kalosAbi, data }) as { errorName?: string; args?: unknown[] };
+      if (!dec?.errorName) return null;
+      const args = (dec.args ?? []).map((a) => (typeof a === "bigint" ? a.toString() : String(a))).join(", ");
+      return `${dec.errorName}(${args})`;
+    } catch { return null; }
+  },
+  /**
+   * Dry-run a buy against the CURRENT chain state without spending gas.
+   * Returns { ok: true } or { ok: false, reason } with a human explanation.
+   */
+  async dryRunBuy(
+    collection: Address, tokenId: bigint, seller: Address, buyer: Address, qty: bigint = 1n
+  ): Promise<{ ok: boolean; reason?: string; price?: bigint; item?: { nftAddress: Address; tokenId: bigint; owner: Address; quantity: bigint; maxPricePerItem: bigint; paymentToken: Address; usingNative: boolean } }> {
+    const listing = await this.getListing(collection, tokenId, seller);
+    if (!listing || listing.pricePerItem === 0n) {
+      return { ok: false, reason: `No live listing: getListing(${collection.slice(0, 10)}…, #${tokenId}, seller ${seller.slice(0, 10)}…) returned price 0 — sold, delisted, or seller changed.` };
+    }
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    if (listing.expirationTime > 0n && listing.expirationTime < now) {
+      return { ok: false, reason: `Listing expired at ${new Date(Number(listing.expirationTime) * 1000).toISOString()} (now ${new Date(Number(now) * 1000).toISOString()}).` };
+    }
+    const client = publicClient();
+    const ownerNow = (await client.readContract({
+      address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tokenId],
+    } as any).catch(() => null)) as Address | null;
+    if (!ownerNow) return { ok: false, reason: `ownerOf(#${tokenId}) reverted — token may be burned or the collection is not ERC-721.` };
+    if (ownerNow.toLowerCase() !== seller.toLowerCase()) {
+      return { ok: false, reason: `Seller changed: listed by ${seller} but now owned by ${ownerNow}. Any buy from the old seller reverts with NotOwningItem()/NotListed().` };
+    }
+    const item = await this.buildBuyItem(collection, tokenId, seller, qty, listing);
+    const price = listing.pricePerItem * qty;
+    try {
+      await client.simulateContract({
+        address: kalosAddr()!, abi: kalosAbi as any, functionName: "buyItems",
+        args: [[item]], value: price, account: buyer,
+      } as any);
+      return { ok: true, price, item };
+    } catch (e: any) {
+      const decoded = this.decodeBuyError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 200);
+      return { ok: false, reason: `simulateContract reverted${decoded ? ` with ${decoded}` : ""}: ${cause}`, price, item };
+    }
   },
   /**
    * Verify a batch of (tokenId, seller) candidates for one collection.
@@ -328,16 +419,18 @@ export const kalosService = {
     const addr = kalosAddr()!;
     const wc = walletClient(privateKey);
     const pc = publicClient();
-    const items = take.map((h) => ({
-      nftAddress: collection,
-      tokenId: h.tokenId,
-      owner: h.seller,
-      quantity: 1n,
-      maxPricePerItem: h.price,
-      paymentToken: NATIVE,
-      usingNative: true,
-    }));
-    const total = take.reduce((s, h) => s + h.price, 0n);
+    // Re-fetch each listing + owner at execution time, build items exactly
+    // like kalos.fun (listing's paymentToken, usingNative=(token==wnative)).
+    const items = await Promise.all(
+      take.map(async (h) => {
+        const listing = await this.getListing(collection, h.tokenId, h.seller);
+        if (!listing || listing.pricePerItem === 0n) {
+          throw new Error(`Token #${h.tokenId} sold before the sweep could execute. Re-scan and try again.`);
+        }
+        return this.buildBuyItem(collection, h.tokenId, h.seller, 1n, listing);
+      })
+    );
+    const total = items.reduce((s, it) => s + it.maxPricePerItem, 0n);
     const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "buyItems", args: [items], value: total } as any);
     await pc.waitForTransactionReceipt({ hash });
     return { hash, items: take.map((h) => ({ tokenId: h.tokenId, seller: h.seller, price: h.price })), totalWei: total };

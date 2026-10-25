@@ -2508,6 +2508,16 @@ async function executeSweepBuy(ctx: Context, contract: Address, items: Array<{ t
   const take = items.slice(0, n);
   const listLine = take.map((t) => `#${t.tokenId} (${t.price} HYPE)`).join(" + ");
   try {
+    // Gas-free dry-run on the FIRST item: catch stale/sold listings before spending gas.
+    const first = take[0];
+    const dry = await kalosService.dryRunBuy(contract, BigInt(first.tokenId), first.seller as Address, wallet.address as Address, 1n);
+    if (!dry.ok) {
+      await ctx.reply(
+        `❌ *Sweep would fail — no gas spent.*\n\n${dry.reason}\n\nTap 🧹 Re-scan floor and try again.`,
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+      return;
+    }
     await ctx.reply(`⏳ Sweeping ${take.length} on Kalos (${listLine})…`, { parse_mode: "Markdown" });
     const { hash, totalWei } = await kalosService.sweepBuy(
       wallet.privateKey,
@@ -2521,7 +2531,9 @@ async function executeSweepBuy(ctx: Context, contract: Address, items: Array<{ t
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (e: any) {
-    await ctx.reply(`❌ Sweep failed: ${e?.shortMessage ?? e?.message ?? "unknown"}\n\nListings may have sold. Tap 🧹 Re-scan floor and try again.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+    const decoded = kalosService.decodeBuyError(e);
+    const detail = decoded ? `Contract error: \`${decoded}\`` : (e?.shortMessage ?? e?.message ?? "unknown");
+    await ctx.reply(`❌ Sweep failed: ${detail}\n\nListings may have sold. Tap 🧹 Re-scan floor and try again.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
   }
 }
 
@@ -2532,7 +2544,29 @@ async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId:
   if (!wallet) { await ctx.reply("No wallet found."); return; }
 
   try {
-    await ctx.reply(`⏳ Purchasing token #${data.tokenId} on Kalos…`, { parse_mode: "Markdown" });
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    await ctx.reply(`⏳ Verifying listing #${data.tokenId} on Kalos…`, { parse_mode: "Markdown" });
+    const listing = await kalosService.getListing(data.collection, BigInt(data.tokenId), data.owner);
+    if (!listing || listing.pricePerItem === 0n) {
+      await ctx.reply(`❌ *No longer listed.* Token #${data.tokenId} was sold, delisted, or the seller changed. Tap 🧹 Re-scan floor for a live one.`, { parse_mode: "Markdown", reply_markup: makeCollectionKeyboard(data.collection) });
+      return;
+    }
+    if (listing.expirationTime > 0n && listing.expirationTime < now) {
+      await ctx.reply(`⚠️ *Listing expired.* The seller needs to relist #${data.tokenId} on Kalos.`, { parse_mode: "Markdown" });
+      return;
+    }
+    const livePrice = kalosService.formatPrice(listing.pricePerItem);
+    // Gas-free dry-run: simulate the exact buy. If it would revert, tell the
+    // user the decoded contract reason instead of spending gas on a failure.
+    const dry = await kalosService.dryRunBuy(data.collection, BigInt(data.tokenId), data.owner, wallet.address as Address, 1n);
+    if (!dry.ok) {
+      await ctx.reply(
+        `❌ *Buy would fail — no gas spent.*\n\n${dry.reason}\n\nTap 🧹 Re-scan floor for a live listing.`,
+        { parse_mode: "Markdown", reply_markup: makeCollectionKeyboard(data.collection) }
+      );
+      return;
+    }
+    await ctx.reply(`⏳ Purchasing #${data.tokenId} on Kalos for ~${livePrice} HYPE…`, { parse_mode: "Markdown" });
     const hash = await kalosService.buy(wallet.privateKey, data.collection, data.tokenId, data.owner, {
       maxPriceEth: data.maxPriceHype,
     });
@@ -2546,7 +2580,9 @@ async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId:
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (err: any) {
-    await ctx.reply(`❌ Buy failed: ${err?.shortMessage || err?.message || "Contract reverted"}`);
+    const decoded = kalosService.decodeBuyError(err);
+    const detail = decoded ? `Contract error: \`${decoded}\`` : (err?.shortMessage || err?.message || "Contract reverted");
+    await ctx.reply(`❌ Buy failed: ${detail}`);
   }
 }
 
