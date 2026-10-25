@@ -1,12 +1,12 @@
 # Zensweep
 
-Telegram bot for the Elysium network — launch tracking, deployment discovery, wallet monitoring, and HYPE-native trading.
+Telegram bot for the Elysium network — launch tracking, deployment discovery, wallet monitoring, paper token trading, and live Kalos NFT trading.
 
 Live bot: [@zensweep_bot](https://t.me/zensweep_bot) · Elysium Testnet (Chain ID 99801)
 
 ## Overview
 
-Zensweep brings Elysium on-chain activity into Telegram. It scans for newly deployed contracts, tracks mint windows, monitors watched wallets, checks token safety before trading, and executes HYPE-native buys and sells — all without leaving a chat.
+Zensweep brings Elysium on-chain activity into Telegram. It scans for newly deployed contracts, tracks mint windows, monitors watched wallets, checks token safety before trading, paper-trades tokens, and trades NFTs live on the Kalos marketplace — all without leaving a chat.
 
 Built for [Elysium by Kinetiq](https://elysium.kinetiq.xyz), an Arbitrum Orbit L2 settling to HyperEVM with HYPE as its native gas token.
 
@@ -20,17 +20,26 @@ Built for [Elysium by Kinetiq](https://elysium.kinetiq.xyz), an Arbitrum Orbit L
 - Wallet watch (/watch, /watchlist) — track any EVM address and get notified on balance changes.
 
 **Trading & Safety**
-- Token card — paste any 0x... address for safety analysis and Buy/Sell buttons.
+- Token card — paste any 0x... address for safety analysis and Buy/Sell buttons (paper trades on testnet until a DEX router is live).
 - Safety checks (/safety 0x...) — honeypot, owner/mint, blacklist, proxy detection (scored 0–100).
-- HYPE-native trading — Buy 0.1/0.5/1 HYPE and Sell 25/50/100%.
+- HYPE-native trading — Buy 0.1/0.5/1 HYPE and Sell 25/50/100% (paper mode on testnet; real swaps once ELYSIUM_ROUTER_ADDRESS is set).
 - Portfolio (/portfolio) — realized PnL, win rate, per-token balances, shareable card.
+
+**Kalos NFT Marketplace (live on-chain)**
+- Collections (/collections) — every live Kalos collection discovered on-chain with verified floors (cheapest live ask, checked via getListing + ownerOf + expiry). No hardcoding.
+- Sweep floor (/sweep 0x... [count] [maxHYPE]) — finds the cheapest verified live listings and buys up to 10 in one batch transaction.
+- Buy (/nftbuy [collection] [id]) — buy any listed NFT with stale-listing detection and 1-tap confirm.
+- List (/nftlist [collection] [id] [price]) — list your NFT on Kalos (auto-approves the marketplace).
+- Delist (/nftdelist [collection] [id]) — cancel your Kalos listing on-chain.
+- Offers (/nftoffer, /nftaccept) — bid on any token and accept bids as a seller.
+- Inventory (/nfts) — your Elysium NFTs plus active Kalos listings.
 
 **Wallet**
 - Custodial wallet per Telegram user (/wallet). Keys encrypted at rest (AES-256-GCM).
 - Balance refresh, chain switching, full withdrawal, and private-key export (/export).
 
 **Secondary Markets**
-- OpenSea-backed tooling (/markets) — floor, NFTs, minting, snipe rules for EVM chains. Requires OPENSEA_API_KEY.
+- OpenSea-backed tooling (/markets) — archived in Elysium-only mode. Use /collections for live Kalos data instead. Requires OPENSEA_API_KEY.
 
 ## Quick Start
 
@@ -63,9 +72,12 @@ All configuration is via environment variables (see .env.example):
 | ELYSIUM_WHYPE_ADDRESS | No | Wrapped HYPE address. If empty, resolved via router.WETH() |
 | FEE_PERCENTAGE | No | Fee fraction, e.g. 0.025 = 2.5% |
 | FEE_RECIPIENT_WALLET | No | Address that receives fees. If empty, trades are fee-free |
-| OPENSEA_API_KEY | No | Enables market features under /markets |
+| KALOS_MARKETPLACE_ADDRESS | No | Kalos marketplace contract (default: 0x0ff8b7afc288ac42f82320f54a49c400f233bf07) |
+| KALOS_API_URL | No | Reserved for a Kalos index API (currently unused — all reads are on-chain) |
 | ZENSWEEP_LAUNCH_API_URL | No | Remote JSON feed for the launch board (alias: `KIWI_LAUNCH_API_URL` kept) |
 | ALERT_POLL_INTERVAL_MS | No | Alert scheduler interval in ms (default: 300000) |
+| FAUCET_PRIVATE_KEY | No | Testnet HYPE drip key. If empty, the bot links the Elysium faucet instead |
+| OPENSEA_API_KEY | No | Legacy, unused in Elysium-only mode |
 
 ## Usage
 
@@ -85,18 +97,34 @@ All configuration is via environment variables (see .env.example):
 | /portfolio | Portfolio, PnL, and share card |
 | /alerts | Active launch alerts |
 | /status | Bot and data-source status |
-| /markets | EVM secondary-market tools |
+| /collections | Live Kalos NFT collections with verified floors |
+| /sweep | Sweep floor — cheapest live listing + 1-tap Buy |
+| /nfts | Your Elysium NFT inventory + active Kalos listings |
+| /mint | Mint an NFT — /mint [contract] |
+| /nftbuy | Buy NFT on Kalos — /nftbuy [collection] [id] |
+| /nftlist | List NFT on Kalos — /nftlist [collection] [id] [price] |
+| /nftdelist | Cancel Kalos listing — /nftdelist [collection] [id] |
+| /nftoffer | Offer on Kalos — /nftoffer [collection] [id] [price] |
+| /nftaccept | Accept offer on Kalos — /nftaccept [collection] [id] [bidder] |
+| /markets | Archived in Elysium-only mode (use /collections) |
 | /help | Command reference |
 
-Any bare 0x... address pasted in chat opens the Token Card directly.
+Any bare 0x... address pasted in chat opens the Token Card directly (ERC-20 safety + paper Buy/Sell, or NFT floor + Kalos actions for collections).
 
-### Workflow
+### Workflows
 
+**Tokens (paper on testnet):**
 1. Send /start and create a wallet.
 2. Browse /deployments or /launch to find new projects.
 3. Paste a token address, review the safety score, then Buy or Sell from the card.
 4. Check /portfolio for PnL and share your card.
 5. Watch team or treasury wallets with /watch 0x... Treasury to get notified on movement.
+
+**NFTs (live on Kalos):**
+1. Browse /collections for live collections with verified floors.
+2. Tap 🧹 Sweep on any collection, or run /sweep 0x... [count] [maxHYPE].
+3. Confirm the 1-tap Buy — the NFT lands in your custodial wallet.
+4. List it back with /nftlist, track it in /nfts, cancel anytime with /nftdelist.
 
 ### Paper Trading on Testnet
 
@@ -115,9 +143,10 @@ src/
   engine/
     elysium.ts          # Chain health, deployment scan, wallet activity
     safety.ts           # Token safety analysis
-    trading.ts          # HYPE-native router trading
-    marketplace.ts      # Multi-chain floor and NFT lookup
-    opensea.ts          # OpenSea API client
+    trading.ts          # HYPE-native router trading (paper mode until router set)
+    kalos.ts            # Kalos NFT marketplace — discovery, verified floors, buy/sell/list
+    marketplace.ts      # Collection stats + NFT inventory (Kalos-enriched)
+    opensea.ts          # OpenSea API client (legacy, unused in Elysium-only mode)
     minter.ts           # Contract mint execution
   wallet/
     manager.ts          # Custodial wallet, encryption, balances
@@ -149,4 +178,4 @@ The bot uses long polling — no webhook or public port required.
 
 - Private keys are stored encrypted at rest (AES-256-GCM) and never sent through Telegram except via the explicit /export command, which warns the user to delete the message after importing.
 - Changing KEY_ENCRYPTION_SECRET after wallets are created will make existing keys undecryptable.
-- Zensweep never holds or transfers funds outside of explicit user actions (Buy, Sell, Mint, Withdraw).
+- Zensweep never holds or transfers funds outside of explicit user actions (Buy, Sell, Mint, Withdraw, NFT Buy/List/Delist/Offer).
