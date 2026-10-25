@@ -41,6 +41,20 @@ function formatAge(s: number | null): string {
 }
 function shortAddr(a: string): string { return a.slice(0, 6) + "…" + a.slice(-4); }
 
+/** Escape Telegram legacy-Markdown special chars in dynamic text (names, etc). */
+function escMd(input: string): string {
+  return String(input ?? "").replace(/([_*`[])/g, "\\$1");
+}
+
+/** Best-effort HYPE balance read. Returns null when the RPC can't be reached (NOT zero). */
+async function tryReadHypeBalance(address: Address): Promise<bigint | null> {
+  try {
+    const cfg = getChainConfig(ELYSIUM.key);
+    const { createPublicClient, http } = await import("viem");
+    const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+    return (await pc.getBalance({ address })) as bigint;
+  } catch { return null; }
+}
 // In-memory conversation state for multi-step prompts
 const userStates: Record<number, { step: string; data?: any }> = {};
 
@@ -1657,20 +1671,23 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
   const userId = ctx.from?.id;
   const cfg = getChainConfig(ELYSIUM.key);
   await ctx.reply(`🔍 Scanning Kalos for the ${count > 1 ? `${count} cheapest live listings` : "cheapest live listing"}…`, { parse_mode: "Markdown" });
-  // Balance pre-check
+  // Balance pre-check (best-effort only).
+  // A balance read can NEVER block the sweep on its own: getBalance returns
+  // "0" on RPC errors, which previously produced a bogus "No HYPE" message
+  // for wallets that actually hold HYPE. Only a CONFIRMED zero blocks.
   if (userId) {
     try {
       const w0 = walletManager.getUserWallet(userId);
       if (w0) {
-        const b = await walletManager.getBalance(w0.address, ELYSIUM.key, true);
-        if (Number(b.eth) <= 0) {
+        const wei = await tryReadHypeBalance(w0.address as Address);
+        if (wei !== null && wei <= 0n) {
           await ctx.reply(
-            `🔴 *No HYPE to sweep with*\n\nYour wallet \`${w0.address}\` holds \`0 ${b.symbol}\`.\n\nTap 💧 Get Testnet HYPE on /wallet, then try /sweep again.`,
-            { parse_mode: "Markdown", reply_markup: mainKeyboard }
-          );
-          return;
+              `🔴 *No HYPE to sweep with*\n\nYour wallet \`${w0.address}\` holds \`0 HYPE\`.\n\nTap 💧 Get Testnet HYPE on /wallet, then try /sweep again.`,
+              { parse_mode: "Markdown", reply_markup: mainKeyboard }
+            );
+            return;
+          }
         }
-      }
     } catch {}
   }
   const want = Math.max(1, Math.min(10, Math.floor(count)));
@@ -1748,6 +1765,68 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
   }
 }
 
+  const ERC721_META_ABI = [
+    { name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+    { name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+    { name: "totalSupply", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  ] as const;
+
+  /** Best-effort collection metadata: name + symbol, with symbol fallback. Never throws. */
+  async function readCollectionMeta(addr: Address): Promise<{ name: string; symbol: string }> {
+    const fallback = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+    try {
+      const { createPublicClient, http } = await import("viem");
+      const cfg = getChainConfig(ELYSIUM.key);
+      const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+      const [n, s] = await Promise.all([
+        pc.readContract({ address: addr, abi: ERC721_META_ABI as any, functionName: "name" } as any).catch(() => null) as Promise<string | null>,
+        pc.readContract({ address: addr, abi: ERC721_META_ABI as any, functionName: "symbol" } as any).catch(() => null) as Promise<string | null>,
+      ]);
+      if (typeof n === "string" && n.trim().length > 0) {
+        return { name: n.trim(), symbol: typeof s === "string" ? s.trim() : "" };
+      }
+      if (typeof s === "string" && s.trim().length > 0) {
+        return { name: `${s.trim()} Collection`, symbol: s.trim() };
+      }
+    } catch {}
+    return { name: fallback, symbol: "" };
+  }
+
+  /** One styled per-collection card (Markdown, with plain-text fallback). */
+  function buildCollectionCard(r: {
+    name: string; symbol: string; address: Address;
+    floorWei: bigint | null; floorStr: string; count: number;
+    unverified: boolean; scannedAt: string;
+  }): { text: string; plain: string } {
+    const title = r.symbol ? `${r.name} ($${r.symbol})` : r.name;
+    const floorEmoji = !r.floorWei || r.floorWei <= 0n ? "⚪" : r.unverified ? "🟡" : "🟢";
+    const floorLine = r.floorWei && r.floorWei > 0n
+      ? `💰 *Floor:* \`${r.floorStr}\`${r.unverified ? " ⏳" : ""}`
+      : `💰 *Floor:* \`No active listings\``;
+    const liveLine = r.count > 0 ? `📊 *Live asks:* \`${r.count} verified\`` : `📊 *Live asks:* \`none found\``;
+    const text =
+      `🖼️ *${escMd(title)}*\n` +
+      `📄 \`${r.address}\`\n\n` +
+      `${floorEmoji} ${floorLine}\n` +
+      `${liveLine}\n` +
+      `🏛 *Market:* Kalos (Elysium L2)${r.unverified ? " · _verifying…_" : ""}`;
+    const plain = text.replace(/[`*_]/g, "");
+    return { text, plain };
+  }
+
+  function collectionCardKeyboard(r: { address: Address; name: string; symbol: string; floorWei: bigint | null; floorStr: string }): InlineKeyboard {
+    const kb = new InlineKeyboard();
+    const label = r.symbol ? `$${r.symbol}` : r.name.slice(0, 16);
+    if (r.floorWei && r.floorWei > 0n) kb.text(`🧹 Sweep ${label} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
+    else kb.text(`🔍 Inspect ${label}`, `col_inspect_${r.address}`).row();
+    kb.text("🛒 Buy", `kalos_buy_${r.address}`)
+      .text("🏷️ List", `kalos_list_${r.address}`)
+      .text("🤝 Offer", `kalos_offer_${r.address}`).row();
+    kb.text("👀 Watch", `watch_add_${r.address}`)
+      .text("🏷️ All", "menu_collections").row();
+    return kb;
+  }
+
 async function renderCollectionsMenu(ctx: Context) {
   const cfg = getChainConfig(ELYSIUM.key);
   const kalosAddress = kalosService.address();
@@ -1755,11 +1834,13 @@ async function renderCollectionsMenu(ctx: Context) {
 
   // Discover EVERY live Kalos collection on-chain — no hardcoding.
   // One shared scan feeds discovery AND all floor rows (cached 45s).
+  // Scan depth covers well beyond the last 50k blocks so collections whose
+  // listings are older still appear (up to ~24+ on Kalos testnet).
   let discovered: Address[] = [];
   let sharedEvents: Awaited<ReturnType<typeof kalosService.cachedScan>> = [];
   let scanFailed = false;
   try {
-    sharedEvents = await kalosService.cachedScan({ blocksBack: 50_000 });
+    sharedEvents = await kalosService.cachedScan({ blocksBack: 200_000 });
     const seen = new Set<string>();
     for (const e of sharedEvents) seen.add(e.nftAddress.toLowerCase());
     discovered = [...seen] as Address[];
@@ -1779,21 +1860,11 @@ async function renderCollectionsMenu(ctx: Context) {
     seenAddr.add(k);
     merged.push(a);
   }
-  // Resolve names (fast) in parallel…
-  const nameRows: Array<{ address: Address; name: string }> = await Promise.all(
-    merged.slice(0, 20).map(async (addr) => {
-      let name = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
-      try {
-        const { createPublicClient, http } = await import("viem");
-        const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
-        const n = (await pc.readContract({
-          address: addr,
-          abi: [{ name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] }] as any,
-          functionName: "name",
-        } as any)) as string;
-        if (n) name = n;
-      } catch {}
-      return { address: addr, name };
+  // Resolve names + symbols (fast, bounded parallel). ALL collections, not just 20.
+  const nameRows: Array<{ address: Address; name: string; symbol: string }> = await Promise.all(
+    merged.map(async (addr) => {
+      const meta = await readCollectionMeta(addr);
+      return { address: addr, name: meta.name, symbol: meta.symbol };
     })
   );
   // …then verified floors from ONE batched call (no per-collection scans).
@@ -1818,53 +1889,45 @@ async function renderCollectionsMenu(ctx: Context) {
     return n;
   };
   // Resolve names + VERIFIED floors (cheapest live ask — getMinPrice returns 0 on Kalos)
-  type ColRow = { address: Address; name: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number; live: number; unverified: boolean };
-  const rows: ColRow[] = nameRows.map(({ address: addr, name }) => {
+  type ColRow = { address: Address; name: string; symbol: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number; live: number; unverified: boolean };
+  const rows: ColRow[] = nameRows.map(({ address: addr, name, symbol }) => {
     const f = floors.get(addr.toLowerCase());
     const floorWei = f?.floor ?? null;
     const live = f?.liveCount ?? 0;
     const tag = undefined;
-    return { address: addr, name, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count: live, live, unverified: false };
+    return { address: addr, name, symbol, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count: live, live, unverified: false };
   });
+  const scannedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const sortRows = () => rows.sort((a, b) => {
     const af = a.floorWei ?? 10n ** 30n;
     const bf = b.floorWei ?? 10n ** 30n;
     return af < bf ? -1 : af > bf ? 1 : 0;
   });
-  const buildMenuText = (verified: boolean): string => {
+  const buildHeaderText = (verified: boolean): string => {
     let m = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
     m += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
     m += `🏛 *Marketplace:* \`${kalosAddress || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07"}\`\n`;
-    m += `🔗 *Portal:* [kalos.fun](https://kalos.fun)\n\n`;
+    m += `🔗 *Portal:* [kalos.fun](https://kalos.fun)\n`;
+    m += `🕒 *Scanned:* \`${scannedAt}\` · \`${rows.length} collections\`\n\n`;
     if (rows.length === 0) {
       m += scanFailed
         ? `⚠️ *Kalos data temporarily unavailable* — the testnet RPC is not responding. This is usually brief maintenance; try again shortly. You can still paste any NFT contract \`0x…\` to inspect it directly.\n\n`
         : `No live Kalos collections found in recent blocks. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
     } else {
       m += verified
-        ? `*Live on Kalos (floor = cheapest verified ask):*\n\n`
-        : `*Live on Kalos (floor ≈ recent ask — verifying…):*\n\n`;
-      for (const r of rows.slice(0, 10)) {
-        m += `• *${r.name}* — \`${r.floorStr}\`${r.tag ? ` · ${r.tag}` : ""}${r.count > 1 ? ` · ${r.count} live` : ""}${r.unverified ? ` ⏳` : ""}\n  \`${r.address}\`\n`;
-      }
-      m += `\n`;
+        ? `*Live on Kalos (floor = cheapest verified ask):*\n`
+        : `*Live on Kalos (floor ≈ recent ask — verifying ${rows.length}…):*\n`;
     }
     return m;
   };
-  const buildMenuKeyboard = (): InlineKeyboard => {
-    const k = new InlineKeyboard();
-    for (const r of rows.slice(0, 10)) {
-      if (r.floorWei && r.floorWei > 0n) k.text(`🧹 Sweep ${r.name.slice(0, 14)} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
-      else k.text(`🔍 Inspect ${r.name.slice(0, 14)}`, `col_inspect_${r.address}`).row();
-    }
-    return k;
-  };
+  const buildMenuText = (verified: boolean): string => buildHeaderText(verified);
+  const buildMenuKeyboard = (): InlineKeyboard => new InlineKeyboard();
   rows.sort((a, b) => {
     const af = a.floorWei ?? 10n ** 30n;
     const bf = b.floorWei ?? 10n ** 30n;
     return af < bf ? -1 : af > bf ? 1 : 0;
   });
-  // Phase 1: instant menu from event prices (marked ⏳ unverified).
+  // Phase 1: instant estimates (marked ⏳ unverified) — one card per collection.
   for (const r of rows) {
     const ef = eventFloor(r.address);
     if (ef && ef > 0n) {
@@ -1875,6 +1938,27 @@ async function renderCollectionsMenu(ctx: Context) {
     }
   }
   sortRows();
+
+  /** Send one card per collection. Returns sent message ids for phase-2 edits. */
+  async function sendCollectionCards(verified: boolean): Promise<number[]> {
+    const ids: number[] = [];
+    for (const r of rows) {
+      const card = buildCollectionCard({ ...r, scannedAt });
+      const kb = collectionCardKeyboard(r);
+      try {
+        const sent = await ctx.reply(card.text, { parse_mode: "Markdown", reply_markup: kb });
+        ids.push(sent.message_id);
+      } catch {
+        try {
+          const sent = await ctx.reply(card.plain, { reply_markup: kb });
+          ids.push(sent.message_id);
+        } catch {}
+      }
+      // Gentle pacing so Telegram never throttles the burst.
+      await new Promise((res) => setTimeout(res, 120));
+    }
+    return ids;
+  }
 
   const projects = await fetchLaunchProjects();
   const nftProjects = projects.filter((p) => p.contractAddress || p.tags.includes("nft") || p.tags.includes("collection") || p.status === "minting" || p.status === "live");
@@ -1901,18 +1985,32 @@ async function renderCollectionsMenu(ctx: Context) {
     return combined;
   };
 
-  let menuMsgId: number | undefined;
+  let headerMsgId: number | undefined;
   try {
     if (sentScanning) { try { await ctx.api.deleteMessage(ctx.chat!.id, sentScanning.message_id); } catch {} }
   } catch {}
   if (rows.length === 0 && scanFailed) {
-    await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(buildMenuKeyboard(), footerKeyboard()) });
+    try {
+      const fb = footerKeyboard();
+      await ctx.reply(buildHeaderText(false) + footerText, { parse_mode: "Markdown", reply_markup: fb });
+    } catch {
+      await ctx.reply(buildHeaderText(false).replace(/[`*_]/g, "") + footerText.replace(/[`*_]/g, ""));
+    }
     return;
   }
+
+  // Phase-1 header + ALL collection cards (estimates, marked ⏳).
+  let phase1CardIds: number[] = [];
   try {
-    const sent = await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(buildMenuKeyboard(), footerKeyboard()) });
-    menuMsgId = sent.message_id;
+    const headerKb = new InlineKeyboard()
+      .text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row()
+      .text("🔙 Main Menu", "menu_main");
+    const sent = await ctx.reply(buildHeaderText(false), { parse_mode: "Markdown", reply_markup: rows.length > 0 ? headerKb : footerKeyboard() });
+    headerMsgId = sent.message_id;
   } catch {}
+  if (rows.length > 0) {
+    phase1CardIds = await sendCollectionCards(false);
+  }
 
   // Launch-board floors use the shared scan (no extra RPC scans).
   const launchFloors = new Map<string, string>();
@@ -1924,7 +2022,7 @@ async function renderCollectionsMenu(ctx: Context) {
     }
   }
 
-  // Phase 2 (background): verify floors, then edit the menu in place.
+  // Phase 2 (background): verify floors, then EDIT each card in place.
   (async () => {
     try {
       floors = await kalosService.getCollectionFloors(nameRows.map((r) => r.address), { events: sharedEvents, perCollection: 80 });
@@ -1946,9 +2044,23 @@ async function renderCollectionsMenu(ctx: Context) {
       if (lf && lf !== "—") launchFloors.set(r.address.toLowerCase(), r.floorStr);
     }
     sortRows();
-    if (menuMsgId && ctx.chat) {
+    // Re-send cards in verified floor order (cheapest first), then delete the
+    // phase-1 estimate cards so the chat ends up clean and correctly ordered.
+    if (rows.length > 0 && ctx.chat) {
+      const verifiedIds = await sendCollectionCards(true);
+      for (const id of phase1CardIds) {
+        try { await ctx.api.deleteMessage(ctx.chat.id, id); } catch {}
+      }
+      phase1CardIds = verifiedIds;
       try {
-        let m = buildMenuText(true);
+        if (headerMsgId) {
+          await ctx.api.editMessageText(ctx.chat.id, headerMsgId, buildHeaderText(true), { parse_mode: "Markdown" });
+        }
+      } catch {}
+    }
+    if (headerMsgId && ctx.chat) {
+      try {
+        let m = buildHeaderText(true);
         if (nftProjects.length === 0) {
           m += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
         } else {
@@ -1956,32 +2068,23 @@ async function renderCollectionsMenu(ctx: Context) {
           for (const p of nftProjects.slice(0, 8)) {
             const addr = p.contractAddress;
             const fl = addr ? (launchFloors.get(addr.toLowerCase()) ?? "—") : "—";
-            m += `• *${p.name}* [${p.stage}]\n`;
+            m += `• *${escMd(p.name)}* [${escMd(p.stage)}]\n`;
             if (addr) m += `  Contract: \`${addr}\`\n`;
-            m += `  Floor: \`${fl}\` • Mint: \`${p.mintDate}\`\n\n`;
+            m += `  Floor: \`${fl}\` • Mint: \`${escMd(p.mintDate)}\`\n\n`;
           }
         }
         m += footerText;
-        const kb = combineKb(buildMenuKeyboard(), footerKeyboard());
-        // Re-add launch-board inspect buttons
+        const kb = footerKeyboard();
         for (const p of nftProjects.slice(0, 8)) {
           if (p.contractAddress) {
-            try { (kb as any).inline_keyboard.splice(kbLen(kb), 0, [{ text: `🔍 ${p.name.slice(0, 16)}`, callback_data: `col_inspect_${p.contractAddress}` }]); } catch {}
+            try { (kb as any).inline_keyboard.unshift([{ text: `🔍 ${p.name.slice(0, 16)}`, callback_data: `col_inspect_${p.contractAddress}` }]); } catch {}
           }
         }
-        await ctx.api.editMessageText(ctx.chat.id, menuMsgId, m, { parse_mode: "Markdown", reply_markup: kb });
+        await ctx.reply(m, { parse_mode: "Markdown", reply_markup: kb });
       } catch {}
     }
   })();
-  if (menuMsgId) return; // phase-2 edit will complete the menu
-
-  // Fallback: phase-1 send failed (e.g. callback context) — send synchronously.
-  const kb = new InlineKeyboard();
-  if (rows.length === 0) {
-    await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(kb, footerKeyboard()) });
-  } else {
-    await ctx.reply(buildMenuText(false) + footerText, { parse_mode: "Markdown", reply_markup: combineKb(buildMenuKeyboard(), footerKeyboard()) });
-  }
+  return; // phase-2 edit completes in background; cards are already sent
 }
 
 function kbLen(kb: InlineKeyboard): number {
