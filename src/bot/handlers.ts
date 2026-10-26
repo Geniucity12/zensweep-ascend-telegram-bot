@@ -2777,7 +2777,7 @@ async function executeNftList(ctx: Context, data: { contract: Address; tokenId: 
     const expList = BigInt(Math.floor(Date.now() / 1000) + (data.days ?? 7) * 86400);
     const dryList = await kalosService.dryRunList(data.contract, BigInt(data.tokenId), wallet.address as Address, parseEtherList(data.priceHype), expList);
     if (!dryList.ok) {
-      await ctx.reply(`❌ *Listing would fail — no gas spent.*\n\n${dryList.reason}`, { parse_mode: "Markdown" });
+      await ctx.reply(`❌ *Listing blocked — no gas spent.*\n\n${dryList.reason}\n\nCheck: 1) token ID is yours in /nfts, 2) Kalos is approved (the bot auto-approves on the real attempt), 3) expiry 1–30 days.`, { parse_mode: "Markdown" });
       return;
     }
     await ctx.reply(`⏳ Approving & creating listing on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });

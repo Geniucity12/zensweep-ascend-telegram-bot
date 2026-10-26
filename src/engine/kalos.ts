@@ -5,6 +5,38 @@ import kalosAbi from "../abi/kalosMarketplace.json";
 import { dbService } from "../db";
 const ZERO = "0x0000000000000000000000000000000000000000" as Address;
 const NATIVE = ZERO;
+/**
+ * Human explanation for common Kalos listing reverts.
+ * The contract reverts with bare custom errors (no message), so map the
+ * decoded error name + viem's hint text to the actual fix.
+ */
+function decodeListingHint(decoded: string | null, rawShort: string, tokenId: bigint): string | null {
+  const d = (decoded ?? "").toLowerCase();
+  const r = (rawShort ?? "").toLowerCase();
+  const says = (...needles: string[]) => needles.some((x) => d.includes(x) || r.includes(x));
+  if (says("notowningitem", "not owning", "not the owner", "ownable", "ownerof")) {
+    return `You don't own #${tokenId} (or the marketplace can't see your approval yet). List only tokens shown in /nfts, and approve Kalos first.`;
+  }
+  if (says("notapproved", "itemnotapproved", "not approved", "allowance", "erc721: caller is not token owner or approved", "not authorized")) {
+    return `Kalos is not approved to move #${tokenId}. Approve the marketplace for this collection, then list again.`;
+  }
+  if (says("collectionnotapproved", "approvalstatus", "collection not approved", "unapproved collection")) {
+    return `This collection is not approved for trading on Kalos (collection approval status). Only approved collections can list.`;
+  }
+  if (says("paymenttokennotsupported", "unsupported payment", "invalid payment")) {
+    return `Payment token rejected: this marketplace only accepts WHYPE listings. Retry — the bot already uses WHYPE.`;
+  }
+  if (says("invalidquantity", "invalid quantity", "quantity")) {
+    return `Invalid quantity for #${tokenId} (must be ≥ 1).`;
+  }
+  if (says("belowminprice", "min price", "price too low")) {
+    return `Price is below the collection's minimum on Kalos. Raise your list price.`;
+  }
+  if (says("invalid expiration", "expiration", "invalidexpirationtime", "expiry")) {
+    return `Bad expiry window for #${tokenId}. Retry with a 1–30 day duration.`;
+  }
+  return null;
+}
 /** WHYPE on Elysium testnet (verified on-chain: wnative() + paymentToken()). */
 const WHYPE_FALLBACK = "0x41051f27c609dB70af05b7128f15155Dc8E49Ac7" as Address;
 /** Module-level wnative cache (verified live: equals WHYPE_FALLBACK). */
@@ -294,7 +326,9 @@ export const kalosService = {
       return { ok: true };
     } catch (e: any) {
       const decoded = this.decodeContractError(e);
-      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      const rawShort = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 300);
+      const hint = decodeListingHint(decoded, rawShort, tokenId);
+      const cause = hint ? `${hint}\n\nRaw: ${rawShort.slice(0, 180)}` : rawShort.slice(0, 220);
       return { ok: false, reason: `Listing would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
     }
   },
