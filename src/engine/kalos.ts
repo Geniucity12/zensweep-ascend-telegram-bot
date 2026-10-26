@@ -1354,7 +1354,7 @@ export const kalosService = {
   /** Short-lived scan cache so burst UI actions (menu + detail + sweep) share one scan. */
   async cachedScan(opts?: { blocksBack?: number; ttlMs?: number }): Promise<ListedEvent[]> {
     const blocksBack = opts?.blocksBack ?? 50_000;
-    const ttlMs = opts?.ttlMs ?? 45_000;
+    const ttlMs = opts?.ttlMs ?? 120_000;
     const now = Date.now();
     if (scanCache && scanCache.blocksBack === blocksBack && now - scanCache.at < ttlMs) return scanCache.events;
     const events = await this.scanListedEvents({ blocksBack });

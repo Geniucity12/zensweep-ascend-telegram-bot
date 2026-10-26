@@ -1280,13 +1280,22 @@ async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?:
     }
   } catch {}
   if (cheapest.length === 0) {
-    let floorLine = "No active listings";
+    // Tell the user WHY: stale ask seen but nothing buyable now, or nothing seen at all.
+    let why = ``;
+    let floorLine = `No live asks found`;
     try {
       const fp = await kalosService.getVerifiedFloor(contract);
-      if (fp && fp > 0n) floorLine = `${kalosService.formatPrice(fp)} HYPE`;
-    } catch {}
-    await ctx.reply(`🧹 *Sweep Floor — no match*`,
-      { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("🏷️ Collections", "menu_collections").text("🔙 Main Menu", "menu_main") }
+      if (fp && fp > 0n) {
+        floorLine = `${kalosService.formatPrice(fp)} HYPE`;
+        why = `\n\nSomeone listed around \`${floorLine}\` recently, but nothing is buyable right now — it sold, expired, or the seller moved it. Try Re-scan, or bid below it with /offer.`;
+      } else {
+        why = `\n\nNo live asks passed the on-chain check just now (sold / expired / moved). Try Re-scan, or place a bid with /offer.`;
+      }
+    } catch {
+      why = `\n\nKalos scan hiccup — try Re-scan once.`;
+    }
+    await ctx.reply(`🧹 *No buyable listing for this collection${floorLine !== `No live asks found` ? ` (last seen ~${floorLine})` : ``}*${why}`,
+      { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text(`🔄 Re-scan`, `kalos_sweep_${contract}`).text(`🤝 Offer`, `kalos_offer_${contract}`).row().text("🏷️ Collections", "menu_collections").text("🔙 Main Menu", "menu_main") }
     );
     return;
   }
@@ -1422,15 +1431,21 @@ async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?:
     const title = r.symbol ? `${r.name} ($${r.symbol})` : r.name;
     const floorEmoji = !r.floorWei || r.floorWei <= 0n ? "⚪" : r.unverified ? "🟡" : "🟢";
     const floorLine = r.floorWei && r.floorWei > 0n
-      ? `💰 *Floor:* \`${r.floorStr}\`${r.unverified ? " ⏳" : ""}`
-      : `💰 *Floor:* \`No active listings\``;
-    const liveLine = r.count > 0 ? `📊 *Live asks:* \`${r.count} verified\`` : `📊 *Live asks:* \`none found\``;
+      ? r.unverified
+        ? `💰 *Floor:* \`~${r.floorStr}\` *(unconfirmed — still checking)*`
+        : `💰 *Floor:* \`${r.floorStr}\` *(live)*`
+      : `💰 *Floor:* \`No live asks found\``;
+    const liveLine = r.count > 0
+      ? r.unverified
+        ? `📊 *Seen in recent events:* \`${r.count}\` *(confirming…)*`
+        : `📊 *Live asks:* \`${r.count} live\``
+      : `📊 *Live asks:* \`none found\``;
     const text =
       `🖼️ *${escMd(title)}*\n` +
       `📄 \`${r.address}\`\n\n` +
       `${floorEmoji} ${floorLine}\n` +
       `${liveLine}\n` +
-      `🏛 *Market:* Kalos (Elysium L2)${r.unverified ? " · _verifying…_" : ""}`;
+      `🏛 *Market:* Kalos on Elysium L2`;
     const plain = text.replace(/[`*_]/g, "");
     return { text, plain };
   }
@@ -1440,7 +1455,7 @@ async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?:
     const label = r.symbol ? `$${r.symbol}` : r.name.slice(0, 16);
     // Sweep first whenever a floor exists — verified OR event-estimate.
     // A stale "No active listings" row hid behind the estimate before.
-    if (r.floorWei && r.floorWei > 0n) kb.text(r.unverified ? `🧹 Sweep ~${label} — ${r.floorStr} ⏳` : `🧹 Sweep ${label} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
+    if (r.floorWei && r.floorWei > 0n) kb.text(r.unverified ? `🧹 Check ~${label} — ${r.floorStr} (unconfirmed)` : `🧹 Sweep ${label} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
     else kb.text(`🔍 Inspect ${label}`, `col_inspect_${r.address}`).row();
     kb.text("🛒 Buy", `kalos_buy_${r.address}`)
       .text("🏷️ List", `kalos_list_${r.address}`)
@@ -1550,8 +1565,8 @@ async function renderCollectionsMenu(ctx: Context) {
         : `No live Kalos collections found in recent blocks. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
     } else {
       m += verified
-        ? `*Live on Kalos (floor = cheapest verified ask):*\n`
-        : `*Live on Kalos (floor ≈ recent ask — verifying ${rows.length}…):*\n`;
+        ? `*Live on Kalos (floor = cheapest live ask):*\n`
+        : `*Live on Kalos (prices are first guesses — confirming each one…):*\n`;
     }
     return m;
   };
@@ -1793,8 +1808,15 @@ async function renderNFTsMenu(ctx: Context) {
 
   const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
   try {
-    // Cheap discovery: only ItemListed events, shared scan (45s cache).
-    const discovered = await kalosService.discoverCollections({ blocksBack: 200_000 });
+    // Cheap discovery: only ItemListed events, shared scan (45s cache) so
+    // /collections -> /nfts -> sweep back-to-back reuses one scan.
+    const shared = await kalosService.cachedScan({ blocksBack: 200_000 }).catch(() => []);
+    const seenDisc = new Set<string>();
+    const discovered: Address[] = [];
+    for (const e of shared) {
+      const k = (e.nftAddress as string).toLowerCase();
+      if (!seenDisc.has(k)) { seenDisc.add(k); discovered.push(e.nftAddress as Address); }
+    }
     // Bound the ownership probe: 30 collections x tokensOfOwner is the RPC
     // hotspot that starves the bid scan — 12 is enough, FIFO by discovery.
     for (const col of discovered.slice(0, 12)) {
