@@ -550,14 +550,23 @@ export function registerHandlers(bot: Bot) {
     await ctx.reply("🔍 Send any NFT collection contract address (`0x...`) on Elysium:", { parse_mode: "Markdown" });
   });
 
-  bot.callbackQuery(/^kalos_buy_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
+  // Buy = "I know the token ID": paste ID first, then your max HYPE.
+  // Flow: tap Buy → bot asks ONLY for the token ID (+ optional max) →
+  // instant read: if listed at/below your max → 1-tap confirm, else offer fallback.
+  bot.callbackQuery(/^kalos_buy_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
-    const col = ctx.match[1] as Address;
-    const tid = ctx.match[2];
-    // No tokenId (e.g. "Buy" on a collection card) = buy the floor:
-    // auto-find the cheapest verified live listing instead of asking for params.
-    if (tid) await promptNftBuy(ctx, `${col} ${tid}`);
-    else await handleSweepCommand(ctx, col);
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    userStates[userId] = { step: "awaiting_buy_tokenid", data: { contract: ctx.match[1] as Address, expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(
+      `🛒 *Buy from this collection*\n\nReply with the token ID + the MOST you'll pay:\n\n\`<tokenId> [maxHYPE]\`\n\n*Examples:*\n\`13578\` — buy #13578 at its listed price\n\`13578 0.5\` — buy #13578 only if ≤ 0.5 HYPE`,
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  bot.callbackQuery(/^kalos_buy_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await promptNftBuy(ctx, `${ctx.match[1]} ${ctx.match[2]}`);
   });
 
   bot.callbackQuery(/^kalos_list_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
@@ -590,14 +599,19 @@ export function registerHandlers(bot: Bot) {
   });
   bot.callbackQuery(/^kalos_sweepbuyN_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const n = Math.max(1, Math.min(10, Number(ctx.match[2])));
     const userId = ctx.from?.id;
     if (!userId) return;
     const st = userStates[userId];
-    if (!st || st.step !== "awaiting_sweepN_confirm" || !st.data) {
-      await ctx.reply("Sweep expired. Tap 🧹 Re-scan floor to refresh.", { parse_mode: "Markdown" });
+    // Two entry paths share this button:
+    //  1) Fresh count pick (step awaiting_sweepN_pick or no state) -> run the sweep for N.
+    //  2) Confirm tap after a multi-sweep preview (step awaiting_sweepN_confirm) -> execute stored items.
+    if (st && st.step === "awaiting_sweepN_confirm" && st.data) {
+      await executeSweepBuy(ctx, st.data.contract as Address, st.data.items as Array<{ tokenId: string; seller: string; price: string }>);
       return;
     }
-    await executeSweepBuy(ctx, st.data.contract as Address, st.data.items as Array<{ tokenId: string; seller: string; price: string }>);
+    await renderSweepResults(ctx, col, (st?.data?.maxPriceEth as string | undefined) ?? undefined, n, false);
   });
   bot.callbackQuery("noop", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Already showing the cheapest live listing." }).catch(() => {});
@@ -1124,6 +1138,32 @@ export function registerHandlers(bot: Bot) {
         return;
       }
       await executeNftAccept(ctx, state.data);
+      return;
+    }
+
+    if (state?.step === "awaiting_buy_tokenid") {
+      const data0 = state.data ?? {};
+      if (!data0.contract || Date.now() > (data0.expiresAt ?? 0)) {
+        delete userStates[userId];
+        await ctx.reply("Buy session expired. Tap 🛒 Buy on the collection card again.");
+        return;
+      }
+      delete userStates[userId];
+      const parts = text.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0 || !/^\d+$/.test(parts[0] ?? "")) {
+        await ctx.reply("Send just the token ID, e.g. `13578`, optionally followed by your max: `13578 0.5`", { parse_mode: "Markdown" });
+        return;
+      }
+      const tid = parts[0];
+      let maxHype: string | undefined;
+      if (parts[1] !== undefined) {
+        if (!/^\d+(?:\.\d{1,18})?$/.test(parts[1]) || Number(parts[1]) <= 0) {
+          await ctx.reply("Max must be a positive HYPE amount, e.g. `13578 0.5`. Try again.");
+          return;
+        }
+        maxHype = parts[1];
+      }
+      await promptNftBuy(ctx, maxHype ? `${data0.contract} ${tid} ${maxHype}` : `${data0.contract} ${tid}`);
       return;
     }
 
@@ -1670,10 +1710,10 @@ async function handleSweepCommand(ctx: Context, arg: string) {
     );
     return;
   }
-  await renderSweepResults(ctx, contract as Address, maxPrice, count);
+  await renderSweepResults(ctx, contract as Address, maxPrice, count, true);
 }
 
-async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?: string, count: number = 1) {
+async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?: string, count: number = 1, fromCommand = false) {
   const userId = ctx.from?.id;
   const cfg = getChainConfig(ELYSIUM.key);
   await ctx.reply(`🔍 Scanning Kalos for the ${count > 1 ? `${count} cheapest live listings` : "cheapest live listing"}…`, { parse_mode: "Markdown" });
@@ -1697,6 +1737,31 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
     } catch {}
   }
   const want = Math.max(1, Math.min(10, Math.floor(count)));
+  function maxPriceHypeSafe(v?: string): string { return String(v ?? ""); }
+  // Multi-count sweeps: ask HOW MANY before scanning (count picker).
+  // Only for the bare "/sweep <contract>" command (no count, no max typed).
+  // Button taps (card Sweep, Sweep-N, Re-scan) always scan directly.
+  const isBareCommand = fromCommand && want === 1 && (maxPriceEth === undefined || maxPriceEth === null);
+  if (isBareCommand) {
+    const floorPreview = await kalosService.getVerifiedFloor(contract).catch(() => null);
+    const floorLine = floorPreview && floorPreview > 0n ? `${kalosService.formatPrice(floorPreview)} HYPE` : "checking…";
+    const kb = new InlineKeyboard()
+      .text("🧹 Sweep 1", `kalos_sweepN_${contract}_1`)
+      .text("🧹 Sweep 2", `kalos_sweepN_${contract}_2`)
+      .text("🧹 Sweep 3", `kalos_sweepN_${contract}_3`).row()
+      .text("🧹 Sweep 5", `kalos_sweepN_${contract}_5`)
+      .text("🧹 Re-scan floor", `kalos_sweep_${contract}`).row()
+      .text("🏷️ Collections", "menu_collections")
+      .text("🔙 Main Menu", "menu_main");
+    if (userId) {
+      userStates[userId] = { step: "awaiting_sweepN_pick", data: { contract, maxPriceEth: maxPriceEth ?? null, expiresAt: Date.now() + 5 * 60_000 } };
+    }
+    await ctx.reply(
+      `🧹 *Sweep Floor — how many?*\n\nContract: \`${contract}\`\nKalos floor: \`${floorLine}\`${maxPriceEth ? `\nMax filter: \`${maxPriceHypeSafe(maxPriceEth)} HYPE\`` : ""}\n\nTap how many cheapest listings to sweep in one transaction:`,
+      { parse_mode: "Markdown", reply_markup: kb }
+    );
+    return;
+  }
   let cheapest: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
   try {
     cheapest = await kalosService.findCheapestListings(contract, { maxScan: 500, maxResults: Math.max(want, 5), maxPriceEth: maxPriceEth });
