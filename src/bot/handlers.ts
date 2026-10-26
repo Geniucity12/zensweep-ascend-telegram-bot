@@ -581,18 +581,16 @@ export function registerHandlers(bot: Bot) {
     await promptNftDelist(ctx, `${ctx.match[1]} ${ctx.match[2]}`);
   });
 
-  // Collection-level Offer tap = "I want to bid on THIS collection":
-  // ask ONLY for token ID, then price — contract rides along from the card.
-  bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
-    ctx.answerCallbackQuery().catch(() => {});
-    const userId = ctx.from?.id;
-    if (!userId) return;
-    userStates[userId] = { step: "awaiting_offer_tokenid", data: { contract: ctx.match[1] as Address, expiresAt: Date.now() + 5 * 60_000 } };
-    await ctx.reply(
-      `🤝 *Make an Offer on this collection*\n\nReply with the token ID + your bid:\n\n\`<tokenId> <priceHYPE> [days]\`\n\n*Example:*\n\`6187 0.5\` — bid 0.5 HYPE on #6187\n\`6187 0.5 3\` — bid 0.5 HYPE, 3-day expiry`,
-      { parse_mode: "Markdown" }
-    );
-  });
+    bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+      ctx.answerCallbackQuery().catch(() => {});
+      const userId = ctx.from?.id;
+      if (!userId) return;
+      userStates[userId] = { step: "awaiting_offer_any", data: { contract: ctx.match[1] as Address, expiresAt: Date.now() + 5 * 60_000 } };
+      await ctx.reply(
+        `🤝 *Make an Offer (token optional)*\n\nReply ONE of:\n\n\`<priceHYPE> [days]\` — offer on *any* token in this collection\n\`<tokenId> <priceHYPE> [days]\` — offer on a *specific* token\n\n*Examples:*\n\`0.5\` — 0.5 HYPE for any token (7 days)\n\`6187 0.5\` — 0.5 HYPE for #6187\n\`6187 0.5 3\` — 0.5 HYPE for #6187, 3 days`,
+        { parse_mode: "Markdown" }
+      );
+    });
 
   bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
@@ -1134,6 +1132,48 @@ export function registerHandlers(bot: Bot) {
       return;
     }
 
+    // Unified offer input: "0.5" / "0.5 3" = any-token; "6187 0.5" / "6187 0.5 3" = specific token.
+    if (state?.step === "awaiting_offer_any") {
+      const data0 = state.data ?? {};
+      if (!data0.contract || Date.now() > (data0.expiresAt ?? 0)) {
+        delete userStates[userId];
+        await ctx.reply("Offer session expired. Tap 🤝 Offer on the collection card again.");
+        return;
+      }
+      delete userStates[userId];
+      const p = text.trim().split(/\s+/).filter(Boolean);
+      const isPrice = (s?: string) => !!s && /^\d+(?:\.\d{1,18})?$/.test(s) && Number(s) > 0;
+      const isTid = (s?: string) => !!s && /^\d+$/.test(s);
+      const isDays = (s?: string) => !!s && /^\d+$/.test(s) && Number(s) >= 1 && Number(s) <= 30;
+      let tid = "0"; let price = ""; let days = 7;
+      if (p.length === 1 && isPrice(p[0])) { price = p[0]; }
+      else if (p.length === 2 && isPrice(p[0]) && isDays(p[1])) { price = p[0]; days = Number(p[1]); }
+      else if ((p.length === 2 || p.length === 3) && isTid(p[0]) && isPrice(p[1])) {
+        tid = p[0]; price = p[1];
+        if (p[2] !== undefined) {
+          if (!isDays(p[2])) {
+            await ctx.reply("Duration must be 1–30 days. Try again, e.g. `6187 0.5 3`.");
+            userStates[userId] = { step: "awaiting_offer_any", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+            return;
+          }
+          days = Number(p[2]);
+        }
+      } else {
+        await ctx.reply("Reply with `<price> [days]` for any token, or `<tokenId> <price> [days]` for a specific one. E.g. `0.5` or `6187 0.5 3`.", { parse_mode: "Markdown" });
+        userStates[userId] = { step: "awaiting_offer_any", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+        return;
+      }
+      const label = tid === "0" ? "any token" : `#${tid}`;
+      userStates[userId] = { step: "awaiting_nftoffer_confirmation", data: { contract: data0.contract, tokenId: tid, priceHype: price, days, expiresAt: Date.now() + 5 * 60_000 } };
+      const kb = new InlineKeyboard()
+        .text(`✅ Yes, Offer ${price} HYPE`, "confirm_nftoffer")
+        .text("❌ Cancel", "cancel_action");
+      await ctx.reply(
+        `🤝 *Confirm Kalos Offer*\n\n📄 *Collection:* \`${data0.contract}\`\n🏷 *Token:* \`${label}\`\n💰 *Offer:* \`${price} HYPE\`\n⏱ *Expiry:* \`${days} days\`\n\nTap below or reply *YES*:`,
+        { parse_mode: "Markdown", reply_markup: kb }
+      );
+      return;
+    }
     if (state?.step === "awaiting_offer_tokenid") {
       const data0 = state.data ?? {};
       if (!data0.contract || Date.now() > (data0.expiresAt ?? 0)) {
@@ -3120,39 +3160,62 @@ async function promptNftOffer(ctx: Context, raw?: string) {
   }
 
   const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
-  if (parts.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1]) && /^\d+(?:\.\d{1,18})?$/.test(parts[2])) {
-    const contract = parts[0] as Address;
-    const tokenId = parts[1];
-    const priceHype = parts[2];
-    const days = parts[3] ? Number(parts[3]) : 7;
+  const isAddr = (s?: string) => !!s && /^0x[a-fA-F0-9]{40}$/.test(s);
+  const isTid = (s?: string) => !!s && /^\d+$/.test(s);
+  const isPrice = (s?: string) => !!s && /^\d+(?:\.\d{1,18})?$/.test(s) && Number(s) > 0;
+  const isDays = (s?: string) => !!s && /^\d+$/.test(s) && Number(s) >= 1 && Number(s) <= 30;
+  // Accepted shapes (tokenId 0 = any token):
+  //   <contract> <price> [days] | <contract> <tokenId> <price> [days]
+  if (parts.length >= 2 && isAddr(parts[0]) && isPrice(parts[1]) && (parts[2] === undefined || isDays(parts[2]))) {
+    const anyContract = parts[0] as Address;
+    userStates[userId] = {
+      step: "awaiting_nftoffer_confirmation",
+      data: { contract: anyContract, tokenId: "0", priceHype: parts[1], days: parts[2] !== undefined ? Number(parts[2]) : 7, expiresAt: Date.now() + 5 * 60_000 },
+    };
+  } else if (parts.length >= 3 && isAddr(parts[0]) && isTid(parts[1]) && isPrice(parts[2])) {
+    const specContract = parts[0] as Address;
+    const specTokenId = parts[1];
+    const specPrice = parts[2];
+    let specDays = 7;
+    if (parts[3] !== undefined) {
+      if (!isDays(parts[3])) {
+        await ctx.reply("Duration must be 1–30 days. Try again, e.g. `<contract> 6187 0.5 3`.", { parse_mode: "Markdown" });
+        return;
+      }
+      specDays = Number(parts[3]);
+    }
 
     userStates[userId] = {
       step: "awaiting_nftoffer_confirmation",
-      data: { contract, tokenId, priceHype, days, expiresAt: Date.now() + 5 * 60_000 },
+      data: { contract: specContract, tokenId: specTokenId, priceHype: specPrice, days: specDays, expiresAt: Date.now() + 5 * 60_000 },
     };
 
+    const tokenLabel = `#${specTokenId}`;
     const kb = new InlineKeyboard()
-      .text(`✅ Yes, Offer ${priceHype} HYPE`, "confirm_nftoffer")
+      .text(`✅ Yes, Offer ${specPrice} HYPE`, "confirm_nftoffer")
       .text("❌ Cancel", "cancel_action");
 
     let quote = `🤝 *Confirm Kalos Offer / Bid*\n\n`;
-    quote += `📄 *Collection:* \`${contract}\`\n`;
-    quote += `🏷 *Token ID:* \`#${tokenId}\`\n`;
-    quote += `💰 *Offer Price:* \`${priceHype} HYPE\`\n`;
-    quote += `⏱ *Expiry:* \`${days} days\`\n\n`;
+    quote += `📄 *Collection:* \`${specContract}\`\n`;
+    quote += `🏷 *Token:* \`${tokenLabel}\`\n`;
+    quote += `💰 *Offer Price:* \`${specPrice} HYPE\`\n`;
+    quote += `⏱ *Expiry:* \`${specDays} days\`\n\n`;
     quote += `Tap the button below or reply *YES* to proceed:`;
     await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
     return;
-  }
+  } else {
+      // Fell through (e.g. bad shape) — show the flexible prompt.
+      userStates[userId] = { step: "awaiting_nftoffer_params" };
+      await ctx.reply(
+        `🤝 *Make Offer on Kalos*\n\nSend ONE of:\n\n\`<collection> <price> [days]\` — any token\n\`<collection> <tokenId> <price> [days]\` — specific token\n\n*Example:*\n\`0x123... 0.5\` or \`0x123... 1 0.1 7\`\n\nOr reply \`/cancel\`.`,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
 
   userStates[userId] = { step: "awaiting_nftoffer_params" };
   await ctx.reply(
-    `🤝 *Make Offer on Kalos*\n\n` +
-    `Send offer details:\n` +
-    `\`<collection_address> <token_id> <price_hype> [days]\`\n\n` +
-    `*Example:*\n` +
-    `\`0x123... 1 0.1 7\`\n\n` +
-    `Or reply \`/cancel\`.`,
+    `🤝 *Make Offer on Kalos*\n\nSend ONE of:\n\n\`<collection> <price> [days]\` — offer on *any* token\n\`<collection> <tokenId> <price> [days]\` — offer on a *specific* token\n\n*Example:*\n\`0x123... 0.5\` or \`0x123... 1 0.1 7\`\n\nOr reply \`/cancel\`.`,
     { parse_mode: "Markdown" }
   );
 }
@@ -3164,7 +3227,8 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
   if (!wallet) { await ctx.reply("No wallet found."); return; }
 
   try {
-    await ctx.reply(`⏳ Placing token bid on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
+    const scope = data.tokenId === "0" ? "any token" : `#${data.tokenId}`;
+    await ctx.reply(`⏳ Placing ${scope} bid on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
     const dry = await kalosService.dryRunBid(data.contract, BigInt(data.tokenId), parseEther(data.priceHype), wallet.address as Address);
     if (!dry.ok) {
       await ctx.reply(`❌ *Offer would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
@@ -3175,7 +3239,7 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
     await ctx.reply(
       `✅ *Offer Placed on Kalos!*\n\n` +
       `📄 *Collection:* \`${data.contract}\`\n` +
-      `🏷 *Token ID:* \`#${data.tokenId}\`\n` +
+      `🏷 *Token:* \`${data.tokenId === "0" ? "any token" : `#${data.tokenId}`}\`\n` +
       `💰 *Bid:* \`${data.priceHype} HYPE\`\n` +
       `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard }

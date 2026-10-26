@@ -202,7 +202,16 @@ export const kalosService = {
   },
 
   async createTokenBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
-    const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
+    const addr = kalosAddr()!; const tid = BigInt(tokenId);
+    if (tid < 0n) throw new Error("Token ID must be 0 (any token) or a positive token ID.");
+    const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
+    // tokenId 0 = collection-wide offer (any token in the collection). No per-token owner check.
+    if (tid > 0n) {
+      const ownerNow = (await publicClient().readContract({
+        address: nftAddress, abi: erc721Abi as any, functionName: "ownerOf", args: [tid],
+      } as any).catch(() => null)) as Address | null;
+      if (!ownerNow) throw new Error(`Token #${tid} does not exist in this collection (ownerOf reverted). Use 0 for any-token.`);
+    }
     const payToken = await this.wnative();
     const wc = walletClient(privateKey); const pc = publicClient();
     const param = { nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: payToken };
@@ -366,10 +375,17 @@ export const kalosService = {
       return { ok: false, reason: `Cancel would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
     }
   },
-  /** Gas-free pre-flight for createOrUpdateTokenBids. */
+  /** Gas-free pre-flight for createOrUpdateTokenBids. tokenId 0 = any token (collection-wide). */
   async dryRunBid(collection: Address, tokenId: bigint, priceWei: bigint, bidder: Address, qty: bigint = 1n): Promise<{ ok: boolean; reason?: string }> {
     const now = BigInt(Math.floor(Date.now() / 1000));
     if (priceWei <= 0n) return { ok: false, reason: "Offer price must be above 0." };
+    if (tokenId < 0n) return { ok: false, reason: "Token ID must be 0 (any token) or a positive token ID." };
+    if (tokenId > 0n) {
+      const ownerNow = (await publicClient().readContract({
+        address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tokenId],
+      } as any).catch(() => null)) as Address | null;
+      if (!ownerNow) return { ok: false, reason: `Token #${tokenId} does not exist in this collection. Use 0 for an any-token offer.` };
+    }
     const payToken = await this.wnative();
     const param = { nftAddress: collection, tokenId, quantity: qty, pricePerItem: priceWei, expirationTime: now + 7n * 86400n, paymentToken: payToken };
     try {
