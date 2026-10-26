@@ -741,10 +741,26 @@ export function registerHandlers(bot: Bot) {
 
   bot.callbackQuery(/^quick_offer_(0x[a-fA-F0-9]{40})_(\d+)(?:_(.+))?$/, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
-    const col = ctx.match[1];
+    const col = ctx.match[1] as Address;
     const tid = ctx.match[2];
     const price = ctx.match[3];
-    await promptNftOffer(ctx, price ? `${col} ${tid} ${price}` : `${col} ${tid}`);
+    // Route through the same any/specific parser as manual input:
+    // token present -> "6187 [0.5]"; never pass collection twice.
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    if (price !== undefined) {
+      userStates[userId] = { step: "awaiting_offer_price", data: { contract: col, tokenId: tid, expiresAt: Date.now() + 5 * 60_000 } };
+      await ctx.reply(
+        `🤝 *Offer on #${tid}*\n\nReply with your bid + optional days:\n\n\`<price_hype> [days]\`\n\nSuggested: \`${price}\``,
+        { parse_mode: "Markdown" }
+      );
+      return;
+    }
+    userStates[userId] = { step: "awaiting_offer_price", data: { contract: col, tokenId: tid, expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(
+      `🤝 *Offer on #${tid}*\n\nReply with your bid + optional days:\n\n\`<price_hype> [days]\`\n\n*Example:* \`0.5 3\` — bid 0.5 HYPE for 3 days`,
+      { parse_mode: "Markdown" }
+    );
   });
 
   bot.callbackQuery("cancel_action", async (ctx) => {

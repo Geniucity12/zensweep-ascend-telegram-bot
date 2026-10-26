@@ -201,6 +201,48 @@ export const kalosService = {
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
 
+  /** Collection's pinned payment token (per getPaymentTokenForCollection), else wnative. */
+  async paymentTokenFor(nftAddress: Address): Promise<Address> {
+    try {
+      const pinned = (await publicClient().readContract({
+        address: kalosAddr()!, abi: kalosAbi as any, functionName: "getPaymentTokenForCollection", args: [nftAddress],
+      } as any).catch(() => null)) as Address | null;
+      if (pinned && /^0x[a-fA-F0-9]{40}$/.test(pinned) && pinned.toLowerCase() !== ZERO.toLowerCase()) return pinned;
+    } catch {}
+    return this.wnative();
+  },
+  /** Reads that gate bid writes: global bids switch + collection approval status. */
+  async bidGates(nftAddress: Address): Promise<{ bidsActive: boolean; collectionApproved: boolean }> {
+    const client = publicClient();
+    const addr = kalosAddr()!;
+    let bidsActive = true;
+    try {
+      bidsActive = (await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "areBidsActive" } as any).catch(() => true)) as boolean;
+    } catch { bidsActive = true; }
+    let collectionApproved = true;
+    try {
+      const st = (await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "collectionApprovals", args: [nftAddress] } as any).catch(() => 2)) as number | bigint;
+      collectionApproved = Number(st) !== 0;
+    } catch { collectionApproved = true; }
+    return { bidsActive: !!bidsActive, collectionApproved };
+  },
+  /** WHYPE (payment-token) balance of an account — bids escrow in WHYPE, not native HYPE. */
+  async paymentTokenBalance(of: Address, nftAddress: Address): Promise<{ symbol: string; decimals: number; raw: bigint }> {
+    const client = publicClient();
+    const pay = await this.paymentTokenFor(nftAddress);
+    const erc = [
+      { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "a", type: "address" }], outputs: [{ type: "uint256" }] },
+      { name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+      { name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] },
+    ] as const;
+    const [raw, symbol, decimals] = await Promise.all([
+      (client.readContract({ address: pay, abi: erc as any, functionName: "balanceOf", args: [of] } as any).catch(() => 0n) as Promise<bigint>)
+        .then((v) => { try { return BigInt((v as any) ?? 0); } catch { return 0n; } }),
+      client.readContract({ address: pay, abi: erc as any, functionName: "symbol" } as any).catch(() => "WHYPE"),
+      client.readContract({ address: pay, abi: erc as any, functionName: "decimals" } as any).catch(() => 18),
+    ]);
+    return { symbol: String(symbol ?? "WHYPE"), decimals: Number(decimals ?? 18), raw };
+  },
   async createTokenBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId);
     if (tid < 0n) throw new Error("Token ID must be 0 (any token) or a positive token ID.");
@@ -212,7 +254,8 @@ export const kalosService = {
       } as any).catch(() => null)) as Address | null;
       if (!ownerNow) throw new Error(`Token #${tid} does not exist in this collection (ownerOf reverted). Use 0 for any-token.`);
     }
-    const payToken = await this.wnative();
+    // Collection-pinned payment token (NOT blind wnative): PaymentTokenNotSupported reverts otherwise.
+    const payToken = await this.paymentTokenFor(nftAddress);
     const wc = walletClient(privateKey); const pc = publicClient();
     const param = { nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: payToken };
     try {
@@ -230,7 +273,8 @@ export const kalosService = {
   },
   async createCollectionBid(privateKey: Hex, nftAddress: Address, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
-    const payToken = await this.wnative();
+    // Collection bids use the same pinned payment token as token bids.
+    const payToken = await this.paymentTokenFor(nftAddress);
     const wc = walletClient(privateKey); const pc = publicClient();
     try {
       await pc.simulateContract({
@@ -250,7 +294,7 @@ export const kalosService = {
     let price = opts?.priceEth ? parseEther(opts.priceEth) : 0n;
     let payToken: Address | null = null;
     if (!price) { const client = publicClient(); const bid:any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, tid, bidder] } as any); if (!bid || bid.pricePerItem===0n) throw new Error("Bid not found"); price = bid.pricePerItem; payToken = (bid.paymentToken ?? null) as Address | null; }
-    if (!payToken) payToken = await this.wnative();
+    if (!payToken) payToken = await this.paymentTokenFor(nftAddress);
     await this.approveMarketplace(privateKey, nftAddress);
     const wc = walletClient(privateKey); const pc = publicClient();
     const param = { bidType: 0, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: payToken };
@@ -386,7 +430,17 @@ export const kalosService = {
       } as any).catch(() => null)) as Address | null;
       if (!ownerNow) return { ok: false, reason: `Token #${tokenId} does not exist in this collection. Use 0 for an any-token offer.` };
     }
-    const payToken = await this.wnative();
+    // 1) Global + collection gates — these revert before anything else.
+    const gates = await this.bidGates(collection).catch(() => ({ bidsActive: true, collectionApproved: true }));
+    if (!gates.bidsActive) return { ok: false, reason: "Bidding is currently disabled on Kalos (areBidsActive = false). Bids cannot land until the marketplace re-enables them." };
+    if (!gates.collectionApproved) return { ok: false, reason: "This collection is not approved for trading on Kalos (collectionApprovals = 0). Only approved collections accept bids/listings." };
+    // 2) Bidder must hold the payment token (bids escrow in WHYPE, not native HYPE).
+    const payToken = await this.paymentTokenFor(collection);
+    const bal = await this.paymentTokenBalance(bidder, collection).catch(() => ({ symbol: "WHYPE", decimals: 18, raw: 0n }));
+    const need = priceWei * (qty > 0n ? qty : 1n);
+    if (bal.raw < need) {
+      return { ok: false, reason: `Insufficient ${bal.symbol}: you hold ${kalosService.formatPrice(bal.raw)} ${bal.symbol} but this bid needs ${kalosService.formatPrice(need)} ${bal.symbol}. Bids escrow in ${bal.symbol} (payment token ${payToken.slice(0, 10)}…), not native HYPE — wrap/bridge first, then retry.` };
+    }
     const param = { nftAddress: collection, tokenId, quantity: qty, pricePerItem: priceWei, expirationTime: now + 7n * 86400n, paymentToken: payToken };
     try {
       await publicClient().simulateContract({
@@ -396,8 +450,8 @@ export const kalosService = {
       return { ok: true };
     } catch (e: any) {
       const decoded = this.decodeContractError(e);
-      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
-      return { ok: false, reason: `Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 260);
+      return { ok: false, reason: `Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}. If this says BiddingNotActive/PaymentTokenNotSupported/CollectionNotApproved, the gates above explain why.` };
     }
   },
   /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token. */
