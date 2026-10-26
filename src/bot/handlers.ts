@@ -55,6 +55,9 @@ async function tryReadHypeBalance(address: Address): Promise<bigint | null> {
     return (await pc.getBalance({ address })) as bigint;
   } catch { return null; }
 }
+// Collection metadata cache: names rarely change — avoid re-hammering the RPC every menu open.
+const collectionMetaCache = new Map<string, { name: string; symbol: string; at: number }>();
+const COLLECTION_META_TTL_MS = 10 * 60_000;
 // In-memory conversation state for multi-step prompts
 const userStates: Record<number, { step: string; data?: any }> = {};
 
@@ -2093,21 +2096,35 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
   /** Best-effort collection metadata: name + symbol, with symbol fallback. Never throws. */
   async function readCollectionMeta(addr: Address): Promise<{ name: string; symbol: string }> {
     const fallback = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+    const key = addr.toLowerCase();
+    const cached = collectionMetaCache.get(key);
+    if (cached && Date.now() - cached.at < COLLECTION_META_TTL_MS && cached.name !== fallback) return cached;
     try {
       const { createPublicClient, http } = await import("viem");
       const cfg = getChainConfig(ELYSIUM.key);
       const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
-      const [n, s] = await Promise.all([
-        pc.readContract({ address: addr, abi: ERC721_META_ABI as any, functionName: "name" } as any).catch(() => null) as Promise<string | null>,
-        pc.readContract({ address: addr, abi: ERC721_META_ABI as any, functionName: "symbol" } as any).catch(() => null) as Promise<string | null>,
-      ]);
+      // Sequential (not parallel): the testnet RPC rate-limits aggressively and
+      // parallel name()+symbol() pairs across 20+ collections all fail at once,
+      // which is exactly how cards end up nameless (0x9b87… fallback). Retry once.
+      let n: string | null = null;
+      let s: string | null = null;
+      for (let attempt = 0; attempt < 2 && (n === null || s === null); attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt));
+        try { n = (await pc.readContract({ address: addr, abi: ERC721_META_ABI as any, functionName: "name" } as any).catch(() => null)) as string | null; } catch { /* retry */ }
+        try { s = (await pc.readContract({ address: addr, abi: ERC721_META_ABI as any, functionName: "symbol" } as any).catch(() => null)) as string | null; } catch { /* retry */ }
+      }
       if (typeof n === "string" && n.trim().length > 0) {
-        return { name: n.trim(), symbol: typeof s === "string" ? s.trim() : "" };
+        const meta = { name: n.trim(), symbol: typeof s === "string" ? s.trim() : "" };
+        collectionMetaCache.set(key, { ...meta, at: Date.now() });
+        return meta;
       }
       if (typeof s === "string" && s.trim().length > 0) {
-        return { name: `${s.trim()} Collection`, symbol: s.trim() };
+        const meta = { name: `${s.trim()} Collection`, symbol: s.trim() };
+        collectionMetaCache.set(key, { ...meta, at: Date.now() });
+        return meta;
       }
     } catch {}
+    if (cached) return { name: cached.name, symbol: cached.symbol };
     return { name: fallback, symbol: "" };
   }
 
@@ -2179,13 +2196,24 @@ async function renderCollectionsMenu(ctx: Context) {
     seenAddr.add(k);
     merged.push(a);
   }
-  // Resolve names + symbols (fast, bounded parallel). ALL collections, not just 20.
-  const nameRows: Array<{ address: Address; name: string; symbol: string }> = await Promise.all(
-    merged.map(async (addr) => {
-      const meta = await readCollectionMeta(addr);
-      return { address: addr, name: meta.name, symbol: meta.symbol };
-    })
-  );
+  // Resolve names (bounded parallel: 5 at a time — the testnet RPC 429s on
+  // Promise.all bursts, which used to leave every card showing raw 0x…).
+  const nameRows: Array<{ address: Address; name: string; symbol: string }> = [];
+  {
+    const queue = [...merged];
+    const workers = new Array(Math.min(5, queue.length)).fill(0).map(async () => {
+      while (queue.length > 0) {
+        const addr = queue.shift()!;
+        try {
+          const meta = await readCollectionMeta(addr);
+          nameRows.push({ address: addr, name: meta.name, symbol: meta.symbol });
+        } catch {
+          nameRows.push({ address: addr, name: `${addr.slice(0, 6)}…${addr.slice(-4)}`, symbol: "" });
+        }
+      }
+    });
+    await Promise.all(workers);
+  }
   // …then verified floors from ONE batched call (no per-collection scans).
   // Two-phase menu: instant event-price estimates first, verified floors edited in.
   let floors = new Map<string, { floor: bigint | null; liveCount: number }>();
