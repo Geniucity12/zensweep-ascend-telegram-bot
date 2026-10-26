@@ -108,15 +108,29 @@ async function checkElysiumDeployments() {
 async function checkWatchFloors() {
   if (!bot) return;
   const watches = dbService.getAllWatches();
-  const collections = [...new Set(
+  const watchAddrs = [...new Set(
     watches.filter((w) => /^0x[a-fA-F0-9]{40}$/.test(w.address ?? "")).map((w) => (w.address as string).toLowerCase())
-  )].slice(0, 20);
+  )];
+  if (watchAddrs.length === 0) return;
+  // Indexer-first: one directory call covers every collection, whatever the count.
+  let idx: Map<string, { floor: bigint | null }> | null = null;
+  try {
+    const { getIndexDirectory } = await import("../engine/kalos");
+    const dir = await getIndexDirectory();
+    idx = new Map([...dir.stats.entries()].map(([addr, s]) => [addr, { floor: s.floor }]));
+  } catch { idx = null; }
+  const collections = watchAddrs.slice(0, 50);
   for (const col of collections) {
     let floor: bigint | null = null;
+    if (idx) {
+      floor = idx.get(col)?.floor ?? null;
+      if (!floor) continue; // indexer authoritative: no floor = no live asks
+    } else {
     try {
       floor = await kalosService.getVerifiedFloor(col as Address);
     } catch { continue; }
     if (!floor || floor <= 0n) continue;
+    }
     const prev = lastFloors.get(col);
     lastFloors.set(col, floor);
     if (prev === undefined || floor === prev) continue; // first sighting or no change

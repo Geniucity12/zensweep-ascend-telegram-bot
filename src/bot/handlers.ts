@@ -1473,7 +1473,7 @@ async function renderCollectionsMenu(ctx: Context) {
   const kalosAddress = kalosService.address();
   const sentScanning = await ctx.reply(`🔍 Loading Kalos collections…`, { parse_mode: "Markdown" }).catch(() => null);
 
-  // PRIMARY: kalos.fun indexer — all 27 collections + floors + topBids in ONE call.
+  // PRIMARY: kalos.fun indexer — every collection + floors + topBids in ONE call.
   // Matches kalos.fun exactly. RPC scan is the fallback (indexer down / unregistered CAs).
   let indexCols: Array<{ slug: string; address: Address; name: string; symbol: string }> = [];
   let indexStats = new Map<string, { floor: bigint | null; topBid: bigint | null }>();
@@ -1876,16 +1876,22 @@ async function renderNFTsMenu(ctx: Context) {
 
   const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
   try {
-    // Cheap discovery: only ItemListed events, shared scan (45s cache) so
-    // /collections -> /nfts -> sweep back-to-back reuses one scan.
-    const shared = await kalosService.cachedScan({ blocksBack: 200_000 }).catch(() => []);
-    const seenDisc = new Set<string>();
-    const discovered: Address[] = [];
-    for (const e of shared) {
-      const k = (e.nftAddress as string).toLowerCase();
-      if (!seenDisc.has(k)) { seenDisc.add(k); discovered.push(e.nftAddress as Address); }
+    // Indexer-first: every known collection (whatever count kalos.fun lists),
+    // then probe ownership. RPC event scan is the fallback (indexer down).
+    let discovered: Address[] = [];
+    try {
+      const { getIndexDirectory } = await import("../engine/kalos");
+      discovered = (await getIndexDirectory()).cols.map((c) => c.address);
+    } catch { discovered = []; }
+    if (discovered.length === 0) {
+      const shared = await kalosService.cachedScan({ blocksBack: 200_000 }).catch(() => []);
+      const seenDisc = new Set<string>();
+      for (const e of shared) {
+        const k = (e.nftAddress as string).toLowerCase();
+        if (!seenDisc.has(k)) { seenDisc.add(k); discovered.push(e.nftAddress as Address); }
+      }
     }
-    // Bound the ownership probe: 30 collections x tokensOfOwner is the RPC
+    // Bound the ownership probe: N collections x tokensOfOwner is the RPC
     // hotspot that starves the bid scan — 12 is enough, FIFO by discovery.
     for (const col of discovered.slice(0, 12)) {
       try {

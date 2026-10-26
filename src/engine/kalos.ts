@@ -102,7 +102,7 @@ async function fetchMarketView(scope: string): Promise<MarketViewPayload | null>
   finally { clearTimeout(t); }
 }
 
-/** All 27 kalos.fun collections + indexer floors/topBids. Cached 60s. */
+/** Kalos indexer directory: every collection kalos.fun lists (no hardcoded count). Cached 60s. */
 export async function getIndexDirectory(): Promise<{ cols: KalosIndexCollection[]; stats: Map<string, { floor: bigint | null; topBid: bigint | null }>; block?: string }> {
   if (indexCache.dir && Date.now() - indexCache.dir.at < INDEX_DIR_TTL_MS) {
     return { cols: indexCache.dir.cols, stats: indexCache.dir.stats };
@@ -1406,7 +1406,7 @@ export const kalosService = {
   },
   /**
    * Floors for MANY collections. PRIMARY: kalos.fun indexer directory
-   * (one HTTP call, all 27 collections, exact match). FALLBACK: RPC scan.
+   * (one HTTP call, every collection, exact match). FALLBACK: RPC scan.
    */
   async getCollectionFloors(
     collections: Address[],
