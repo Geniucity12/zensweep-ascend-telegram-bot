@@ -613,6 +613,17 @@ export function registerHandlers(bot: Bot) {
     }
     await renderSweepResults(ctx, col, (st?.data?.maxPriceEth as string | undefined) ?? undefined, n, false);
   });
+  // Count-picker taps use kalos_sweepN_<addr>_<n> (no "buy" in the middle).
+  // Same behavior as a fresh pick: run the sweep for N directly.
+  bot.callbackQuery(/^kalos_sweepN_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const n = Math.max(1, Math.min(10, Number(ctx.match[2])));
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    const st = userStates[userId];
+    await renderSweepResults(ctx, col, (st?.data?.maxPriceEth as string | undefined) ?? undefined, n, false);
+  });
   bot.callbackQuery("noop", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Already showing the cheapest live listing." }).catch(() => {});
   });
