@@ -97,7 +97,7 @@ export const kalosService = {
     const addr = kalosAddr(); if (!addr) return false;
     try { const c = publicClient(); return !!(await c.readContract({ address: nft, abi: erc721Abi as any, functionName: "isApprovedForAll", args: [owner, addr] } as any)); } catch { return false; }
   },
-  async ensureApprovedForAll(privateKey: Hex, nft: Address): Promise<Hash | null> {
+  async approveMarketplace(privateKey: Hex, nft: Address): Promise<Hash | null> {
     const addr = kalosAddr()!; const account = privateKeyToAccount(privateKey); const pc = publicClient();
     const ok = await this.isApprovedForAll(nft, account.address); if (ok) return null;
     const wc = walletClient(privateKey); const hash = await wc.writeContract({ address: nft, abi: erc721Abi as any, functionName: "setApprovalForAll", args: [addr, true] } as any);
@@ -117,7 +117,15 @@ export const kalosService = {
     if (ownerNow.toLowerCase() !== account.address.toLowerCase()) {
       throw new Error(`You don't own #${tid}: it belongs to ${ownerNow.slice(0, 10)}…, not your wallet ${account.address.slice(0, 10)}…. List only tokens you hold (see /nfts).`);
     }
-    await this.ensureApprovedForAll(privateKey, nftAddress);
+    await this.approveMarketplace(privateKey, nftAddress);
+    // 1b) Re-check approval AFTER the approve tx confirms: createOrUpdateListings
+    // reverts (ItemNotApproved) if the approval didn't actually land on-chain.
+    const approvedNow = (await client.readContract({
+      address: nftAddress, abi: erc721Abi as any, functionName: "isApprovedForAll", args: [account.address, addr],
+    } as any).catch(() => false)) as boolean;
+    if (!approvedNow) {
+      throw new Error(`Kalos approval didn't stick for this collection — the approve tx may have failed or is still pending. Wait a few seconds and retry the listing.`);
+    }
     // 2) List in the marketplace's native quote token (WHYPE), NOT zero address.
     // Verified on-chain: paymentToken() == wnative() == WHYPE and every live
     // listing uses it. Zero-address listings revert.
@@ -234,7 +242,7 @@ export const kalosService = {
     let payToken: Address | null = null;
     if (!price) { const client = publicClient(); const bid:any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, tid, bidder] } as any); if (!bid || bid.pricePerItem===0n) throw new Error("Bid not found"); price = bid.pricePerItem; payToken = (bid.paymentToken ?? null) as Address | null; }
     if (!payToken) payToken = await this.wnative();
-    await this.ensureApprovedForAll(privateKey, nftAddress);
+    await this.approveMarketplace(privateKey, nftAddress);
     const wc = walletClient(privateKey); const pc = publicClient();
     const param = { bidType: 0, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: payToken };
     try {
@@ -304,7 +312,7 @@ export const kalosService = {
     );
     return out;
   },
-  /** Gas-free pre-flight for createListing: ownership + dry-run simulate. */
+  /** Gas-free pre-flight for createListing: ownership + approval + dry-run simulate. */
   async dryRunList(
     collection: Address, tokenId: bigint, owner: Address, priceWei: bigint, expiration: bigint
   ): Promise<{ ok: boolean; reason?: string }> {
@@ -315,6 +323,13 @@ export const kalosService = {
     if (!ownerNow) return { ok: false, reason: `Token #${tokenId} does not exist in this collection (ownerOf reverted). Check the token ID with /nfts first.` };
     if (ownerNow.toLowerCase() !== owner.toLowerCase()) {
       return { ok: false, reason: `You don't own #${tokenId}: it belongs to ${ownerNow.slice(0, 10)}…. List only tokens you hold (see /nfts).` };
+    }
+    const mkt = kalosAddr()!;
+    const approved = (await client.readContract({
+      address: collection, abi: erc721Abi as any, functionName: "isApprovedForAll", args: [owner, mkt],
+    } as any).catch(() => false)) as boolean;
+    if (!approved) {
+      return { ok: false, needsApproval: true, reason: `Kalos is not approved to move #${tokenId} yet. Tap Approve below, wait for confirmation, then list again.` } as { ok: boolean; reason?: string };
     }
     const payToken = await this.wnative();
     const param = { nftAddress: collection, tokenId, quantity: 1n, pricePerItem: priceWei, expirationTime: expiration, paymentToken: payToken };

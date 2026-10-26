@@ -660,6 +660,33 @@ export function registerHandlers(bot: Bot) {
     await executeNftList(ctx, data);
   });
 
+  bot.callbackQuery("confirm_nftapprove", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    if (!data || Date.now() > (data.expiresAt ?? 0)) {
+      await ctx.reply("Approval session expired. Start the listing again with /nftlist.");
+      return;
+    }
+    const wallet = walletManager.getUserWallet(userId);
+    if (!wallet) { await ctx.reply("No wallet found."); return; }
+    try {
+      await ctx.reply(`⏳ Approving Kalos to move your NFTs in \`${data.contract}\`…`, { parse_mode: "Markdown" });
+      const hash = await kalosService.approveMarketplace(wallet.privateKey, data.contract as Address);
+      if (!hash) {
+        await ctx.reply("Already approved. Continuing your listing…", { parse_mode: "Markdown" });
+      } else {
+        const cfg = getChainConfig(ELYSIUM.key);
+        await ctx.reply(`✅ *Approved.* [View approval tx](${cfg.explorerUrl}/tx/${hash})\n\nContinuing your listing…`, { parse_mode: "Markdown" });
+      }
+      await executeNftList(ctx, data);
+    } catch (e: any) {
+      await ctx.reply(`❌ Approval failed: ${e?.shortMessage || e?.message || "unknown"}\n\nListing not started — no gas spent on the listing itself.`);
+    }
+  });
+
   bot.callbackQuery("confirm_nftdelist", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     const userId = ctx.from?.id;
@@ -2777,7 +2804,21 @@ async function executeNftList(ctx: Context, data: { contract: Address; tokenId: 
     const expList = BigInt(Math.floor(Date.now() / 1000) + (data.days ?? 7) * 86400);
     const dryList = await kalosService.dryRunList(data.contract, BigInt(data.tokenId), wallet.address as Address, parseEtherList(data.priceHype), expList);
     if (!dryList.ok) {
-      await ctx.reply(`❌ *Listing blocked — no gas spent.*\n\n${dryList.reason}\n\nCheck: 1) token ID is yours in /nfts, 2) Kalos is approved (the bot auto-approves on the real attempt), 3) expiry 1–30 days.`, { parse_mode: "Markdown" });
+      const needsApproval = (dryList as { needsApproval?: boolean }).needsApproval === true;
+      if (needsApproval) {
+        if (userId) {
+          userStates[userId] = { step: "awaiting_nftlist_approve", data: { ...data, expiresAt: Date.now() + 5 * 60_000 } };
+        }
+        const kb = new InlineKeyboard()
+          .text("✅ Approve Kalos", "confirm_nftapprove")
+          .text("❌ Cancel", "cancel_action");
+        await ctx.reply(
+          `🔐 *Approval needed.*\n\n${dryList.reason}\n\nTap Approve (one tx), then I’ll continue your listing automatically.`,
+          { parse_mode: "Markdown", reply_markup: kb }
+        );
+        return;
+      }
+      await ctx.reply(`❌ *Listing blocked — no gas spent.*\n\n${dryList.reason}\n\nCheck: 1) token ID is yours in /nfts, 2) expiry 1–30 days.`, { parse_mode: "Markdown" });
       return;
     }
     await ctx.reply(`⏳ Approving & creating listing on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
