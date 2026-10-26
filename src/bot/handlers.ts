@@ -449,16 +449,17 @@ export function registerHandlers(bot: Bot) {
   bot.callbackQuery("wrap_and_bid", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     const userId = ctx.from?.id;
-    if (!userId || !userStates[userId]?.data || userStates[userId].step !== "awaiting_offer_wrap_confirm") return;
+    if (!userId || !userStates[userId]?.data) return;
+    if (userStates[userId].step !== "awaiting_offer_wrap_confirm" && userStates[userId].step !== "awaiting_offer_approve_confirm") return;
     const data = userStates[userId].data as { contract: Address; tokenId: string; priceHype: string; days: number; expiresAt?: number };
-    if (Date.now() > (data.expiresAt ?? 0)) { delete userStates[userId]; await ctx.reply("Offer session expired. Start again with /nftoffer."); return; }
+    if (Date.now() > (data.expiresAt ?? 0)) { delete userStates[userId]; await ctx.reply("Offer session expired. Start again with /offer."); return; }
     delete userStates[userId];
     const wallet = walletManager.getUserWallet(userId);
     if (!wallet) { await ctx.reply("No wallet found."); return; }
     try {
       const scope = data.tokenId === "0" ? "any token" : `#${data.tokenId}`;
       const shortfall = parseEther(data.priceHype); // worst case: wrap full bid; ensureBidFunds wraps only the shortfall
-      await ctx.reply(`🔄 Wrapping HYPE → WHYPE, then placing your ${scope} bid for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
+      await ctx.reply(`🔄 Approving Kalos + wrapping (if needed), then placing your ${scope} bid for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
       await kalosService.ensureBidFunds(wallet.privateKey, data.contract, shortfall);
       const hash = await kalosService.createTokenBid(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
       const cfg = getChainConfig(ELYSIUM.key);
@@ -471,7 +472,7 @@ export function registerHandlers(bot: Bot) {
         { parse_mode: "Markdown", reply_markup: mainKeyboard }
       );
     } catch (e: any) {
-      await ctx.reply(`❌ Wrap-and-bid failed: ${e?.shortMessage || e?.message || "unknown"}\n\nNo bid was placed. Your HYPE is safe — retry or top up and try again.`);
+      await ctx.reply(`❌ Approve-and-bid failed: ${e?.shortMessage || e?.message || "unknown"}\n\nNo bid was placed. Your WHYPE is safe — tap again or retry /offer.`);
     }
   });
 
@@ -1995,6 +1996,16 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
     const need = parseEther(data.priceHype);
     const dry = await kalosService.dryRunBid(data.contract, BigInt(data.tokenId), need, wallet.address as Address);
     if (!dry.ok) {
+      if (dry.code === "NEEDS_APPROVE") {
+        const kb = new InlineKeyboard().text(`✅ Approve Kalos & Bid ${data.priceHype}`, "wrap_and_bid").text("❌ Cancel", "cancel_action");
+        userStates[userId] = { step: "awaiting_offer_approve_confirm", data: { ...data, expiresAt: Date.now() + 5 * 60_000 } };
+        await ctx.reply(
+          `🔐 *One tap to fix:* ${dry.reason}\n\n` +
+          `Your WHYPE balance already covers this bid — Kalos just needs permission to pull it. Tap below and I'll approve + place the bid (small gas for the approve).`,
+          { parse_mode: "Markdown", reply_markup: kb }
+        );
+        return;
+      }
       if (dry.code === "NEEDS_WRAP" && dry.shortfall && dry.shortfall > 0n) {
         const shortStr = kalosService.formatPrice(dry.shortfall);
         const kb = new InlineKeyboard().text(`🔄 Wrap ${shortStr} HYPE & Bid`, "wrap_and_bid").text("💰 Wrap…", "wallet_wrap").row().text("💧 Get HYPE", "wallet_faucet").text("❌ Cancel", "cancel_action");

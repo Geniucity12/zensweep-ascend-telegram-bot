@@ -311,7 +311,7 @@ export const kalosService = {
   /** WHYPE allowance of owner -> Kalos marketplace. */
   async paymentTokenAllowance(owner: Address, payToken: Address): Promise<bigint> {
     try {
-      const v = await publicClient().readContract({ address: payToken, abi: erc20Abi as any, functionName: "allowance", args: [owner, kalosAddr()!] } as any);
+      const v = await withRetry(() => publicClient().readContract({ address: payToken, abi: erc20Abi as any, functionName: "allowance", args: [owner, kalosAddr()!] } as any) as Promise<unknown>, 3, 400);
       return BigInt((v as any) ?? 0);
     } catch { return 0n; }
   },
@@ -535,7 +535,7 @@ export const kalosService = {
     }
   },
   /** Gas-free pre-flight for createOrUpdateTokenBids. tokenId 0 = any token (collection-wide). */
-  async dryRunBid(collection: Address, tokenId: bigint, priceWei: bigint, bidder: Address, qty: bigint = 1n): Promise<{ ok: boolean; reason?: string; code?: string; need?: bigint; shortfall?: bigint; payToken?: Address }> {
+  async dryRunBid(collection: Address, tokenId: bigint, priceWei: bigint, bidder: Address, qty: bigint = 1n): Promise<{ ok: boolean; reason?: string; code?: string; need?: bigint; shortfall?: bigint; balRaw?: bigint; payToken?: Address }> {
     const now = BigInt(Math.floor(Date.now() / 1000));
     if (priceWei <= 0n) return { ok: false, reason: "Offer price must be above 0." };
     if (tokenId < 0n) return { ok: false, reason: "Token ID must be 0 (any token) or a positive token ID." };
@@ -568,9 +568,17 @@ export const kalosService = {
       const buffer = parseEther("0.005");
       const spendable = nativeBal > buffer ? nativeBal - buffer : 0n;
       if (spendable >= shortfall) {
-        return { ok: false, code: "NEEDS_WRAP", need, shortfall, payToken, reason: `Needs wrap: you hold ${kalosService.formatPrice(bal.raw)} WHYPE but this bid needs ${kalosService.formatPrice(need)} WHYPE. You have ${kalosService.formatPrice(nativeBal)} HYPE — wrap ${kalosService.formatPrice(shortfall)} HYPE to cover it.` };
+        return { ok: false, code: "NEEDS_WRAP", need, shortfall, payToken, balRaw: bal.raw, reason: `Needs wrap: you hold ${kalosService.formatPrice(bal.raw)} WHYPE but this bid needs ${kalosService.formatPrice(need)} WHYPE. You have ${kalosService.formatPrice(nativeBal)} HYPE — wrap ${kalosService.formatPrice(shortfall)} HYPE to cover it.` };
       }
       return { ok: false, code: "INSUFFICIENT_WHYPE", need, shortfall, payToken, reason: `Insufficient WHYPE: you hold ${kalosService.formatPrice(bal.raw)} WHYPE but this bid needs ${kalosService.formatPrice(need)} WHYPE. You only have ${kalosService.formatPrice(nativeBal)} native HYPE, so even wrapping can't cover it — top up, then retry. Bids escrow in WHYPE (payment token ${payToken.slice(0, 10)}…), not native HYPE.` };
+    }
+    // 3) Kalos must be APPROVED to pull WHYPE. simulateContract runs as the
+    //    bidder with the real allowance — with allowance 0 the call reverts with
+    //    InsufficientBidFunds() even when the balance covers the bid.
+    let allow = 0n;
+    try { allow = await this.paymentTokenAllowance(bidder, payToken); } catch { allow = 0n; }
+    if (allow < need) {
+      return { ok: false, code: "NEEDS_APPROVE", need, payToken, reason: `Kalos isn't approved to move your WHYPE yet (allowance ${kalosService.formatPrice(allow)} < bid ${kalosService.formatPrice(need)}). One tap approves Kalos, then places the bid.` };
     }
     const param = { nftAddress: collection, tokenId, quantity: qty, pricePerItem: priceWei, expirationTime: now + 7n * 86400n, paymentToken: payToken };
     try {
@@ -582,7 +590,10 @@ export const kalosService = {
     } catch (e: any) {
       const decoded = this.decodeContractError(e);
       const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 260);
-      return { ok: false, reason: `Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}. If this says BiddingNotActive/PaymentTokenNotSupported/CollectionNotApproved, the gates above explain why.` };
+      const bidHint = decoded && decoded.toLowerCase().includes("insufficientbidfunds")
+        ? " InsufficientBidFunds with a funded wallet almost always means Kalos lacks WHYPE allowance (approve first) — the bot now checks this automatically, retry the offer."
+        : "";
+      return { ok: false, reason: `Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}.${bidHint}` };
     }
   },
   /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token. */
@@ -783,9 +794,20 @@ export const kalosService = {
   /** Decode ANY Kalos custom error from a reverted call (buy, list, bid, accept…). */
   decodeContractError(err: any): string | null {
     try {
-      const data = err?.cause?.data ?? err?.data;
-      if (!data || data === "0x") return null;
-      const dec = decodeErrorResult({ abi: kalosAbi, data }) as { errorName?: string; args?: unknown[] };
+      // Viem often pre-decodes the revert: cause.data = {errorName, abiItem, args} (not hex).
+      const pre = err?.cause?.data ?? err?.data;
+      if (pre && typeof pre === "object") {
+        const name = (pre as any).errorName ?? (pre as any).abiItem?.name;
+        if (typeof name === "string" && name) {
+          const a = Array.isArray((pre as any).args) ? (pre as any).args : [];
+          const args = a.map((x: unknown) => (typeof x === "bigint" ? x.toString() : String(x))).join(", ");
+          return `${name}(${args})`;
+        }
+        return null;
+      }
+      const data = pre;
+      if (!data || data === "0x" || typeof data !== "string") return null;
+      const dec = decodeErrorResult({ abi: kalosAbi, data: data as Hex }) as { errorName?: string; args?: unknown[] };
       if (!dec?.errorName) return null;
       const args = (dec.args ?? []).map((a) => (typeof a === "bigint" ? a.toString() : String(a))).join(", ");
       return `${dec.errorName}(${args})`;
