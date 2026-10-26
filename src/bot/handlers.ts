@@ -89,7 +89,24 @@ export function registerHandlers(bot: Bot) {
     await promptNftBuy(ctx, raw);
   });
 
-  // Listing removed — create/cancel listings on kalos.fun; the bot buys, bids and tracks.
+  // List on Kalos: /nftlist + /nftdelist (restored — bot lists, not just kalos.fun).
+
+  bot.command("nftlist", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftList(ctx, raw);
+  });
+  bot.command("list", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftList(ctx, raw);
+  });
+  bot.command("nftdelist", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftDelist(ctx, raw);
+  });
+  bot.command("delist", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await promptNftDelist(ctx, raw);
+  });
 
   bot.command("nftoffer", async (ctx) => {
     const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
@@ -458,22 +475,74 @@ export function registerHandlers(bot: Bot) {
     if (!wallet) { await ctx.reply("No wallet found."); return; }
     try {
       const scope = data.tokenId === "0" ? "any token" : `#${data.tokenId}`;
-      const shortfall = parseEther(data.priceHype); // worst case: wrap full bid; ensureBidFunds wraps only the shortfall
       await ctx.reply(`🔄 Approving Kalos + wrapping (if needed), then placing your ${scope} bid for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
-      await kalosService.ensureBidFunds(wallet.privateKey, data.contract, shortfall);
-      const hash = await kalosService.createTokenBid(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
+      // Single-shot path: one ensureBidFunds + one bid write, both retried.
+      // Old path called ensureBidFunds then createTokenBid (which ensured again)
+      // and surfaced bare "RPC Request failed" with no hashes.
+      const res = await kalosService.approveAndBid(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
       const cfg = getChainConfig(ELYSIUM.key);
+      const bits: string[] = [];
+      if (res.wrapHash) bits.push(`wrap \`${res.wrapHash.slice(0, 10)}…\``);
+      if (res.approveHash) bits.push(`approve \`${res.approveHash.slice(0, 10)}…\``);
+      bits.push(`bid \`${res.bidHash.slice(0, 10)}…\``);
       await ctx.reply(
         `✅ *Offer Placed on Kalos!*\n\n` +
         `📄 *Collection:* \`${data.contract}\`\n` +
         `🏷 *Token:* \`${data.tokenId === "0" ? "any token" : `#${data.tokenId}`}\`\n` +
-        `💰 *Bid:* \`${data.priceHype} HYPE\` (wrapped + approved automatically)\n` +
-        `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
+        `💰 *Bid:* \`${data.priceHype} HYPE\` (${bits.join(" + ")})\n` +
+        `🔗 [View Bid tx](${cfg.explorerUrl}/tx/${res.bidHash})` +
+        (res.approveHash ? `\n🔗 [View Approve tx](${cfg.explorerUrl}/tx/${res.approveHash})` : "") +
+        (res.wrapHash ? `\n🔗 [View Wrap tx](${cfg.explorerUrl}/tx/${res.wrapHash})` : ""),
         { parse_mode: "Markdown", reply_markup: mainKeyboard }
       );
     } catch (e: any) {
-      await ctx.reply(`❌ Approve-and-bid failed: ${e?.shortMessage || e?.message || "unknown"}\n\nNo bid was placed. Your WHYPE is safe — tap again or retry /offer.`);
+      const detail = e?.shortMessage || e?.message || "unknown";
+      await ctx.reply(`❌ Approve-and-bid failed: ${detail}\n\nYour WHYPE is safe — allowance may now cover it, so tap again or retry /offer.`);
     }
+  });
+
+  // ---- List on Kalos (restored): /nftlist + 1-tap List from /nfts cards ----
+  bot.callbackQuery(/^kalos_list_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const col = ctx.match[1] as Address;
+    const tid = ctx.match[2];
+    await promptNftList(ctx, tid ? `${col} ${tid}` : col);
+  });
+
+  bot.callbackQuery("confirm_nftlist", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftList(ctx, data);
+  });
+
+  bot.callbackQuery("confirm_nftapprove", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data as { contract: Address; tokenId: string; priceHype: string; days: number; expiresAt?: number };
+    if (Date.now() > (data.expiresAt ?? 0)) { delete userStates[userId]; await ctx.reply("Approval session expired. Start the listing again with /nftlist."); return; }
+    delete userStates[userId];
+    const wallet = walletManager.getUserWallet(userId);
+    if (!wallet) { await ctx.reply("No wallet found."); return; }
+    try {
+      await ctx.reply(`🔐 Approving Kalos for #${data.tokenId}…`, { parse_mode: "Markdown" });
+      await kalosService.approveMarketplace(wallet.privateKey, data.contract);
+      await executeNftList(ctx, data);
+    } catch (e: any) {
+      await ctx.reply(`❌ Approve failed: ${e?.shortMessage || e?.message || "unknown"}\n\nRetry /nftlist.`);
+    }
+  });
+
+  bot.callbackQuery("confirm_nftdelist", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data;
+    delete userStates[userId];
+    await executeNftDelist(ctx, data);
   });
 
   bot.callbackQuery("confirm_nftaccept", async (ctx) => {
@@ -831,7 +900,85 @@ export function registerHandlers(bot: Bot) {
       return;
     }
 
-  // Listing/delist text confirms removed — kalos.fun.
+  // List text steps (restored).
+    if (state?.step === "awaiting_nftlist_params" || state?.step === "awaiting_list_params") {
+      delete userStates[userId];
+      await promptNftList(ctx, text);
+      return;
+    }
+    if (state?.step === "awaiting_nftlist_price") {
+      const data0 = state.data ?? {};
+      if (!data0.contract || !data0.tokenId || Date.now() > (data0.expiresAt ?? 0)) {
+        delete userStates[userId];
+        await ctx.reply("List session expired. Tap 🏷️ List again.");
+        return;
+      }
+      const p = text.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 0 || !/^\d+(?:\.\d{1,18})?$/.test(p[0]) || Number(p[0]) <= 0) {
+        await ctx.reply("Send just the price, e.g. `0.55`, optionally with duration: `0.55 6h`");
+        userStates[userId] = { step: "awaiting_nftlist_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+        return;
+      }
+      let days = 7;
+      if (p[1] !== undefined) {
+        const dd = parseDurationDays(p[1]);
+        if (dd === null) {
+          await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. E.g. `0.55 6h`.");
+          userStates[userId] = { step: "awaiting_nftlist_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+          return;
+        }
+        days = Math.max(1, Math.min(30, Math.round(dd)));
+      }
+      delete userStates[userId];
+      await promptNftList(ctx, `${data0.contract} ${data0.tokenId} ${p[0]} ${days}`);
+      return;
+    }
+    if (state?.step === "awaiting_nftlist_confirmation" || state?.step === "awaiting_listing_confirmation") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Listing confirmation expired. Send /nftlist to try again.");
+        return;
+      }
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Listing cancelled.", { reply_markup: mainKeyboard });
+        return;
+      }
+      await executeNftList(ctx, state.data);
+      return;
+    }
+    if (state?.step === "awaiting_nftlist_approve") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Approval session expired.");
+        return;
+      }
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Listing cancelled.", { reply_markup: mainKeyboard });
+        return;
+      }
+      const walletA = walletManager.getUserWallet(userId);
+      if (!walletA) { await ctx.reply("No wallet found."); return; }
+      try {
+        await kalosService.approveMarketplace(walletA.privateKey, state.data.contract);
+        await executeNftList(ctx, state.data);
+      } catch (e: any) {
+        await ctx.reply(`❌ Approve failed: ${e?.shortMessage || e?.message || "unknown"}`);
+      }
+      return;
+    }
+    if (state?.step === "awaiting_nftdelist_confirmation" || state?.step === "awaiting_listing_cancel_confirmation") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Delist confirmation expired.");
+        return;
+      }
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Delist cancelled.", { reply_markup: mainKeyboard });
+        return;
+      }
+      await executeNftDelist(ctx, state.data);
+      return;
+    }
 
     if (state?.step === "awaiting_nftoffer_params" || state?.step === "awaiting_offer_params") {
       delete userStates[userId];
@@ -1619,17 +1766,17 @@ async function renderCollectionDetail(ctx: Context, address: Address) {
 
   const kb = new InlineKeyboard();
   kb.text("🛒 Buy Floor", `kalos_sweep_${address}`)
-    .text("🤝 Make Offer", `kalos_offer_${address}`).row()
-    .url("🌐 View on Kalos", "https://kalos.fun")
+    .text("🏷️ List", `kalos_list_${address}`).row()
+    .text("🤝 Make Offer", `kalos_offer_${address}`)
     .text("👀 Watch", `watch_add_${address}`).row()
-    .text("🏷️ All Collections", "menu_collections")
+    .url("🌐 View on Kalos", "https://kalos.fun")
+    .text("🏷️ All Collections", "menu_collections").row()
     .text("🔙 Main Menu", "menu_main");
 
   await ctx.reply(msg, {
     parse_mode: "Markdown",
     reply_markup: kb,
   });
-  // Listing buttons removed — manage listings on kalos.fun.
 }
 
 async function renderNFTsMenu(ctx: Context) {
@@ -1682,7 +1829,7 @@ async function renderNFTsMenu(ctx: Context) {
 
   // Incoming live offers on YOUR tokens (verified via getTokenBid + ownership).
   // Shows a checking line first so "none right now" only appears AFTER a real scan.
-  let incomingBids: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
+  let incomingBids: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }> = [];
   let bidsScanned = false;
   await ctx.reply(`🤝 Checking live offers on your NFTs…`, { parse_mode: "Markdown" }).catch(() => null);
   try {
@@ -1693,29 +1840,31 @@ async function renderNFTsMenu(ctx: Context) {
     bidsScanned = true;
   } catch { incomingBids = []; bidsScanned = true; }
 
-   // ONE card per NFT: Accept live offers / inspect collection on the card itself.
+   // ONE card per NFT: top 3 live offers with Accept + List on the card itself.
   // No giant shared wall — each token carries its own actions. If the card
   // send fails (bad Markdown), fall back to PLAIN TEXT *WITH THE SAME BUTTONS*.
   for (const nft of nfts.slice(0, 12) as Array<{ collection: Address; tokenId: bigint }>) {
     const nftBids = incomingBids.filter(
       (b) => b.collection.toLowerCase() === String(nft.collection).toLowerCase() && b.tokenId.toString() === String(nft.tokenId)
-    );
+    ).sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0)).slice(0, 3);
     const best = nftBids.length > 0 ? nftBids[0] : null;
+    const tagFor = (b: { collectionWide?: boolean }) => (b.collectionWide ? ` (any-token)` : ``);
     const offerLine = !bidsScanned
       ? `\n🤝 *Offers:* \`checking…\``
       : best
-        ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\``
-        : `\n🤝 *Offers:* \`none right now\``;
+        ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\`${tagFor(best)}`
+        : `\n🤝 *Offers:* \`none right now — list it or wait for bids\``;
     const extraLine = nftBids.length > 1 ? ` (+${nftBids.length - 1} more)` : "";
     const meta = await readCollectionMeta(nft.collection as Address).catch(() => ({ name: `#${String(nft.tokenId)}`, symbol: "" }));
     const text = `🖼️ *${escMd(meta.name)} #${escMd(String(nft.tokenId))}*\n\`${nft.collection}\`${offerLine}${extraLine}`;
     const cardKb = (() => {
       const kb = new InlineKeyboard();
       if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${best.bidder}`).row();
-      for (const b of nftBids.slice(0, 3)) {
-        kb.text(`🤝 ${kalosService.formatPrice(b.price)} from ${b.bidder.slice(0, 6)}…${b.bidder.slice(-4)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${b.bidder}`).row();
+      for (const b of nftBids) {
+        const tag = b.collectionWide ? ` (any)` : ``;
+        kb.text(`🤝 ${kalosService.formatPrice(b.price)}${tag} from ${b.bidder.slice(0, 6)}…${b.bidder.slice(-4)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${b.bidder}`).row();
       }
-      kb.text(`🔍 Collection`, `col_inspect_${nft.collection}`).row();
+      kb.text(`🏷️ List`, `kalos_list_${nft.collection}_${nft.tokenId}`).text(`🔍 Collection`, `col_inspect_${nft.collection}`).row();
       kb.text("🔙 Menu", "menu_main");
       return kb;
     })();
@@ -1976,7 +2125,97 @@ async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId:
   }
 }
 
-// List/delist prompt + executor removed — manage listings on kalos.fun.
+// List/delist prompts (restored — manage listings in-bot, not just kalos.fun).
+async function promptNftList(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) {
+    await ctx.reply("Connect a wallet before listing an NFT.", { reply_markup: noWalletKeyboard });
+    return;
+  }
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 2 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+    userStates[userId] = { step: "awaiting_nftlist_price", data: { contract: parts[0] as Address, tokenId: parts[1], expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(`🏷 *List #${parts[1]} on Kalos*\n\nReply with price + optional duration:\n\n\`<price_hype> [duration]\`\n\n*Examples:*\n\`0.55\` — 0.55 HYPE for 7 days\n\`0.55 6h\` — 6 hours`, { parse_mode: "Markdown" });
+    return;
+  }
+  if (parts.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1]) && /^\d+(?:\.\d{1,18})?$/.test(parts[2])) {
+    let days = 7;
+    if (parts[3] !== undefined) {
+      const dd = parseDurationDays(parts[3]);
+      if (dd === null) { await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. E.g. `0x… 6187 0.5 6h`."); return; }
+      days = Math.max(1, Math.min(30, Math.round(dd)));
+    }
+    userStates[userId] = { step: "awaiting_nftlist_confirmation", data: { contract: parts[0] as Address, tokenId: parts[1], priceHype: parts[2], days, expiresAt: Date.now() + 5 * 60_000 } };
+    const kb = new InlineKeyboard().text(`✅ Yes, List for ${parts[2]} HYPE`, "confirm_nftlist").text("❌ Cancel", "cancel_action");
+    await ctx.reply(`🏷 *Confirm Kalos Listing*\n\n📄 \`${parts[0]}\`\n🔢 \`#${parts[1]}\`\n💰 \`${parts[2]} HYPE\`\n⏱ \`${formatDuration(days)}\`\n\nTap below or reply *YES*:`, { parse_mode: "Markdown", reply_markup: kb });
+    return;
+  }
+  userStates[userId] = { step: "awaiting_nftlist_params" };
+  await ctx.reply(`🏷 *List NFT on Kalos*\n\nSend:\n\`<collection> <token_id> <price_hype> [duration]\`\n\n*Duration:* \`3\`=3d, \`6h\`, \`30m\`\nE.g. \`0x123... 1 0.25 7\`\n\nOr \`/cancel\`.`, { parse_mode: "Markdown" });
+}
+
+async function executeNftList(ctx: Context, data: { contract: Address; tokenId: string; priceHype: string; days: number }) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
+  try {
+    await ctx.reply(`⏳ Checking #${data.tokenId} on Kalos…`, { parse_mode: "Markdown" });
+    const { parseEther: pe } = await import("viem");
+    const exp = BigInt(Math.floor(Date.now() / 1000) + (data.days ?? 7) * 86400);
+    const dry = await kalosService.dryRunList(data.contract, BigInt(data.tokenId), wallet.address as Address, pe(data.priceHype), exp);
+    if (!dry.ok) {
+      if ((dry as any).needsApproval) {
+        userStates[userId] = { step: "awaiting_nftlist_approve", data: { ...data, expiresAt: Date.now() + 5 * 60_000 } };
+        const kb = new InlineKeyboard().text("✅ Approve Kalos", "confirm_nftapprove").text("❌ Cancel", "cancel_action");
+        await ctx.reply(`🔐 *Approval needed.*\n\n${dry.reason}\n\nTap Approve, then listing continues.`, { parse_mode: "Markdown", reply_markup: kb });
+        return;
+      }
+      await ctx.reply(`❌ *Listing would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
+      return;
+    }
+    const hash = await kalosService.createListing(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
+    const cfg = getChainConfig(ELYSIUM.key);
+    await ctx.reply(`✅ *Listed #${data.tokenId} for ${data.priceHype} HYPE!*\n\n🔗 [View tx](${cfg.explorerUrl}/tx/${hash})`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+  } catch (err: any) {
+    const decoded = kalosService.decodeContractError(err);
+    await ctx.reply(`❌ Listing failed: ${decoded ? `\`${decoded}\`` : (err?.shortMessage || err?.message || "Reverted")}\n\nTip: list only IDs from /nfts.`);
+  }
+}
+
+async function promptNftDelist(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("Connect a wallet first.", { reply_markup: noWalletKeyboard }); return; }
+  const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+    userStates[userId] = { step: "awaiting_nftdelist_confirmation", data: { contract: parts[0] as Address, tokenId: parts[1], expiresAt: Date.now() + 5 * 60_000 } };
+    const kb = new InlineKeyboard().text("✅ Yes, Delist", "confirm_nftdelist").text("❌ Keep", "cancel_action");
+    await ctx.reply(`❌ Delist \`${parts[0]} #${parts[1]}\` on Kalos?\n\nTap below or reply *YES*:`, { parse_mode: "Markdown", reply_markup: kb });
+    return;
+  }
+  await ctx.reply("Send `/nftdelist <collection> <token_id>`.", { parse_mode: "Markdown" });
+}
+
+async function executeNftDelist(ctx: Context, data: { contract: Address; tokenId: string; listingId?: number }) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("No wallet found."); return; }
+  try {
+    const dry = await kalosService.dryRunCancel(data.contract, BigInt(data.tokenId), wallet.address as Address);
+    if (!dry.ok) { await ctx.reply(`❌ *Cancel would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" }); return; }
+    const hash = await kalosService.cancelListing(wallet.privateKey, data.contract, data.tokenId);
+    if (data.listingId) dbService.delist(data.listingId, userId);
+    const cfg = getChainConfig(ELYSIUM.key);
+    await ctx.reply(`✅ *Delisted!*\n\n🔗 [View tx](${cfg.explorerUrl}/tx/${hash})`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+  } catch (err: any) {
+    await ctx.reply(`❌ Cancel failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+  }
+}
 
 async function promptNftOffer(ctx: Context, raw?: string) {
   const userId = ctx.from?.id;
@@ -2517,6 +2756,10 @@ async function renderHelpMenu(ctx: Context) {
   msg += `• \`/offer <collection> [tokenId] <price> [duration]\` — any-token or specific\n`;
   msg += `  e.g. \`/offer 0x… 0.5 6h\` — 0.5 on any token, 6 hours\n`;
   msg += `• \`/accept <collection> <tokenId> <bidder>\` — accept a bid on your NFT\n`;
+  msg += `\n*Sell it:*\n`;
+  msg += `• \`/nftlist <collection> <tokenId> <price> [duration]\` — list your NFT on Kalos\n`;
+  msg += `  e.g. \`/nftlist 0x… 824 0.55 6h\`\n`;
+  msg += `• \`/nftdelist <collection> <tokenId>\` — cancel your listing\n`;
   msg += `\n*Track it:*\n`;
   msg += `• \`/watch <0x…> [label]\` — floor-drop + new-deployment pings\n`;
   msg += `• \`/watchlist\` — your tracked collections\n`;

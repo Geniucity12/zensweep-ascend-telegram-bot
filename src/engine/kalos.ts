@@ -120,8 +120,9 @@ export const kalosService = {
   async approveMarketplace(privateKey: Hex, nft: Address): Promise<Hash | null> {
     const addr = kalosAddr()!; const account = privateKeyToAccount(privateKey); const pc = publicClient();
     const ok = await this.isApprovedForAll(nft, account.address); if (ok) return null;
-    const wc = walletClient(privateKey); const hash = await wc.writeContract({ address: nft, abi: erc721Abi as any, functionName: "setApprovalForAll", args: [addr, true] } as any);
-    await pc.waitForTransactionReceipt({ hash }); return hash;
+    const wc = walletClient(privateKey);
+    const hash = await withRetry(() => wc.writeContract({ address: nft, abi: erc721Abi as any, functionName: "setApprovalForAll", args: [addr, true] } as any), 3, 600);
+    await withRetry(() => pc.waitForTransactionReceipt({ hash }), 3, 600); return hash;
   },
   async createListing(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr(); if (!addr) throw new Error("Kalos not configured");
@@ -163,13 +164,13 @@ export const kalosService = {
       const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
       throw new Error(`Listing would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
     }
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateListings", args: [[param]] } as any);
-    await pc.waitForTransactionReceipt({ hash }); return hash;
+    const hash = await withRetry(() => wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateListings", args: [[param]] } as any), 3, 600);
+    await withRetry(() => pc.waitForTransactionReceipt({ hash }), 3, 600); return hash;
   },
   async cancelListing(privateKey: Hex, nftAddress: Address, tokenId: string | bigint): Promise<Hash> {
     const addr = kalosAddr()!; const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "cancelListings", args: [[{ nftAddress, tokenId: BigInt(tokenId) }]] } as any);
-    await pc.waitForTransactionReceipt({ hash }); return hash;
+    const hash = await withRetry(() => wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "cancelListings", args: [[{ nftAddress, tokenId: BigInt(tokenId) }]] } as any), 3, 600);
+    await withRetry(() => pc.waitForTransactionReceipt({ hash }), 3, 600); return hash;
   },
   /** Build one buy-item param exactly like kalos.fun: listing's paymentToken + usingNative=(token==wnative). */
   async buildBuyItem(
@@ -301,12 +302,12 @@ export const kalosService = {
     const hash = await wc.writeContract({ address: token, abi: erc20Abi as any, functionName: "withdraw", args: [amountWei] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
-  /** Wrap native HYPE -> WHYPE (deposit). Returns tx hash. */
+  /** Wrap native HYPE -> WHYPE (deposit). Returns tx hash. Retried for flaky RPC. */
   async wrapHype(privateKey: Hex, amountWei: bigint, payToken?: Address): Promise<Hash> {
     const token = payToken ?? await this.wnative();
     const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: token, abi: erc20Abi as any, functionName: "deposit", value: amountWei } as any);
-    await pc.waitForTransactionReceipt({ hash }); return hash;
+    const hash = await withRetry(() => wc.writeContract({ address: token, abi: erc20Abi as any, functionName: "deposit", value: amountWei } as any), 3, 600);
+    await withRetry(() => pc.waitForTransactionReceipt({ hash }), 3, 600); return hash;
   },
   /** WHYPE allowance of owner -> Kalos marketplace. */
   async paymentTokenAllowance(owner: Address, payToken: Address): Promise<bigint> {
@@ -315,7 +316,7 @@ export const kalosService = {
       return BigInt((v as any) ?? 0);
     } catch { return 0n; }
   },
-  /** Approve Kalos to pull WHYPE (max). No-op if allowance already covers need. */
+  /** Approve Kalos to pull WHYPE (max). No-op if allowance already covers need. Retried + verified. */
   async approvePaymentToken(privateKey: Hex, payToken: Address, need?: bigint): Promise<Hash | null> {
     const account = privateKeyToAccount(privateKey);
     const allow = await this.paymentTokenAllowance(account.address, payToken);
@@ -323,22 +324,31 @@ export const kalosService = {
     if (need === undefined && allow > 0n) return null;
     const wc = walletClient(privateKey); const pc = publicClient();
     const max = (1n << 256n) - 1n;
-    const hash = await wc.writeContract({ address: payToken, abi: erc20Abi as any, functionName: "approve", args: [kalosAddr()!, max] } as any);
-    await pc.waitForTransactionReceipt({ hash }); return hash;
+    const hash = await withRetry(() => wc.writeContract({ address: payToken, abi: erc20Abi as any, functionName: "approve", args: [kalosAddr()!, max] } as any), 3, 600);
+    await withRetry(() => pc.waitForTransactionReceipt({ hash }), 3, 600);
+    // Verify the approval actually landed — flaky RPC can return a receipt that
+    // isn't yet visible to reads; without this the bid reverts InsufficientBidFunds.
+    for (let i = 0; i < 3; i++) {
+      const after = await this.paymentTokenAllowance(account.address, payToken).catch(() => 0n);
+      if (need === undefined ? after > 0n : after >= (need ?? 0n)) return hash;
+      await new Promise((r) => setTimeout(r, 600));
+    }
+    return hash;
   },
   /**
    * Ensure bidder can cover `need` in WHYPE: wrap native shortfall + approve Kalos.
    * Keeps a small gas buffer so the wrap doesn't strand the wallet.
    */
-  async ensureBidFunds(privateKey: Hex, nftAddress: Address, need: bigint): Promise<{ wrapHash: Hash | null; approveHash: Hash | null }> {
+  async ensureBidFunds(privateKey: Hex, nftAddress: Address, need: bigint): Promise<{ wrapHash: Hash | null; approveHash: Hash | null; payToken: Address; balRaw: bigint }> {
     const account = privateKeyToAccount(privateKey);
     const payToken = await this.paymentTokenFor(nftAddress);
     const client = publicClient();
-    const bal = await this.paymentTokenBalance(account.address, nftAddress).catch(() => ({ raw: 0n }));
+    const balObj = await this.paymentTokenBalance(account.address, nftAddress).catch(() => ({ raw: 0n } as any));
+    const bal = (balObj as any).raw as bigint;
     let wrapHash: Hash | null = null;
-    if ((bal as any).raw < need) {
-      const shortfall = need - (bal as any).raw;
-      const native = await client.getBalance({ address: account.address }).catch(() => 0n);
+    if (bal < need) {
+      const shortfall = need - bal;
+      const native = await withRetry(() => client.getBalance({ address: account.address }), 3, 400).catch(() => 0n);
       const buffer = parseEther("0.005");
       const spendable = native > buffer ? native - buffer : 0n;
       if (spendable < shortfall) {
@@ -347,7 +357,49 @@ export const kalosService = {
       wrapHash = await this.wrapHype(privateKey, shortfall, payToken);
     }
     const approveHash = await this.approvePaymentToken(privateKey, payToken, need);
-    return { wrapHash, approveHash };
+    const balAfter = await this.paymentTokenBalance(account.address, nftAddress).catch(() => ({ raw: bal } as any));
+    return { wrapHash, approveHash, payToken, balRaw: (balAfter as any).raw as bigint };
+  },
+  /** One-shot approve+wrap+bid: single ensureBidFunds then bid write, both retried.
+   * Fixes the old double-ensure path (handler called ensureBidFunds, then
+   * createTokenBid called it again) which doubled RPC load and surfaced bare
+   * "RPC Request failed" with no hashes. Returns hashes for user feedback. */
+  async approveAndBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<{ bidHash: Hash; wrapHash: Hash | null; approveHash: Hash | null; payToken: Address }> {
+    const tid = BigInt(tokenId);
+    if (tid < 0n) throw new Error("Token ID must be 0 (any token) or a positive token ID.");
+    const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth);
+    const days = Math.max(1, Math.min(30, Math.round(opts?.days ?? 7)));
+    const exp = BigInt(Math.floor(Date.now() / 1000) + days * 86400);
+    if (tid > 0n) {
+      const ownerNow = (await withRetry(() => publicClient().readContract({
+        address: nftAddress, abi: erc721Abi as any, functionName: "ownerOf", args: [tid],
+      } as any), 3, 400).catch(() => null)) as Address | null;
+      if (!ownerNow) throw new Error(`Token #${tid} does not exist in this collection (ownerOf reverted). Use 0 for any-token.`);
+    }
+    const payToken = await this.paymentTokenFor(nftAddress);
+    const { wrapHash, approveHash } = await this.ensureBidFunds(privateKey, nftAddress, price * qty);
+    const addr = kalosAddr()!;
+    const param = { nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: payToken };
+    try {
+      await withRetry(() => publicClient().simulateContract({
+        address: addr, abi: kalosAbi as any, functionName: "createOrUpdateTokenBids",
+        args: [[param]], account: privateKeyToAccount(privateKey).address,
+      } as any), 2, 500);
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      throw new Error(`Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+    }
+    const wc = walletClient(privateKey); const pc = publicClient();
+    let bidHash: Hash;
+    try {
+      bidHash = await withRetry(() => wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateTokenBids", args: [[param]] } as any), 3, 600);
+    } catch (e: any) {
+      const msg = e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown";
+      throw new Error(`Bid write failed after approve${approveHash ? ` (approve ${approveHash.slice(0, 10)}… landed)` : ""}${wrapHash ? ` + wrap ${wrapHash.slice(0, 10)}… landed` : ""}: ${String(msg).slice(0, 220)}. Your WHYPE is safe — retry /offer (allowance now covers it).`);
+    }
+    await withRetry(() => pc.waitForTransactionReceipt({ hash: bidHash }), 3, 600);
+    return { bidHash, wrapHash, approveHash, payToken };
   },
   async createTokenBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId);
@@ -408,20 +460,68 @@ export const kalosService = {
     const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1);
     let price = opts?.priceEth ? parseEther(opts.priceEth) : 0n;
     let payToken: Address | null = null;
-    if (!price) { const client = publicClient(); const bid:any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, tid, bidder] } as any); if (!bid || bid.pricePerItem===0n) throw new Error("Bid not found"); price = bid.pricePerItem; payToken = (bid.paymentToken ?? null) as Address | null; }
+    let bidType = 0;
+    if (!price) {
+      const client = publicClient();
+      // Specific-token bid first, then any-token (id 0), then collection-wide.
+      // getTokenBid returns (quantity, pricePerItem, expirationTime, paymentTokenAddress).
+      const specific: any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, tid, bidder] } as any).catch(() => null);
+      const anyToken: any = tid !== 0n ? await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, 0n, bidder] } as any).catch(() => null) : null;
+      const coll: any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getCollectionBid", args: [nftAddress, bidder] } as any).catch(() => null);
+      const pick = (b: any): { p: bigint; t: Address | null } | null => {
+        if (!b) return null;
+        let p = 0n;
+        try { p = BigInt(b?.pricePerItem ?? b?.[1] ?? 0); } catch { p = 0n; }
+        if (p <= 0n) return null;
+        const t = (b?.paymentTokenAddress ?? b?.paymentToken ?? b?.[3] ?? null) as Address | null;
+        return { p, t };
+      };
+      const s = pick(specific);
+      if (s) { price = s.p; payToken = s.t; bidType = 0; }
+      else {
+        const a = pick(anyToken);
+        const c = pick(coll);
+        // Prefer the higher-priced live bid so the seller gets the best fill.
+        if (a && c) {
+          if (a.p >= c.p) { price = a.p; payToken = a.t; bidType = 0; }
+          else { price = c.p; payToken = c.t; bidType = 1; }
+        } else if (a) { price = a.p; payToken = a.t; bidType = 0; }
+        else if (c) { price = c.p; payToken = c.t; bidType = 1; }
+      }
+      if (!price || price === 0n) throw new Error("Bid not found");
+    }
     if (!payToken) payToken = await this.paymentTokenFor(nftAddress);
     await this.approveMarketplace(privateKey, nftAddress);
     const wc = walletClient(privateKey); const pc = publicClient();
-    const param = { bidType: 0, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: payToken };
-    try {
-      await pc.simulateContract({
-        address: addr, abi: kalosAbi as any, functionName: "acceptBids",
-        args: [[param]], account: privateKeyToAccount(privateKey).address,
-      } as any);
-    } catch (e: any) {
-      const decoded = this.decodeContractError(e);
-      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
-      throw new Error(`Accept would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+    const seller = privateKeyToAccount(privateKey).address;
+    // Collection-wide fills may need bidType 1 — try 0 first, fall back to 1
+    // via simulation so the on-chain call is the one that actually succeeds.
+    const candidates = bidType === 1 ? [1, 0] : [0, 1];
+    let param: any = null;
+    for (const bt of candidates) {
+      const p = { bidType: bt, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: payToken };
+      try {
+        await pc.simulateContract({
+          address: addr, abi: kalosAbi as any, functionName: "acceptBids",
+          args: [[p]], account: seller,
+        } as any);
+        param = p;
+        break;
+      } catch { /* try next bidType */ }
+    }
+    if (!param) {
+      // Default to the resolved bidType so the write surfaces the real revert.
+      param = { bidType, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: payToken };
+      try {
+        await pc.simulateContract({
+          address: addr, abi: kalosAbi as any, functionName: "acceptBids",
+          args: [[param]], account: seller,
+        } as any);
+      } catch (e: any) {
+        const decoded = this.decodeContractError(e);
+        const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+        throw new Error(`Accept would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+      }
     }
     const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "acceptBids", args: [[param]] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
@@ -819,16 +919,19 @@ export const kalosService = {
   },
   /** Live token bids ON your tokens: who offered what, verified against getTokenBid.
    * Hardened: tolerant getTokenBid decoding (named OR ANY positional slot),
-   * ownerOf gate, chunked event scan so one RPC failure can't blank everything. */
+   * ownerOf gate, chunked event scan so one RPC failure can't blank everything.
+   * PLUS collection-wide sweep: tokenId-0 (any-token) bids live under
+   * getCollectionBid / CollectionBidCreatedOrUpdated and must ALSO surface on
+   * every token you hold — otherwise collection offers are invisible. */
   async getIncomingBids(
     tokens: Array<{ collection: Address; tokenId: bigint }>,
     owner: Address,
-    opts?: { perToken?: number; blocksBack?: bigint }
-  ): Promise<Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }>> {
+    opts?: { perToken?: number; blocksBack?: bigint; includeCollectionBids?: boolean }
+  ): Promise<Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }>> {
     const per = opts?.perToken ?? 8;
     const addr = kalosAddr()!;
     const client = publicClient();
-    const out: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
+    const out: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }> = [];
     const latest = await client.getBlockNumber().catch(() => 0n);
     if (latest === 0n) return [];
     // Chunk the bid-event scan so a single range-limit error can't wipe out
@@ -846,9 +949,11 @@ export const kalosService = {
         e = s - 1n;
       }
     }
-    // Try BOTH spellings: the ABI's canonical event is TokenBidCreatedOrUpdated
-    // (no "s"), but indexers/nodes vary — never let one wrong string = "none".
-    const eventNames = ["TokenBidCreatedOrUpdated", "TokenBidCreatedOrUpdate"] as const;
+    // Token bids AND collection bids: specific-token offers live under
+    // TokenBidCreatedOrUpdated (any-token offers use tokenId 0 there too),
+    // while collection-wide offers live under CollectionBidCreatedOrUpdated
+    // and verify via getCollectionBid. Scan both — never one wrong name = none.
+    const eventNames = ["TokenBidCreatedOrUpdated", "TokenBidCreatedOrUpdate", "CollectionBidCreatedOrUpdated", "CollectionBidCreatedOrUpdate"] as const;
     let bidLogs: any[] = [];
     for (const sp of spans) {
       for (const evName of eventNames) {
@@ -864,27 +969,34 @@ export const kalosService = {
       if (bidLogs.length >= 500) break;
     }
     if (bidLogs.length === 0) return [];
-    // bidder+token -> newest event wins
-    const seen = new Map<string, { collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; bn: bigint }>();
+    // bidder+token -> newest event wins. Collection-wide bids (any-token,
+    // tokenId 0) are kept alongside specific bids — they verify via
+    // getCollectionBid and surface ON the token card with an "any token" tag.
+    const seen = new Map<string, { collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; bn: bigint; collWide: boolean }>();
     for (const l of bidLogs) {
       try {
+        const evName = String((l as any).eventName ?? "");
         const a = (l as any).args as any;
         const col = String(a.nftAddress).toLowerCase();
-        const tid = BigInt(a.tokenId);
-        const key = `${col}:${tid.toString()}:${String(a.bidder).toLowerCase()}`;
+        const tid = BigInt(a.tokenId ?? 0);
+        const isColl = evName.toLowerCase().startsWith("collectionbid");
+        const key = `${col}:${isColl ? "COLL" : tid.toString()}:${String(a.bidder).toLowerCase()}`;
         const bn = BigInt((l as any).blockNumber ?? 0);
         const price = BigInt(a.pricePerItem ?? 0);
         const exp = BigInt(a.expirationTime ?? 0);
         if (price <= 0n) continue;
         const prev = seen.get(key);
         if (!prev || bn > prev.bn) {
-          seen.set(key, { collection: a.nftAddress as Address, tokenId: tid, bidder: a.bidder as Address, price, expiration: exp, bn });
+          seen.set(key, { collection: a.nftAddress as Address, tokenId: tid, bidder: a.bidder as Address, price, expiration: exp, bn, collWide: isColl });
         }
       } catch {}
     }
     const wanted = new Set(tokens.map((t) => `${t.collection.toLowerCase()}:${t.tokenId.toString()}`));
+    const wantedColls = new Set(tokens.map((t) => t.collection.toLowerCase()));
+    const includeColl = opts?.includeCollectionBids !== false;
     const cands = [...seen.values()]
-      .filter((c) => wanted.has(`${String(c.collection).toLowerCase()}:${c.tokenId.toString()}`))
+      .filter((c) => wanted.has(`${String(c.collection).toLowerCase()}:${c.tokenId.toString()}`)
+        || (includeColl && c.collWide && wantedColls.has(String(c.collection).toLowerCase())))
       .sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0))
       .slice(0, Math.max(8, per * Math.max(1, tokens.length)));
     // Fallback: events are best-effort on this RPC. If the scan found nothing
@@ -892,10 +1004,62 @@ export const kalosService = {
     // bidders seen on ANY of their tokens (covers bids older than scan depth).
     // (Direct per-bidder probing without event signal would be unbounded, so
     // we only reach here when the event path came up empty.)
+    const pickBig = (...vals: any[]): bigint => {
+      for (const v of vals) {
+        try { const b = BigInt(v ?? -1); if (b > 0n) return b; } catch {}
+      }
+      return 0n;
+    };
     const verified = await mapLimit(cands, 6, async (c) => {
       try {
         const now = BigInt(Math.floor(Date.now() / 1000));
         if (c.expiration > 0n && c.expiration < now) return null;
+        // Collection-wide / any-token (tokenId 0) bids verify via
+        // getCollectionBid (or getTokenBid with id 0) then fan out to EACH
+        // owned token in that collection — otherwise the card filter
+        // (collection+tokenId exact match) can never see them.
+        if (c.collWide || c.tokenId === 0n) {
+          let livePrice = 0n;
+          let liveExp = 0n;
+          try {
+            const liveColl: any = await client.readContract({
+              address: addr, abi: kalosAbi as any, functionName: "getCollectionBid",
+              args: [c.collection, c.bidder],
+            } as any).catch(() => null);
+            if (liveColl) {
+              livePrice = pickBig(liveColl?.[1], liveColl?.pricePerItem);
+              liveExp = pickBig(liveColl?.[2], liveColl?.expirationTime);
+            }
+          } catch {}
+          // Any-token TOKEN bids (createOrUpdateTokenBids with id 0) live
+          // under getTokenBid(collection, 0, bidder) — same fan-out.
+          if (livePrice <= 0n) {
+            try {
+              const liveAny: any = await client.readContract({
+                address: addr, abi: kalosAbi as any, functionName: "getTokenBid",
+                args: [c.collection, 0n, c.bidder],
+              } as any).catch(() => null);
+              if (liveAny) {
+                livePrice = pickBig(liveAny?.[1], liveAny?.pricePerItem);
+                liveExp = pickBig(liveAny?.[2], liveAny?.expirationTime);
+              }
+            } catch {}
+          }
+          if (livePrice <= 0n) return null;
+          const mine = tokens.filter((t) => t.collection.toLowerCase() === String(c.collection).toLowerCase());
+          const fanned: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }> = [];
+          for (const t of mine) {
+            try {
+              if (liveExp > 0n && liveExp < now) continue;
+              const ownerNow = (await client.readContract({
+                address: c.collection, abi: erc721Abi as any, functionName: "ownerOf", args: [t.tokenId],
+              } as any).catch(() => null)) as Address | null;
+              if (!ownerNow || ownerNow.toLowerCase() !== owner.toLowerCase()) continue;
+              fanned.push({ collection: c.collection, tokenId: t.tokenId, bidder: c.bidder, price: livePrice, expiration: liveExp > 0n ? liveExp : c.expiration, collectionWide: true });
+            } catch {}
+          }
+          return fanned.length > 0 ? fanned : null;
+        }
         const live: any = await client.readContract({
           address: addr, abi: kalosAbi as any, functionName: "getTokenBid",
           args: [c.collection, c.tokenId, c.bidder],
@@ -903,12 +1067,6 @@ export const kalosService = {
         if (!live) return null;
         // getTokenBid returns (quantity, pricePerItem, expirationTime, paymentTokenAddress)
         // per the ABI — positional [1]/[2] first, named as backup.
-        const pickBig = (...vals: any[]): bigint => {
-          for (const v of vals) {
-            try { const b = BigInt(v ?? -1); if (b > 0n) return b; } catch {}
-          }
-          return 0n;
-        };
         const livePrice = pickBig(live?.[1], live?.pricePerItem, live?.[4], live?.price, live?.amount);
         if (livePrice <= 0n) return null;
         const liveExp = pickBig(live?.[2], live?.expirationTime, live?.[5], live?.expiration, live?.expiry);
@@ -919,7 +1077,11 @@ export const kalosService = {
         return { collection: c.collection, tokenId: c.tokenId, bidder: c.bidder, price: livePrice, expiration: liveExp > 0n ? liveExp : c.expiration };
       } catch { return null; }
     });
-    for (const v of verified) if (v) out.push(v);
+    for (const v of verified) {
+      if (!v) continue;
+      if (Array.isArray(v)) { for (const e of v) out.push(e); }
+      else out.push(v as any);
+    }
     return out.sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0));
   },
   /**

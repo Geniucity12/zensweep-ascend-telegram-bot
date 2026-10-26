@@ -37,6 +37,8 @@ async function main() {
     { command: "sweep", description: "Sweep floor — cheapest live listing" },
     { command: "offer", description: "Place a bid — /offer [col] [id] [price]" },
     { command: "accept", description: "Accept a bid — /accept [col] [id] [bidder]" },
+    { command: "nftlist", description: "List your NFT — /nftlist [col] [id] [price]" },
+    { command: "nftdelist", description: "Cancel listing — /nftdelist [col] [id]" },
     { command: "watch", description: "Track a collection — /watch 0x…" },
     { command: "watchlist", description: "Your tracked collections" },
     { command: "alerts", description: "Floor & deployment pings" },
