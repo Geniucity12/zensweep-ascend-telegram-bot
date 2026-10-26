@@ -63,9 +63,21 @@ export interface ListedEvent { seller: Address; nftAddress: Address; tokenId: bi
 /** Module-level scan cache (shared across all kalosService calls in this process). */
 let scanCache: { at: number; blocksBack: number; events: ListedEvent[] } | null = null;
 /**
+ * Retry helper for flaky testnet RPC (429s). Sequential, backoff, throws last error.
  * Bounded-parallel map. The public testnet RPC rate-limits aggressively, so
  * verification batches must NOT fire hundreds of concurrent eth_calls.
  */
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseMs = 400): Promise<T> {
+  let last: any = null;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); } catch (e) { last = e; }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, baseMs * (i + 1)));
+  }
+  throw last;
+}
+/** Per-collection payment-token cache (pinned token never changes). */
+const payTokenCache = new Map<string, { token: Address; at: number }>();
+const PAY_TOKEN_TTL_MS = 10 * 60_000;
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let i = 0;
@@ -86,8 +98,9 @@ export const kalosService = {
     const addr = kalosAddr()!;
     const client = publicClient();
     try {
-      cachedWnative = (await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "wnative" } as any)) as Address;
+      cachedWnative = (await withRetry(() => client.readContract({ address: addr, abi: kalosAbi as any, functionName: "wnative" } as any) as Promise<Address>, 3, 400)) as Address;
     } catch { cachedWnative = WHYPE_FALLBACK; }
+    if (!cachedWnative || !/^0x[a-fA-F0-9]{40}$/.test(cachedWnative)) cachedWnative = WHYPE_FALLBACK;
     return cachedWnative;
   },
   async getListing(collection: Address, tokenId: bigint, seller: Address): Promise<KalosListing | null> {
@@ -210,13 +223,21 @@ export const kalosService = {
 
   /** Collection's pinned payment token (per getPaymentTokenForCollection), else wnative. */
   async paymentTokenFor(nftAddress: Address): Promise<Address> {
+    const key = nftAddress.toLowerCase();
+    const hit = payTokenCache.get(key);
+    if (hit && Date.now() - hit.at < PAY_TOKEN_TTL_MS) return hit.token;
     try {
-      const pinned = (await publicClient().readContract({
+      const pinned = (await withRetry(() => publicClient().readContract({
         address: kalosAddr()!, abi: kalosAbi as any, functionName: "getPaymentTokenForCollection", args: [nftAddress],
-      } as any).catch(() => null)) as Address | null;
-      if (pinned && /^0x[a-fA-F0-9]{40}$/.test(pinned) && pinned.toLowerCase() !== ZERO.toLowerCase()) return pinned;
+      } as any) as Promise<Address | null>, 3, 400).catch(() => null)) as Address | null;
+      if (pinned && /^0x[a-fA-F0-9]{40}$/.test(pinned) && pinned.toLowerCase() !== ZERO.toLowerCase()) {
+        payTokenCache.set(key, { token: pinned, at: Date.now() });
+        return pinned;
+      }
     } catch {}
-    return this.wnative();
+    const w = await this.wnative();
+    payTokenCache.set(key, { token: w, at: Date.now() });
+    return w;
   },
   /** Reads that gate bid writes: global bids switch + collection approval status. */
   async bidGates(nftAddress: Address): Promise<{ bidsActive: boolean; collectionApproved: boolean }> {
@@ -242,12 +263,18 @@ export const kalosService = {
       { name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
       { name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint8" }] },
     ] as const;
-    const [raw, symbol, decimals] = await Promise.all([
-      (client.readContract({ address: pay, abi: erc as any, functionName: "balanceOf", args: [of] } as any).catch(() => 0n) as Promise<bigint>)
-        .then((v) => { try { return BigInt((v as any) ?? 0); } catch { return 0n; } }),
-      client.readContract({ address: pay, abi: erc as any, functionName: "symbol" } as any).catch(() => "WHYPE"),
-      client.readContract({ address: pay, abi: erc as any, functionName: "decimals" } as any).catch(() => 18),
-    ]);
+    // Sequential + retried: parallel balanceOf/symbol/decimals bursts 429 and
+    // the whole Promise.all used to resolve 0n — the exact "you hold 0 WHYPE"
+    // lie when the wallet really holds 0.1. Never report 0 without retries.
+    let raw: bigint = 0n;
+    try {
+      const v = await withRetry(() => client.readContract({ address: pay, abi: erc as any, functionName: "balanceOf", args: [of] } as any) as Promise<unknown>, 3, 400);
+      try { raw = BigInt((v as any) ?? 0); } catch { raw = 0n; }
+    } catch { raw = 0n; }
+    let symbol: unknown = "WHYPE";
+    try { symbol = await withRetry(() => client.readContract({ address: pay, abi: erc as any, functionName: "symbol" } as any) as Promise<unknown>, 2, 400).catch(() => "WHYPE"); } catch { symbol = "WHYPE"; }
+    let decimals: unknown = 18;
+    try { decimals = await withRetry(() => client.readContract({ address: pay, abi: erc as any, functionName: "decimals" } as any) as Promise<unknown>, 2, 400).catch(() => 18); } catch { decimals = 18; }
     return { symbol: String(symbol ?? "WHYPE"), decimals: Number(decimals ?? 18), raw };
   },
   /** Generic WHYPE balance (no collection needed) — for wallet display. */
@@ -258,11 +285,13 @@ export const kalosService = {
       { name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
     ] as const;
     const client = publicClient();
-    const [raw, symbol] = await Promise.all([
-      (client.readContract({ address: pay, abi: erc as any, functionName: "balanceOf", args: [of] } as any).catch(() => 0n) as Promise<bigint>)
-        .then((v) => { try { return BigInt((v as any) ?? 0); } catch { return 0n; } }),
-      client.readContract({ address: pay, abi: erc as any, functionName: "symbol" } as any).catch(() => "WHYPE"),
-    ]);
+    let raw: bigint = 0n;
+    try {
+      const v = await withRetry(() => client.readContract({ address: pay, abi: erc as any, functionName: "balanceOf", args: [of] } as any) as Promise<unknown>, 3, 400);
+      try { raw = BigInt((v as any) ?? 0); } catch { raw = 0n; }
+    } catch { raw = 0n; }
+    let symbol: unknown = "WHYPE";
+    try { symbol = await withRetry(() => client.readContract({ address: pay, abi: erc as any, functionName: "symbol" } as any) as Promise<unknown>, 2, 400).catch(() => "WHYPE"); } catch { symbol = "WHYPE"; }
     return { symbol: String(symbol ?? "WHYPE"), raw };
   },
   /** Unwrap WHYPE -> native HYPE (withdraw). Returns tx hash. */
@@ -523,8 +552,14 @@ export const kalosService = {
     // 2) Bidder must hold the payment token (bids escrow in WHYPE, not native HYPE).
     //    If WHYPE is short but native HYPE covers it, return NEEDS_WRAP so the
     //    bot can one-tap wrap + approve instead of hard-failing.
+    //    Balance is double-read (sequential, retried): the testnet RPC 429s and
+    //    a single-shot .catch(()=>0n) is what reported "0 WHYPE" for a 0.1 wallet.
     const payToken = await this.paymentTokenFor(collection);
-    const bal = await this.paymentTokenBalance(bidder, collection).catch(() => ({ symbol: "WHYPE", decimals: 18, raw: 0n }));
+    let bal = await this.paymentTokenBalance(bidder, collection).catch(() => ({ symbol: "WHYPE", decimals: 18, raw: 0n }));
+    if (bal.raw === 0n) {
+      await new Promise((r) => setTimeout(r, 500));
+      try { bal = await this.paymentTokenBalance(bidder, collection); } catch {}
+    }
     const need = priceWei * (qty > 0n ? qty : 1n);
     if (bal.raw < need) {
       const shortfall = need - bal.raw;
