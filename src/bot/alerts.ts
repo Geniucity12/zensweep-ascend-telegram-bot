@@ -119,11 +119,15 @@ async function checkWatchFloors() {
     if (!floor || floor <= 0n) continue;
     const prev = lastFloors.get(col);
     lastFloors.set(col, floor);
-    if (prev === undefined || floor >= prev) continue; // first sighting or no drop
-    // Noise gate: ignore dips under ~2% (e.g. 22 -> 21.9). Ratchets via
-    // lastFloors above, so a slow bleed still pings once it crosses 2% total.
-    const dropBps = prev > 0n ? Number(((prev - floor) * 10_000n) / prev) : 0;
-    if (dropBps < 200) continue;
+    if (prev === undefined || floor === prev) continue; // first sighting or no change
+    const isDrop = floor < prev;
+    // Noise gate both ways: ignore wiggles under ~2% (e.g. 22 -> 21.9).
+    // Ratchets via lastFloors above, so a slow bleed/pump still pings
+    // once the cumulative move crosses 2%.
+    const diff = isDrop ? prev - floor : floor - prev;
+    const base = prev > 0n ? prev : 1n;
+    const moveBps = Number((diff * 10_000n) / base);
+    if (moveBps < 200) continue;
     // Dedup restarts: if we already pinged this exact floor recently, skip.
     const alerted = lastAlertedFloor.get(col);
     if (alerted && alerted.floor === floor && Date.now() - alerted.at < 60 * 60_000) continue;
@@ -133,6 +137,8 @@ async function checkWatchFloors() {
     const label = watches.find((w) => (w.address as string).toLowerCase() === col)?.label;
     const labelLine = label ? `\n👀 *Watch:* ${escAlertMd(label)}` : ``;
     const owners = [...new Set(watches.filter((w) => (w.address as string).toLowerCase() === col).map((w) => w.user_id))];
+    const arrow = isDrop ? `📉 *Floor drop: ${escAlertMd(title)}*` : `📈 *Floor pump: ${escAlertMd(title)}*`;
+    const cta = isDrop ? `Tap Sweep to grab it or Offer to bid below.` : `Floor is climbing — list into strength or hold.`;
     for (const uid of owners.slice(0, 50)) {
       try {
         const kb = new InlineKeyboard()
@@ -143,7 +149,7 @@ async function checkWatchFloors() {
           .text(`🔙 Menu`, `menu_main`);
         await bot.api.sendMessage(
           uid,
-          `📉 *Floor drop: ${escAlertMd(title)}*${labelLine}\n\`${col}\`\n💰 Now \`${kalosService.formatPrice(floor)} HYPE\` (was \`${kalosService.formatPrice(prev)} HYPE\`)\n\nTap Sweep to grab it or Offer to bid below.`,
+          `${arrow}${labelLine}\n\`${col}\`\n💰 Now \`${kalosService.formatPrice(floor)} HYPE\` (was \`${kalosService.formatPrice(prev)} HYPE\`)\n\n${cta}`,
           { parse_mode: "Markdown", reply_markup: kb }
         );
       } catch {}
