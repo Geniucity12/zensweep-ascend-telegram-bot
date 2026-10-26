@@ -519,6 +519,9 @@ export function registerHandlers(bot: Bot) {
     await promptFloorCheck(ctx);
   });
 
+  // Taps on "🏷️ All" / "🏷️ Collections" explicitly re-open the menu.
+  // Nothing else routes here: card Sweep/Buy/List/Offer buttons go straight
+  // to their flows so a tap NEVER re-dumps the collections list.
   bot.callbackQuery("menu_collections", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     await renderCollectionsMenu(ctx);
@@ -1906,6 +1909,7 @@ async function renderCollectionsMenu(ctx: Context) {
     const bf = b.floorWei ?? 10n ** 30n;
     return af < bf ? -1 : af > bf ? 1 : 0;
   });
+  void kbLen;
   const buildHeaderText = (verified: boolean): string => {
     let m = `🏷️ *Kalos NFT Marketplace — Elysium*\n\n`;
     m += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
@@ -1923,8 +1927,24 @@ async function renderCollectionsMenu(ctx: Context) {
     }
     return m;
   };
-  const buildMenuText = (verified: boolean): string => buildHeaderText(verified);
+  const buildMenuText = (_verified: boolean): string => buildHeaderText(_verified);
   const buildMenuKeyboard = (): InlineKeyboard => new InlineKeyboard();
+  void buildMenuText;
+  void buildMenuKeyboard;
+  /** Tag one collection's card so phase-2 edits hit the RIGHT message. */
+  const COLLECTION_CARD_TAG = "kalos_collection_card";
+  function collectionCardTag(r: { address: Address }): string {
+    return `${COLLECTION_CARD_TAG}:${r.address.toLowerCase()}`;
+  }
+  /** Edit one collection card in place (Markdown, plain-text fallback). */
+  async function editCollectionCard(chatId: number, msgId: number, r: (typeof rows)[number], kb: InlineKeyboard): Promise<void> {
+    const card = buildCollectionCard({ ...r, scannedAt });
+    try {
+      await ctx.api.editMessageText(chatId, msgId, card.text, { parse_mode: "Markdown", reply_markup: kb });
+    } catch {
+      try { await ctx.api.editMessageText(chatId, msgId, card.plain, { reply_markup: kb }); } catch {}
+    }
+  }
   rows.sort((a, b) => {
     const af = a.floorWei ?? 10n ** 30n;
     const bf = b.floorWei ?? 10n ** 30n;
@@ -1942,19 +1962,19 @@ async function renderCollectionsMenu(ctx: Context) {
   }
   sortRows();
 
-  /** Send one card per collection. Returns sent message ids for phase-2 edits. */
-  async function sendCollectionCards(verified: boolean): Promise<number[]> {
-    const ids: number[] = [];
+  /** Send one card per collection. Returns address->messageId so phase-2 edits the SAME cards. */
+  async function sendCollectionCards(_verified: boolean): Promise<Map<string, number>> {
+    const ids = new Map<string, number>();
     for (const r of rows) {
       const card = buildCollectionCard({ ...r, scannedAt });
       const kb = collectionCardKeyboard(r);
       try {
         const sent = await ctx.reply(card.text, { parse_mode: "Markdown", reply_markup: kb });
-        ids.push(sent.message_id);
+        ids.set(r.address.toLowerCase(), sent.message_id);
       } catch {
         try {
           const sent = await ctx.reply(card.plain, { reply_markup: kb });
-          ids.push(sent.message_id);
+          ids.set(r.address.toLowerCase(), sent.message_id);
         } catch {}
       }
       // Gentle pacing so Telegram never throttles the burst.
@@ -1962,6 +1982,8 @@ async function renderCollectionsMenu(ctx: Context) {
     }
     return ids;
   }
+  void collectionCardTag;
+  void editCollectionCard;
 
   const projects = await fetchLaunchProjects();
   const nftProjects = projects.filter((p) => p.contractAddress || p.tags.includes("nft") || p.tags.includes("collection") || p.status === "minting" || p.status === "live");
@@ -1977,16 +1999,6 @@ async function renderCollectionsMenu(ctx: Context) {
     .text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row()
     .text("⚡ Direct Mint", "menu_mint").text("🖼️ My NFTs", "menu_nfts").row()
     .text("🔙 Main Menu", "menu_main");
-  const combineKb = (menu: InlineKeyboard, foot: InlineKeyboard): InlineKeyboard => {
-    const combined = new InlineKeyboard();
-    try {
-      const raw: any = (menu as any).inline_keyboard ?? [];
-      for (const row of raw) for (const btn of row) combined.text(btn.text, btn.callback_data).row();
-      const fraw: any = (foot as any).inline_keyboard ?? [];
-      for (const row of fraw) for (const btn of row) combined.text(btn.text, btn.callback_data).row();
-    } catch {}
-    return combined;
-  };
 
   let headerMsgId: number | undefined;
   try {
@@ -2003,7 +2015,7 @@ async function renderCollectionsMenu(ctx: Context) {
   }
 
   // Phase-1 header + ALL collection cards (estimates, marked ⏳).
-  let phase1CardIds: number[] = [];
+  let phase1CardIds = new Map<string, number>();
   try {
     const headerKb = new InlineKeyboard()
       .text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row()
@@ -2025,7 +2037,8 @@ async function renderCollectionsMenu(ctx: Context) {
     }
   }
 
-  // Phase 2 (background): verify floors, then EDIT each card in place.
+  // Phase 2 (background): verify floors, then EDIT the SAME cards in place.
+  // No re-sends, no deletes — each card's message id is stable per address.
   (async () => {
     try {
       floors = await kalosService.getCollectionFloors(nameRows.map((r) => r.address), { events: sharedEvents, perCollection: 80 });
@@ -2047,26 +2060,27 @@ async function renderCollectionsMenu(ctx: Context) {
       if (lf && lf !== "—") launchFloors.set(r.address.toLowerCase(), r.floorStr);
     }
     sortRows();
-    // Re-send cards in verified floor order (cheapest first), then delete the
-    // phase-1 estimate cards so the chat ends up clean and correctly ordered.
+    // Edit each card IN PLACE (same message ids) — the chat never gets a second dump.
     if (rows.length > 0 && ctx.chat) {
-      const verifiedIds = await sendCollectionCards(true);
-      for (const id of phase1CardIds) {
-        try { await ctx.api.deleteMessage(ctx.chat.id, id); } catch {}
+      for (const r of rows) {
+        const msgId = phase1CardIds.get(r.address.toLowerCase());
+        if (!msgId) continue;
+        const kb = collectionCardKeyboard(r);
+        await editCollectionCard(ctx.chat.id, msgId, r, kb);
       }
-      phase1CardIds = verifiedIds;
       try {
         if (headerMsgId) {
           await ctx.api.editMessageText(ctx.chat.id, headerMsgId, buildHeaderText(true), { parse_mode: "Markdown" });
         }
       } catch {}
     }
+    // Launch-board footer: ONE message (and ONLY if there is something to show
+    // beyond the per-collection cards — never a second dump of collections).
     if (headerMsgId && ctx.chat) {
       try {
-        let m = buildHeaderText(true);
-        if (nftProjects.length === 0) {
-          m += `No collections in launch board yet. You can inspect any collection by contract address below.\n\n`;
-        } else {
+        const hasLaunchContent = nftProjects.length > 0;
+        if (hasLaunchContent) {
+          let m = buildHeaderText(true);
           m += `*Featured & Tracked Collections:*\n\n`;
           for (const p of nftProjects.slice(0, 8)) {
             const addr = p.contractAddress;
@@ -2075,19 +2089,24 @@ async function renderCollectionsMenu(ctx: Context) {
             if (addr) m += `  Contract: \`${addr}\`\n`;
             m += `  Floor: \`${fl}\` • Mint: \`${escMd(p.mintDate)}\`\n\n`;
           }
-        }
-        m += footerText;
-        const kb = footerKeyboard();
-        for (const p of nftProjects.slice(0, 8)) {
-          if (p.contractAddress) {
-            try { (kb as any).inline_keyboard.unshift([{ text: `🔍 ${p.name.slice(0, 16)}`, callback_data: `col_inspect_${p.contractAddress}` }]); } catch {}
+          m += footerText;
+          const kb = footerKeyboard();
+          for (const p of nftProjects.slice(0, 8)) {
+            if (p.contractAddress) {
+              try { (kb as any).inline_keyboard.unshift([{ text: `🔍 ${p.name.slice(0, 16)}`, callback_data: `col_inspect_${p.contractAddress}` }]); } catch {}
+            }
           }
+          await ctx.reply(m, { parse_mode: "Markdown", reply_markup: kb });
+        } else {
+          // No launch board content: just append the commands footer to the header.
+          try {
+            await ctx.api.editMessageText(ctx.chat.id, headerMsgId, buildHeaderText(true) + footerText, { parse_mode: "Markdown" });
+          } catch {}
         }
-        await ctx.reply(m, { parse_mode: "Markdown", reply_markup: kb });
       } catch {}
     }
   })();
-  return; // phase-2 edit completes in background; cards are already sent
+  return; // phase-2 edits the SAME cards in place; nothing is ever re-sent
 }
 
 function kbLen(kb: InlineKeyboard): number {
@@ -2127,19 +2146,48 @@ async function renderCollectionDetail(ctx: Context, address: Address) {
     } catch {}
   }
 
-  let msg = `🖼️ *${name}${symbol}*\n`;
+  let msg = `🖼️ *${escMd(name)}${symbol ? ` (${escMd(symbol.slice(2, -1))})` : ""}*\n`;
   msg += `\`${address}\`\n\n`;
   msg += `🏛 *Marketplace:* Kalos (Elysium L2)\n`;
   msg += `💰 *Floor Price:* \`${floorStr}\`\n`;
-  msg += `💼 *Your Holdings:* \`${userBalStr} owned\`\n`;
+  msg += `💼 *Your Holdings:* \`${userBalStr} owned\``;
+  const userTokens = user?.wallet_address ? await kalosService.tokensOfOwner(address, user.wallet_address as Address).catch(() => []) : [];
+  const shownTokens = (userTokens ?? []).slice(0, 10);
+  if (shownTokens.length > 0) {
+    msg += ` _(IDs: ${shownTokens.map((t) => `#${t.toString()}`).join(", ")}${(userTokens?.length ?? 0) > shownTokens.length ? ` +${(userTokens?.length ?? 0) - shownTokens.length} more` : ""})_`;
+  }
+  msg += `\n`;
   if (meta?.bytecodeSize) msg += `📦 *Contract Size:* \`${meta.bytecodeSize} bytes\`\n`;
   if (explorerUrl) msg += `🔗 [View on Explorer](${explorerUrl}) • [View on Kalos](https://kalos.fun)\n\n`;
   msg += `*Kalos Actions:* Tap below to Buy on Kalos, List an item, Make an Offer, or Direct Mint.`;
 
+  const kb = new InlineKeyboard();
+  kb.text("🛒 Buy Floor", `kalos_sweep_${address}`)
+    .text("🏷️ List Item", `kalos_list_${address}`).row()
+    .text("⚡ Direct Mint", `kalos_mint_${address}`)
+    .text("🤝 Make Offer", `kalos_offer_${address}`).row()
+    .url("🌐 View on Kalos", "https://kalos.fun")
+    .text("👀 Watch", `watch_add_${address}`).row()
+    .text("🏷️ All Collections", "menu_collections")
+    .text("🔙 Main Menu", "menu_main");
+
   await ctx.reply(msg, {
     parse_mode: "Markdown",
-    reply_markup: makeCollectionKeyboard(address),
+    reply_markup: kb,
   });
+  // If the user holds NFTs here, send tap-to-list buttons for each token (no typing).
+  if (shownTokens.length > 0) {
+    const kb = new InlineKeyboard();
+    for (const t of shownTokens) {
+      kb.text(`🏷️ List #${t.toString()}`, `kalos_list_${address}_${t.toString()}`).row();
+    }
+    kb.text("🔙 Main Menu", "menu_main");
+    try {
+      await ctx.reply(`Select a token to list from *${escMd(name)}*:`, { parse_mode: "Markdown", reply_markup: kb });
+    } catch {
+      await ctx.reply(`Select a token to list from ${name}:`, { reply_markup: kb });
+    }
+  }
 }
 
 async function renderNFTsMenu(ctx: Context) {

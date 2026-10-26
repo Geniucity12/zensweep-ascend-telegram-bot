@@ -209,6 +209,80 @@ export const kalosService = {
     );
     return out;
   },
+  /** List token IDs owned by `owner` in an ERC-721 collection (enumerable fast path + event fallback). */
+  async tokensOfOwner(collection: Address, owner: Address, opts?: { maxScan?: number; limit?: number }): Promise<bigint[]> {
+    const limit = opts?.limit ?? 25;
+    try {
+      const client = publicClient();
+      const bal = (await client.readContract({
+        address: collection,
+        abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] }] as any,
+        functionName: "balanceOf", args: [owner],
+      } as any).catch(() => 0n)) as bigint;
+      if (bal > 0n) {
+        const ids: bigint[] = [];
+        for (let i = 0n; i < bal && ids.length < limit; i++) {
+          try {
+            const tid = (await client.readContract({
+              address: collection,
+              abi: [{ name: "tokenOfOwnerByIndex", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "index", type: "uint256" }], outputs: [{ type: "uint256" }] }] as any,
+              functionName: "tokenOfOwnerByIndex", args: [owner, i],
+            } as any).catch(() => null)) as bigint | null;
+            if (tid !== null) ids.push(tid);
+            else break; // not enumerable — fall through to event scan
+          } catch { break; }
+        }
+        if (ids.length > 0) return ids.slice(0, limit);
+      }
+    } catch {}
+    // Fallback: tokenIds this owner RECEIVED in Transfer events (works for non-enumerable ERC-721).
+    try {
+      const client = publicClient();
+      const transferEvent = {
+        name: "Transfer", type: "event", stateMutability: "nonpayable",
+        inputs: [
+          { name: "from", type: "address", indexed: true },
+          { name: "to", type: "address", indexed: true },
+          { name: "tokenId", type: "uint256", indexed: true },
+        ],
+      } as const;
+      const latest = await client.getBlockNumber();
+      const blocksBack = 200_000n;
+      const from = latest > blocksBack ? latest - blocksBack : 0n;
+      const logs = await client.getContractEvents({
+        address: collection, abi: [transferEvent] as any, eventName: "Transfer",
+        args: { to: owner }, fromBlock: from, toBlock: latest,
+      } as any).catch(() => []);
+      const owned = new Set<string>();
+      for (const l of (logs as Array<any>) ?? []) {
+        try {
+          const tid = BigInt((l?.args as any)?.tokenId ?? -1);
+          if (tid >= 0n) owned.add(tid.toString());
+        } catch {}
+      }
+      // Subtract tokens the owner sent away afterwards.
+      try {
+        const outLogs = await client.getContractEvents({
+          address: collection, abi: [transferEvent] as any, eventName: "Transfer",
+          args: { from: owner }, fromBlock: from, toBlock: latest,
+        } as any).catch(() => []);
+        for (const l of (outLogs as Array<any>) ?? []) {
+          try { owned.delete(BigInt((l?.args as any)?.tokenId ?? -1).toString()); } catch {}
+        }
+      } catch {}
+      // Confirm current ownership on-chain (cheap, bounded).
+      const ids = [...owned].slice(0, limit).map(BigInt);
+      const confirmed: bigint[] = await mapLimit(ids, 6, async (tid) => {
+        try {
+          const o = (await client.readContract({
+            address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tid],
+          } as any).catch(() => null)) as Address | null;
+          return o && o.toLowerCase() === owner.toLowerCase() ? tid : null;
+        } catch { return null; }
+      }).then((rs) => rs.filter((x): x is bigint => x !== null));
+      return confirmed;
+    } catch { return []; }
+  },
   /** Verify one (collection, tokenId, seller) is still a live ask. Returns the live price or null. */
   async verifyListing(collection: Address, tokenId: bigint, seller: Address, opts?: { maxAgeSec?: number }): Promise<bigint | null> {
     try {

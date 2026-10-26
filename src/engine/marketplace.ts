@@ -168,6 +168,13 @@ export const marketplaceService = {
             candidates.add(row.contract.toLowerCase());
           }
         }
+        // AND every collection seen on Kalos recently: the user may hold NFTs
+        // from ANY live collection (e.g. bought via sweep), not just launches.
+        try {
+          for (const c of await kalosService.discoverCollections({ blocksBack: 200_000 })) {
+            candidates.add(c.toLowerCase());
+          }
+        } catch { /* scan failed — fall back to launch/DB candidates */ }
 
         const balAbi = [
           { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] },
