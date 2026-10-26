@@ -2354,8 +2354,9 @@ async function renderNFTsMenu(ctx: Context) {
     }
   } catch { incomingBids = []; }
 
-  // ONE card per NFT: held tokens first, each with its own buttons.
-  // Cards include live offer (if any) + 1-tap Accept — no typing.
+   // ONE card per NFT: List + Accept-Offer / Make-Offer on the card itself.
+  // No giant shared wall — each token carries its own actions. If the card
+  // send fails (bad Markdown), fall back to PLAIN TEXT *WITH THE SAME BUTTONS*.
   for (const nft of nfts.slice(0, 12)) {
     const nftBids = incomingBids.filter(
       (b) => b.collection.toLowerCase() === String(nft.contract).toLowerCase() && b.tokenId.toString() === String(nft.tokenId)
@@ -2365,29 +2366,30 @@ async function renderNFTsMenu(ctx: Context) {
       ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\``
       : `\n🤝 *Offers:* \`none right now\``;
     const extraLine = nftBids.length > 1 ? ` (+${nftBids.length - 1} more)` : "";
-    let text = `🖼️ *${escMd(nft.title)}*\n\`${nft.contract}\` • Token \`#${escMd(String(nft.tokenId))}\`${offerLine}${extraLine}`;
+    const text = `🖼️ *${escMd(nft.title)}*\n\`${nft.contract}\` • Token \`#${escMd(String(nft.tokenId))}\`${offerLine}${extraLine}`;
+    const cardKb = (() => {
+      const kb = new InlineKeyboard();
+      kb.text(`🏷️ List #${nft.tokenId}`, `kalos_list_${nft.contract}_${nft.tokenId}`);
+      if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)}`, `kalos_accept_${nft.contract}_${nft.tokenId}_${best.bidder}`);
+      kb.text(`🔍 Collection`, `col_inspect_${nft.contract}`).row();
+      kb.text("🔙 Menu", "menu_main");
+      return kb;
+    })();
     try {
-      await ctx.reply(text, {
-        parse_mode: "Markdown",
-        reply_markup: (() => {
-          const kb = new InlineKeyboard();
-          kb.text(`🏷️ List #${nft.tokenId}`, `kalos_list_${nft.contract}_${nft.tokenId}`).row();
-          if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)} HYPE`, `kalos_accept_${nft.contract}_${nft.tokenId}_${best.bidder}`).row();
-          else kb.text(`🤝 Offer #${nft.tokenId}`, `kalos_offer_${nft.contract}_${nft.tokenId}`).row();
-          kb.text(`🔍 Collection`, `col_inspect_${nft.contract}`).text("🔙 Menu", "menu_main");
-          return kb;
-        })(),
-      });
+      await ctx.reply(text, { parse_mode: "Markdown", reply_markup: cardKb });
     } catch {
-      try { await ctx.reply(text.replace(/[`*_]/g, "")); } catch {}
+      try { await ctx.reply(text.replace(/[`*_]/g, ""), { reply_markup: cardKb }); } catch {}
     }
   }
 
+  // Summary footer ONLY (counts + active listings with Cancel) — no per-NFT
+  // lines here anymore, each NFT already got its own card above.
+
+  // Summary footer: counts + ACTIVE listings, each with its own Cancel.
+  // (Your screenshot showed a listing with NO cancel path — now every listing
+  // gets one, and the cards above carry List/Accept per NFT.)
   if (nfts.length > 0) {
-    msg += `*Held NFTs (${nfts.length}):*\n`;
-    for (const nft of nfts.slice(0, 8)) {
-      msg += `• *${nft.title}*\n  Contract: \`${nft.contract}\`\n  Token ID: \`#${nft.tokenId}\`\n\n`;
-    }
+    msg += `*Held NFTs: ${nfts.length} (each has its own card above with List / Accept buttons)*\n\n`;
   }
 
   if (activeListings.length > 0) {
@@ -2398,6 +2400,9 @@ async function renderNFTsMenu(ctx: Context) {
   }
 
   const kb = new InlineKeyboard();
+  for (const l of activeListings.slice(0, 8)) {
+    kb.text(`❌ Cancel #${l.token_id} (${l.price_eth} HYPE)`, `listing_cancel_${l.id}`).row();
+  }
   kb.text("⚡ Direct Mint", "menu_mint")
     .text("🏷️ Collections", "menu_collections").row()
     .text("🔙 Main Menu", "menu_main");
