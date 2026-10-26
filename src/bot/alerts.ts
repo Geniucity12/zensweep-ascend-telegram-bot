@@ -1,114 +1,39 @@
 import { InlineKeyboard, type Bot } from "grammy";
 import { dbService } from "../db";
-import { fetchLaunchProjects, getLaunchStatusLabel, mintWindowLine, getMintWindowState, type LaunchProject, type LaunchStatus } from "../data/launches";
-import { marketplaceService } from "../engine/marketplace";
 import { getChainConfig, ELYSIUM, ALERT_POLL_INTERVAL_MS } from "../config";
-import { getChainHealth, scanRecentDeployments, getDeploymentMeta, getWalletActivity } from "../engine/elysium";
+import { getWalletActivity, scanRecentDeployments } from "../engine/elysium";
+import { kalosService } from "../engine/kalos";
 import type { Address } from "viem";
 
 /**
- * Background alert scheduler.
- *
- * Five jobs, run on an interval:
- *   1. Launch-status watcher — refetches the launch board and DMs every user
- *      when a project changes status (e.g. upcoming → minting → live).
- *   2. Mint-window watcher — DMs when a mint window flips to "opens_soon" or
- *      "live_now" for the first time.
- *   3. Elysium deployments watcher — surfaces fresh on-chain contract
- *      deployments on Elysium (new launches appearing on-chain).
- *   4. Watch-motion watcher — DMs watch owners when a tracked address's
- *      balance moves or fresh transfers appear.
- *   5. Kalos listing watcher — DMs sellers when THEIR listing sells, cancels
- *      or expires (reconciles local DB against getListing + ItemSold events).
- * Floor watcher (OpenSea-backed) is retained for EVM snipe tasks.
- *
+ * Background alert scheduler — lean bot, three jobs:
+ *   1. Watch-motion watcher — DMs watch owners when a tracked collection
+ *      wallet moves or fresh transfers appear.
+ *   2. Kalos floor watcher — DMs watch owners on new cheapest live asks.
+ *   3. Kalos offer watcher — DMs bidders on accept/fill, owners on new bids.
  * All sends are best-effort; a failed DM never crashes the loop.
  */
 
-const lastKnownStatuses = new Map<string, string>();
-let initialized = false;
 let bot: Bot | null = null;
 const seenDeploymentTx = new Set<string>();
-const alertedMintWindows = new Set<string>();
+const initialized = { value: false };
+/** Last verified floor per collection (lowercase) — floor-drop detection. */
+const lastFloors = new Map<string, bigint>();
 
-
-async function notifyUsers(text: string) {
-  if (!bot) return;
-  const users = dbService.getAllUserIds();
-  for (const userId of users) {
-    try {
-      await bot.api.sendMessage(userId, text, { parse_mode: "Markdown" });
-    } catch (err) {
-      // User may have blocked the bot; ignore.
-    }
-  }
-}
-
-async function checkLaunches() {
-  const projects: LaunchProject[] = await fetchLaunchProjects();
-  if (!initialized) {
-    for (const p of projects) lastKnownStatuses.set(p.id, p.status);
-    initialized = true;
-    return;
-  }
-  for (const p of projects) {
-    const prev = lastKnownStatuses.get(p.id);
-    if (prev && prev !== p.status) {
-      const emoji = p.status === "live" ? "🟢" : p.status === "minting" ? "🟡" : "🔵";
-      await notifyUsers(
-        `${emoji} *Launch Update:* *${p.name}*\n` +
-          `_Status: ${getLaunchStatusLabel(prev as LaunchStatus)} → ${getLaunchStatusLabel(p.status)}_\n` +
-          `${p.summary}\n${mintWindowLine(p)}${p.website ? `\nWebsite: ${p.website}` : ""}`
-      );
-    }
-    lastKnownStatuses.set(p.id, p.status);
-  }
-}
-
-/** Alert once when a mint window flips to opens_soon or live_now. */
-async function checkMintWindows() {
-  const projects: LaunchProject[] = await fetchLaunchProjects();
-  const now = Date.now();
-  for (const p of projects) {
-    const state = getMintWindowState(p, now);
-    if (state !== "opens_soon" && state !== "live_now") continue;
-    const key = `${p.id}:${state}`;
-    if (alertedMintWindows.has(key)) continue;
-    alertedMintWindows.add(key);
-    const emoji = state === "live_now" ? "⏳" : "⏰";
-    await notifyUsers(
-      `${emoji} *Mint Window ${state === "live_now" ? "OPEN" : "opening soon"}:* *${p.name}*\n` +
-        `${mintWindowLine(p, now)}\n` +
-        (p.contractAddress ? `Contract: \`${p.contractAddress}\`\n` : "") +
-        (p.website ? `Website: ${p.website}` : "")
-    );
-  }
-}
-
-/** Surface fresh on-chain contract deployments on Elysium. */
-/**
- * DM only users who have deployment alerts enabled.
- * Sends a keyboard so they can mute/unmute inline.
- */
+/** DM only users who have deployment alerts enabled. */
 async function notifyDeployUsers(text: string) {
   if (!bot) return;
   const userIds = dbService.getDeployAlertUserIds();
   for (const userId of userIds) {
-    const kb = new InlineKeyboard().text("🔕 Mute Deployment Alerts", "deploy_alert_toggle_off").row().text("🆕 Fresh Deployments", "menu_deployments");
+    const kb = new InlineKeyboard().text("🔕 Mute", "deploy_alert_toggle_off").row().text("🔙 Main Menu", "menu_main");
     try {
       await bot.api.sendMessage(userId, text, { parse_mode: "Markdown", reply_markup: kb });
-    } catch {
-      // User may have blocked the bot; ignore.
-    }
+    } catch { /* blocked; ignore */ }
   }
 }
 
+/** Surface fresh on-chain contract deployments on Elysium (first tick seeds). */
 async function checkElysiumDeployments() {
-  try {
-    await getChainHealth(ELYSIUM.key);
-  } catch {
-    return; // chain unreachable this cycle
-  }
   let deployments;
   try {
     deployments = await scanRecentDeployments(40, ELYSIUM.key);
@@ -117,50 +42,48 @@ async function checkElysiumDeployments() {
   }
   const fresh = deployments.filter((d) => !seenDeploymentTx.has(d.txHash));
   for (const d of fresh) seenDeploymentTx.add(d.txHash);
-  // Keep the set bounded across long runs.
   if (seenDeploymentTx.size > 500) {
     const arr = [...seenDeploymentTx].slice(-300);
     seenDeploymentTx.clear();
     for (const h of arr) seenDeploymentTx.add(h);
   }
-  if (!initialized) return; // first tick only seeds
+  if (!initialized.value) return; // first tick only seeds
   if (fresh.length === 0) return;
-  const enriched = await Promise.all(
-    fresh.slice(0, 5).map(async (d) => {
-      let label = "📄 Contract";
-      try {
-        const meta = await getDeploymentMeta(d.address, ELYSIUM.key);
-        label = meta.label;
-      } catch { /* keep default */ }
-      return `${label}\n\`${d.address}\`\n  by \`${d.deployer}\` • block ${d.blockNumber}\n  [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash}) • [address](${ELYSIUM.explorerUrl}/address/${d.address})`;
-    })
+  const lines = fresh.slice(0, 5).map(
+    (d) => `📄 \`${d.address}\`\n  by \`${d.deployer}\` • block ${d.blockNumber}\n  [tx](${ELYSIUM.explorerUrl}/tx/${d.txHash})`
   );
   await notifyDeployUsers(
     `🆕 *Fresh Elysium deployments* (${fresh.length} new)\n\n` +
-      enriched.join("\n\n") +
-      `\n\nTrack one: \`/watch <0x…> [label]\`\nStop these: \`/mutedeploys\` — turn back on: \`/unmutedeploys\``
+      lines.join("\n\n") +
+      `\n\nTrack one: \`/watch <0x…> [label]\` — or browse /collections for live Kalos floors.`
   );
 }
 
-async function checkFloors() {
-  const tasks = dbService.getAllActiveTasks();
-  for (const task of tasks) {
+/** DM watch owners when a tracked watched-collection's floor drops. */
+async function checkWatchFloors() {
+  if (!bot) return;
+  const watches = dbService.getAllWatches();
+  const collections = [...new Set(
+    watches.filter((w) => /^0x[a-fA-F0-9]{40}$/.test(w.address ?? "")).map((w) => (w.address as string).toLowerCase())
+  )].slice(0, 20);
+  for (const col of collections) {
+    let floor: bigint | null = null;
     try {
-      const stats = await marketplaceService.autoDetectAndGetStats(task.contract_address);
-      if (stats.floorPrice === undefined || stats.floorPrice <= 0) continue;
-      if (stats.floorPrice <= task.max_price_eth) {
-        const symbol = stats.floorCurrency || getChainConfig(task.chain).symbol;
-        await notifyUsers(
-          `🎯 *Floor Hit!* (Task #${task.id})\n` +
-            `📄 \`${stats.name}\`\n` +
-            `💰 Floor: *${stats.floorPrice} ${symbol}* ≤ your max *${task.max_price_eth} ${symbol}*\n` +
-            `🔗 ${stats.explorerUrl}`
+      floor = await kalosService.getVerifiedFloor(col as Address);
+    } catch { continue; }
+    if (!floor || floor <= 0n) continue;
+    const prev = lastFloors.get(col);
+    lastFloors.set(col, floor);
+    if (prev === undefined || floor >= prev) continue; // first sighting or no drop
+    const owners = [...new Set(watches.filter((w) => (w.address as string).toLowerCase() === col).map((w) => w.user_id))];
+    for (const uid of owners.slice(0, 50)) {
+      try {
+        await bot.api.sendMessage(
+          uid,
+          `📉 *Floor drop:* \`${col}\`\n💰 Now \`${kalosService.formatPrice(floor)} HYPE\` (was \`${kalosService.formatPrice(prev)} HYPE\`)\n\n/sweep to grab it, /offer to bid below.`,
+          { parse_mode: "Markdown" }
         );
-        // Avoid re-alerting every interval for the same trigger.
-        dbService.updateTaskStatus(task.id, "paused");
-      }
-    } catch {
-      // Skip contracts we cannot resolve this cycle.
+      } catch {}
     }
   }
 }
@@ -247,12 +170,11 @@ async function checkListingSales() {
 
 async function tick() {
   try {
-    await checkLaunches();
-    await checkMintWindows();
     await checkElysiumDeployments();
     await checkWatchMotion();
-    await checkFloors();
+    await checkWatchFloors();
     await checkListingSales();
+    initialized.value = true;
   } catch (err) {
     console.error("Alert tick failed:", err);
   }
