@@ -28,16 +28,15 @@ export const mainKeyboard = new InlineKeyboard()
 export const marketsKeyboard = new InlineKeyboard().text("\uD83D\uDD19 Main Menu", "menu_main");
 
 export const walletKeyboard = new InlineKeyboard()
-  .text("\uD83D\uDD04 Refresh", "wallet_refresh")
-  .text("\uD83D\uDCE4 Withdraw", "wallet_withdraw")
-  .row()
-  .text("\uD83D\uDCA7 Get Testnet HYPE", "wallet_faucet")
-  .text("\uD83D\uDD11 Export Key", "wallet_export")
-  .row()
-  .text("\uD83D\uDCE5 Import Wallet", "wallet_import")
-  .text("\uD83D\uDD04 Change Wallet", "wallet_change")
-  .row()
-  .text("\uD83D\uDD19 Main Menu", "menu_main");
+  .text("🔄 Refresh", "wallet_refresh")
+  .text("💰 Wrap HYPE→WHYPE", "wallet_wrap").row()
+  .text("📤 Withdraw", "wallet_withdraw")
+  .text("💧 Get Testnet HYPE", "wallet_faucet").row()
+  .text("💎 Unwrap WHYPE→HYPE", "wallet_unwrap")
+  .text("🔑 Export Key", "wallet_export").row()
+  .text("📥 Import Wallet", "wallet_import")
+  .text("🔄 Change Wallet", "wallet_change").row()
+  .text("🔙 Main Menu", "menu_main");
 
 export const noWalletKeyboard = new InlineKeyboard()
   .text("\u2795 Create Wallet", "wallet_generate")

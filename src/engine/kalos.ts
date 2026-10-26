@@ -250,6 +250,28 @@ export const kalosService = {
     ]);
     return { symbol: String(symbol ?? "WHYPE"), decimals: Number(decimals ?? 18), raw };
   },
+  /** Generic WHYPE balance (no collection needed) — for wallet display. */
+  async whypeBalance(of: Address): Promise<{ symbol: string; raw: bigint }> {
+    const pay = await this.wnative();
+    const erc = [
+      { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "a", type: "address" }], outputs: [{ type: "uint256" }] },
+      { name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+    ] as const;
+    const client = publicClient();
+    const [raw, symbol] = await Promise.all([
+      (client.readContract({ address: pay, abi: erc as any, functionName: "balanceOf", args: [of] } as any).catch(() => 0n) as Promise<bigint>)
+        .then((v) => { try { return BigInt((v as any) ?? 0); } catch { return 0n; } }),
+      client.readContract({ address: pay, abi: erc as any, functionName: "symbol" } as any).catch(() => "WHYPE"),
+    ]);
+    return { symbol: String(symbol ?? "WHYPE"), raw };
+  },
+  /** Unwrap WHYPE -> native HYPE (withdraw). Returns tx hash. */
+  async unwrapHype(privateKey: Hex, amountWei: bigint, payToken?: Address): Promise<Hash> {
+    const token = payToken ?? await this.wnative();
+    const wc = walletClient(privateKey); const pc = publicClient();
+    const hash = await wc.writeContract({ address: token, abi: erc20Abi as any, functionName: "withdraw", args: [amountWei] } as any);
+    await pc.waitForTransactionReceipt({ hash }); return hash;
+  },
   /** Wrap native HYPE -> WHYPE (deposit). Returns tx hash. */
   async wrapHype(privateKey: Hex, amountWei: bigint, payToken?: Address): Promise<Hash> {
     const token = payToken ?? await this.wnative();

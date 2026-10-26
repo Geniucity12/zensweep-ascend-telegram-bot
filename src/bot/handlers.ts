@@ -277,6 +277,46 @@ export function registerHandlers(bot: Bot) {
   });
   bot.command("wallet-change", async (ctx) => { await promptWalletChange(ctx); });
 
+  bot.command("wrap", async (ctx) => {
+    const arg = ctx.message?.text?.split(/\s+/)[1] ?? "";
+    await handleWrap(ctx, arg || undefined);
+  });
+  bot.command("unwrap", async (ctx) => {
+    const arg = ctx.message?.text?.split(/\s+/)[1] ?? "";
+    await handleUnwrap(ctx, arg || undefined);
+  });
+  bot.callbackQuery("wallet_wrap", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id; if (!userId) return;
+    userStates[userId] = { step: "awaiting_wrap_amount", data: { expiresAt: Date.now() + 5 * 60_000 } };
+    const wallet = walletManager.getUserWallet(userId);
+    let balLine = "";
+    try {
+      const { createPublicClient, http } = await import("viem");
+      const cfg = getChainConfig(ELYSIUM.key);
+      const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+      const [native, w] = await Promise.all([
+        pc.getBalance({ address: wallet!.address as Address }).catch(() => 0n),
+        kalosService.whypeBalance(wallet!.address as Address).catch(() => ({ raw: 0n, symbol: "WHYPE" })),
+      ]);
+      const { formatEther } = await import("viem");
+      balLine = `\n\nnative HYPE: \`${formatEther(native as bigint)}\` · WHYPE: \`${kalosService.formatPrice((w as any).raw)}\``;
+    } catch {}
+    await ctx.reply(
+      `💰 *Wrap HYPE → WHYPE*\n\nBids escrow in WHYPE. Reply with an amount (e.g. \`0.1\`), or \`max\` to wrap everything except gas.${balLine}\n\nOr reply \`/cancel\`.`,
+      { parse_mode: "Markdown" }
+    );
+  });
+  bot.callbackQuery("wallet_unwrap", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id; if (!userId) return;
+    userStates[userId] = { step: "awaiting_unwrap_amount", data: { expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(
+      `💎 *Unwrap WHYPE → HYPE*\n\nReply with an amount (e.g. \`0.1\`), or \`max\` for all WHYPE.\n\nOr reply \`/cancel\`.`,
+      { parse_mode: "Markdown" }
+    );
+  });
+
   bot.command("token", async (ctx) => {
     const arg = ctx.message?.text?.split(/\s+/)[1] ?? "";
     if (/^0x[a-fA-F0-9]{40}$/.test(arg)) await renderTokenCard(ctx, arg as Address);
@@ -1135,6 +1175,20 @@ export function registerHandlers(bot: Bot) {
       return;
     }
 
+    if (state?.step === "awaiting_wrap_amount") {
+      delete userStates[userId];
+      if (Date.now() > (state.data?.expiresAt ?? 0)) { await ctx.reply("Wrap session expired. Tap 💰 Wrap again."); return; }
+      await handleWrap(ctx, text.trim());
+      return;
+    }
+
+    if (state?.step === "awaiting_unwrap_amount") {
+      delete userStates[userId];
+      if (Date.now() > (state.data?.expiresAt ?? 0)) { await ctx.reply("Unwrap session expired. Tap 💎 Unwrap again."); return; }
+      await handleUnwrap(ctx, text.trim());
+      return;
+    }
+
     if (state?.step === "awaiting_floor_contract") {
       delete userStates[userId];
       await handleFloorLookup(ctx, text);
@@ -1809,11 +1863,19 @@ async function renderWalletMenu(ctx: Context, forceRefresh: boolean = false) {
   const chain = user.selected_chain || DEFAULT_CHAIN_KEY;
   const chainConfig = getChainConfig(chain);
   const balance = await walletManager.getBalance(user.wallet_address as Address, chain, forceRefresh);
+  // Real WHYPE balance (what bids actually escrow) — not paper, read live on-chain.
+  let whypeLine = "";
+  try {
+    const w = await kalosService.whypeBalance(user.wallet_address as Address);
+    whypeLine = `💎 wrapped *Balance:* \`${kalosService.formatPrice(w.raw)} ${w.symbol}\` (bids escrow in this)\n`;
+  } catch { whypeLine = ""; }
 
   let msg = `🟢 *Your Trading Wallet* — Elysium\n\n`;
   msg += `🌐 *Chain:* \`${chainConfig.name}\`\n`;
   msg += `📫 *Address:* \`${user.wallet_address}\`\n`;
-  msg += `💰 *Balance:* \`${balance.eth} ${balance.symbol}\`\n\n`;
+  msg += `💰 native *Balance:* \`${balance.eth} ${balance.symbol}\`\n`;
+  msg += whypeLine + `\n`;
+  msg += `Bids escrow in *WHYPE*, not native HYPE. Tap 💰 *Wrap HYPE→WHYPE* below (or /wrap 0.1) to convert, 💎 *Unwrap* to go back.\n`;
   msg += `This is a server-managed wallet; its signing key stays on the bot host.\n`;
   msg += `*Deposit:* Send native tokens (${balance.symbol}) only if you are comfortable with that custody model. Use Withdraw to move funds out.`;
 
@@ -3307,13 +3369,18 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
     if (!dry.ok) {
       if (dry.code === "NEEDS_WRAP" && dry.shortfall && dry.shortfall > 0n) {
         const shortStr = kalosService.formatPrice(dry.shortfall);
-        const kb = new InlineKeyboard().text(`🔄 Wrap ${shortStr} HYPE & Bid`, "wrap_and_bid").text("❌ Cancel", "cancel_action");
+        const kb = new InlineKeyboard().text(`🔄 Wrap ${shortStr} HYPE & Bid`, "wrap_and_bid").text("💰 Wrap…", "wallet_wrap").row().text("💧 Get HYPE", "wallet_faucet").text("❌ Cancel", "cancel_action");
         userStates[userId] = { step: "awaiting_offer_wrap_confirm", data: { ...data, expiresAt: Date.now() + 5 * 60_000 } };
         await ctx.reply(
           `🔄 *One tap to fix:* you hold 0 WHYPE but need *${data.priceHype} WHYPE* for this bid.\n\n` +
           `Your HYPE is native — bids escrow in WHYPE. Tap below and I'll wrap *${shortStr} HYPE → WHYPE*, approve Kalos, then place your bid. Small gas applies to the wrap.`,
           { parse_mode: "Markdown", reply_markup: kb }
         );
+        return;
+      }
+      if (dry.code === "INSUFFICIENT_WHYPE") {
+        const kb = new InlineKeyboard().text("💰 Wrap…", "wallet_wrap").text("💧 Get Testnet HYPE", "wallet_faucet").row().text("💎 Check WHYPE", "wallet_refresh").text("❌ Cancel", "cancel_action");
+        await ctx.reply(`❌ *Offer would fail — no gas spent.*\n\n${dry.reason}\n\nYou need real funds first: top up HYPE (faucet), then wrap to WHYPE. Your WHYPE balance is live in /wallet — nothing paper.`, { parse_mode: "Markdown", reply_markup: kb });
         return;
       }
       await ctx.reply(`❌ *Offer would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
@@ -4122,6 +4189,79 @@ async function promptWalletChange(ctx: Context) {
     `⚠️ *Change Wallet?*\n\nCurrent: \`${existing.wallet_address}\`\nThis creates a NEW wallet and overwrites the stored key. Withdraw first if you have funds.\n\nReply *CONFIRM* to create new wallet, or \`/cancel\`.`,
     { parse_mode: "Markdown" }
   );
+}
+
+/** Wrap explicit amount (or "max") of native HYPE -> WHYPE. Real tx, never paper. */
+async function handleWrap(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id; if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("Create a wallet first.", { reply_markup: noWalletKeyboard }); return; }
+  const arg = (raw ?? "").trim().toLowerCase();
+  if (!arg) {
+    userStates[userId] = { step: "awaiting_wrap_amount", data: { expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(`💰 *Wrap HYPE → WHYPE*\n\nReply with an amount (e.g. \`0.1\`), or \`max\`.\n\nOr reply \`/cancel\`.`, { parse_mode: "Markdown" });
+    return;
+  }
+  try {
+    const { createPublicClient, http, parseEther, formatEther } = await import("viem");
+    const cfg = getChainConfig(ELYSIUM.key);
+    const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+    const native = await pc.getBalance({ address: wallet.address as Address });
+    const buffer = parseEther("0.005");
+    let amount: bigint;
+    if (arg === "max" || arg === "all") {
+      if (native <= buffer) { await ctx.reply(`❌ Nothing wrappable: you hold \`${formatEther(native)} HYPE\` and ~0.005 must stay for gas. Top up via 💧 Get Testnet HYPE first.`); return; }
+      amount = native - buffer;
+    } else {
+      if (!/^\d+(?:\.\d{1,18})?$/.test(arg) || Number(arg) <= 0) { await ctx.reply("❌ Invalid amount — use e.g. `0.1` or `max`."); return; }
+      amount = parseEther(arg as `${number}`);
+      if (native < amount + buffer) {
+        await ctx.reply(`❌ Not enough HYPE: you hold \`${formatEther(native)} HYPE\` but need \`${formatEther(amount)} + ~0.005 gas\`. Top up via 💧 Get Testnet HYPE, or wrap less.`, { parse_mode: "Markdown" });
+        return;
+      }
+    }
+    await ctx.reply(`🔄 Wrapping \`${formatEther(amount)} HYPE → WHYPE\`...`, { parse_mode: "Markdown" });
+    const hash = await kalosService.wrapHype(wallet.privateKey, amount);
+    const w = await kalosService.whypeBalance(wallet.address as Address).catch(() => ({ raw: 0n, symbol: "WHYPE" }));
+    await ctx.reply(
+      `✅ *Wrapped!* \`${formatEther(amount)} HYPE → WHYPE\`\n\n💎 WHYPE now: \`${kalosService.formatPrice(w.raw)} ${w.symbol}\`\n🔗 [View wrap tx](${cfg.explorerUrl}/tx/${hash})\n\nNow retry your offer — or tap 🔄 Wrap & Bid on the offer card.`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  } catch (e: any) {
+    await ctx.reply(`❌ Wrap failed: ${e?.shortMessage || e?.message || "unknown"}`);
+  }
+}
+
+/** Unwrap explicit amount (or "max") of WHYPE -> native HYPE. */
+async function handleUnwrap(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id; if (!userId) return;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) { await ctx.reply("Create a wallet first.", { reply_markup: noWalletKeyboard }); return; }
+  const arg = (raw ?? "").trim().toLowerCase();
+  if (!arg) {
+    userStates[userId] = { step: "awaiting_unwrap_amount", data: { expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(`💎 *Unwrap WHYPE → HYPE*\n\nReply with an amount (e.g. \`0.1\`), or \`max\`.\n\nOr reply \`/cancel\`.`, { parse_mode: "Markdown" });
+    return;
+  }
+  try {
+    const { parseEther, formatEther } = await import("viem");
+    const w = await kalosService.whypeBalance(wallet.address as Address);
+    let amount: bigint;
+    if (arg === "max" || arg === "all") {
+      if (w.raw <= 0n) { await ctx.reply(`❌ Nothing to unwrap: you hold \`0 WHYPE\`. Wrap first with /wrap.`); return; }
+      amount = w.raw;
+    } else {
+      if (!/^\d+(?:\.\d{1,18})?$/.test(arg) || Number(arg) <= 0) { await ctx.reply("❌ Invalid amount — use e.g. `0.1` or `max`."); return; }
+      amount = parseEther(arg as `${number}`);
+      if (w.raw < amount) { await ctx.reply(`❌ Not enough WHYPE: you hold \`${kalosService.formatPrice(w.raw)} WHYPE\`.`); return; }
+    }
+    await ctx.reply(`🔄 Unwrapping \`${formatEther(amount)} WHYPE → HYPE\`...`, { parse_mode: "Markdown" });
+    const cfg = getChainConfig(ELYSIUM.key);
+    const hash = await kalosService.unwrapHype(wallet.privateKey, amount);
+    await ctx.reply(`✅ *Unwrapped!* \`${formatEther(amount)} WHYPE → HYPE\`\n🔗 [View tx](${cfg.explorerUrl}/tx/${hash})`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+  } catch (e: any) {
+    await ctx.reply(`❌ Unwrap failed: ${e?.shortMessage || e?.message || "unknown"}`);
+  }
 }
 
 
