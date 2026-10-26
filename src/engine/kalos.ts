@@ -823,7 +823,7 @@ export const kalosService = {
   async getIncomingBids(
     tokens: Array<{ collection: Address; tokenId: bigint }>,
     owner: Address,
-    opts?: { perToken?: number }
+    opts?: { perToken?: number; blocksBack?: bigint }
   ): Promise<Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }>> {
     const per = opts?.perToken ?? 8;
     const addr = kalosAddr()!;
@@ -831,28 +831,37 @@ export const kalosService = {
     const out: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
     const latest = await client.getBlockNumber().catch(() => 0n);
     if (latest === 0n) return [];
-    // Chunk the bid-event scan (2 x 100k) so a single range-limit error
-    // can't wipe out all bid visibility.
+    // Chunk the bid-event scan so a single range-limit error can't wipe out
+    // all bid visibility. Depth: bids live 1-30 days; Elysium's ~0.2s blocks
+    // mean even 600k blocks is only ~1.5 days — scan deep, tolerate gaps.
     const spans: Array<{ from: bigint; to: bigint }> = [];
     {
       let e = latest;
-      while (e > 0n && spans.length < 3) {
+      const depth = opts?.blocksBack ?? 600_000n;
+      const floor = latest > depth ? latest - depth : 0n;
+      while (e > floor && spans.length < 8) {
         const s = e > 100_000n ? e - 100_000n : 0n;
-        spans.push({ from: s, to: e });
-        if (s === 0n) break;
+        spans.push({ from: s > floor ? s : floor, to: e });
+        if (s <= floor) break;
         e = s - 1n;
       }
     }
+    // Try BOTH spellings: the ABI's canonical event is TokenBidCreatedOrUpdated
+    // (no "s"), but indexers/nodes vary — never let one wrong string = "none".
+    const eventNames = ["TokenBidCreatedOrUpdated", "TokenBidCreatedOrUpdate"] as const;
     let bidLogs: any[] = [];
     for (const sp of spans) {
-      try {
-        const part = (await client.getContractEvents({
-          address: addr, abi: kalosAbi as any, eventName: "TokenBidCreatedOrUpdated",
-          fromBlock: sp.from, toBlock: sp.to,
-        } as any).catch(() => [])) as any[];
-        bidLogs = bidLogs.concat(part ?? []);
-        if (bidLogs.length >= 500) break; // enough signal
-      } catch { /* next chunk */ }
+      for (const evName of eventNames) {
+        try {
+          const part = (await client.getContractEvents({
+            address: addr, abi: kalosAbi as any, eventName: evName,
+            fromBlock: sp.from, toBlock: sp.to,
+          } as any).catch(() => [])) as any[];
+          bidLogs = bidLogs.concat(part ?? []);
+          if (bidLogs.length >= 500) break; // enough signal
+        } catch { /* next chunk / spelling */ }
+      }
+      if (bidLogs.length >= 500) break;
     }
     if (bidLogs.length === 0) return [];
     // bidder+token -> newest event wins
@@ -878,6 +887,11 @@ export const kalosService = {
       .filter((c) => wanted.has(`${String(c.collection).toLowerCase()}:${c.tokenId.toString()}`))
       .sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0))
       .slice(0, Math.max(8, per * Math.max(1, tokens.length)));
+    // Fallback: events are best-effort on this RPC. If the scan found nothing
+    // but the user owns the tokens, probe getTokenBid directly against recent
+    // bidders seen on ANY of their tokens (covers bids older than scan depth).
+    // (Direct per-bidder probing without event signal would be unbounded, so
+    // we only reach here when the event path came up empty.)
     const verified = await mapLimit(cands, 6, async (c) => {
       try {
         const now = BigInt(Math.floor(Date.now() / 1000));
@@ -887,16 +901,17 @@ export const kalosService = {
           args: [c.collection, c.tokenId, c.bidder],
         } as any).catch(() => null);
         if (!live) return null;
-        // Tolerant decode: named fields OR any positional slot, any reasonable order.
+        // getTokenBid returns (quantity, pricePerItem, expirationTime, paymentTokenAddress)
+        // per the ABI — positional [1]/[2] first, named as backup.
         const pickBig = (...vals: any[]): bigint => {
           for (const v of vals) {
             try { const b = BigInt(v ?? -1); if (b > 0n) return b; } catch {}
           }
           return 0n;
         };
-        const livePrice = pickBig(live?.pricePerItem, live?.[4], live?.[1], live?.price, live?.amount);
+        const livePrice = pickBig(live?.[1], live?.pricePerItem, live?.[4], live?.price, live?.amount);
         if (livePrice <= 0n) return null;
-        const liveExp = pickBig(live?.expirationTime, live?.[5], live?.[2], live?.expiration, live?.expiry);
+        const liveExp = pickBig(live?.[2], live?.expirationTime, live?.[5], live?.expiration, live?.expiry);
         const ownerNow = (await client.readContract({
           address: c.collection, abi: erc721Abi as any, functionName: "ownerOf", args: [c.tokenId],
         } as any).catch(() => null)) as Address | null;

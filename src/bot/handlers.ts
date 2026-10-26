@@ -348,13 +348,14 @@ export function registerHandlers(bot: Bot) {
 
   // Listing/delist button taps removed — manage listings on kalos.fun; bot buys/bids/tracks.
 
-    bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+  // Collection Offer tap: token optional — buyer may not care about tokenId.
+  bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
       ctx.answerCallbackQuery().catch(() => {});
       const userId = ctx.from?.id;
       if (!userId) return;
       userStates[userId] = { step: "awaiting_offer_any", data: { contract: ctx.match[1] as Address, expiresAt: Date.now() + 5 * 60_000 } };
       await ctx.reply(
-        `🤝 *Make an Offer (token optional)*\n\nReply ONE of:\n\n\`<priceHYPE> [days]\` — offer on *any* token in this collection\n\`<tokenId> <priceHYPE> [days]\` — offer on a *specific* token\n\n*Examples:*\n\`0.5\` — 0.5 HYPE for any token (7 days)\n\`6187 0.5\` — 0.5 HYPE for #6187\n\`6187 0.5 3\` — 0.5 HYPE for #6187, 3 days`,
+        `🤝 *Make an Offer (token optional)*\n\nReply ONE of:\n\n\`<priceHYPE> [duration]\` — offer on *any* token in this collection\n\`<tokenId> <priceHYPE> [duration]\` — offer on a *specific* token\n\n*Examples:*\n\`0.5\` — 0.5 HYPE for any token (7 days)\n\`0.5 6h\` — 0.5 HYPE for any token, 6 hours\n\`6187 0.5\` — 0.5 HYPE for #6187\n\`6187 0.5 3d\` — 0.5 HYPE for #6187, 3 days`,
         { parse_mode: "Markdown" }
       );
     });
@@ -365,11 +366,10 @@ export function registerHandlers(bot: Bot) {
     const tid = ctx.match[2];
     const userId = ctx.from?.id;
     if (!userId) return;
-    // Token-level Offer tap (from sweep results / NFT cards): contract + token
-    // known, only price + days still needed — mirror the List flow.
+    // Token-level Offer tap: contract + token known, only price + duration needed.
     userStates[userId] = { step: "awaiting_offer_price", data: { contract: col, tokenId: tid, expiresAt: Date.now() + 5 * 60_000 } };
     await ctx.reply(
-      `🤝 *Offer on #${tid}*\n\nReply with your bid + optional days:\n\n\`<price_hype> [days]\`\n\n*Examples:*\n\`0.5\` — bid 0.5 HYPE for 7 days\n\`0.5 3\` — bid 0.5 HYPE for 3 days`,
+      `🤝 *Offer on #${tid}*\n\nReply with your bid + optional duration:\n\n\`<price_hype> [duration]\`\n\n*Examples:*\n\`0.5\` — bid 0.5 HYPE for 7 days\n\`0.5 6h\` — bid 0.5 HYPE for 6 hours`,
       { parse_mode: "Markdown" }
     );
   });
@@ -397,7 +397,7 @@ export function registerHandlers(bot: Bot) {
       await executeSweepBuy(ctx, st.data.contract as Address, st.data.items as Array<{ tokenId: string; seller: string; price: string }>);
       return;
     }
-    await renderSweepResults(ctx, col, (st?.data?.maxPriceEth as string | undefined) ?? undefined, n, false);
+    await renderSweepResults(ctx, col, (st?.data?.maxTotalEth as string | undefined) ?? undefined, n, false);
   });
   // Count-picker taps use kalos_sweepN_<addr>_<n> (no "buy" in the middle).
   // Same behavior as a fresh pick: run the sweep for N directly.
@@ -408,7 +408,7 @@ export function registerHandlers(bot: Bot) {
     const userId = ctx.from?.id;
     if (!userId) return;
     const st = userStates[userId];
-    await renderSweepResults(ctx, col, (st?.data?.maxPriceEth as string | undefined) ?? undefined, n, false);
+    await renderSweepResults(ctx, col, (st?.data?.maxTotalEth as string | undefined) ?? undefined, n, false);
   });
   bot.callbackQuery("noop", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Already showing the cheapest live listing." }).catch(() => {});
@@ -688,7 +688,7 @@ export function registerHandlers(bot: Bot) {
 
   // Listing-price text step removed — listings live on kalos.fun.
 
-    // Unified offer input: "0.5" / "0.5 3" = any-token; "6187 0.5" / "6187 0.5 3" = specific token.
+    // Unified offer input: "0.5" / "0.5 3" / "0.5 6h" = any-token; "6187 0.5" / "6187 0.5 3d" = specific.
     if (state?.step === "awaiting_offer_any") {
       const data0 = state.data ?? {};
       if (!data0.contract || Date.now() > (data0.expiresAt ?? 0)) {
@@ -700,32 +700,43 @@ export function registerHandlers(bot: Bot) {
       const p = text.trim().split(/\s+/).filter(Boolean);
       const isPrice = (s?: string) => !!s && /^\d+(?:\.\d{1,18})?$/.test(s) && Number(s) > 0;
       const isTid = (s?: string) => !!s && /^\d+$/.test(s);
-      const isDays = (s?: string) => !!s && /^\d+$/.test(s) && Number(s) >= 1 && Number(s) <= 30;
       let tid = "0"; let price = ""; let days = 7;
-      if (p.length === 1 && isPrice(p[0])) { price = p[0]; }
-      else if (p.length === 2 && isPrice(p[0]) && isDays(p[1])) { price = p[0]; days = Number(p[1]); }
-      else if ((p.length === 2 || p.length === 3) && isTid(p[0]) && isPrice(p[1])) {
-        tid = p[0]; price = p[1];
-        if (p[2] !== undefined) {
-          if (!isDays(p[2])) {
-            await ctx.reply("Duration must be 1–30 days. Try again, e.g. `6187 0.5 3`.");
+      if (p.length >= 1 && isPrice(p[0])) {
+        price = p[0];
+        if (p[1] !== undefined) {
+          const dd = parseDurationDays(p[1]);
+          if (dd === null) {
+            await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. E.g. `0.5 6h`.", { parse_mode: "Markdown" });
             userStates[userId] = { step: "awaiting_offer_any", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
             return;
           }
-          days = Number(p[2]);
+          days = dd;
+        }
+      }
+      else if (p.length >= 2 && isTid(p[0]) && isPrice(p[1])) {
+        tid = p[0]; price = p[1];
+        if (p[2] !== undefined) {
+          const dd = parseDurationDays(p[2]);
+          if (dd === null) {
+            await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. E.g. `6187 0.5 6h`.");
+            userStates[userId] = { step: "awaiting_offer_any", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+            return;
+          }
+          days = dd;
         }
       } else {
-        await ctx.reply("Reply with `<price> [days]` for any token, or `<tokenId> <price> [days]` for a specific one. E.g. `0.5` or `6187 0.5 3`.", { parse_mode: "Markdown" });
+        await ctx.reply("Reply `<price> [duration]` for any token, or `<tokenId> <price> [duration]`. E.g. `0.5`, `0.5 6h`, `6187 0.5 3d`.", { parse_mode: "Markdown" });
         userStates[userId] = { step: "awaiting_offer_any", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
         return;
       }
       const label = tid === "0" ? "any token" : `#${tid}`;
-      userStates[userId] = { step: "awaiting_nftoffer_confirmation", data: { contract: data0.contract, tokenId: tid, priceHype: price, days, expiresAt: Date.now() + 5 * 60_000 } };
+      const daysRounded = Math.max(1, Math.min(30, Math.round(days)));
+      userStates[userId] = { step: "awaiting_nftoffer_confirmation", data: { contract: data0.contract, tokenId: tid, priceHype: price, days: daysRounded, expiresAt: Date.now() + 5 * 60_000 } };
       const kb = new InlineKeyboard()
         .text(`✅ Yes, Offer ${price} HYPE`, "confirm_nftoffer")
         .text("❌ Cancel", "cancel_action");
       await ctx.reply(
-        `🤝 *Confirm Kalos Offer*\n\n📄 *Collection:* \`${data0.contract}\`\n🏷 *Token:* \`${label}\`\n💰 *Offer:* \`${price} HYPE\`\n⏱ *Expiry:* \`${days} days\`\n\nTap below or reply *YES*:`,
+        `🤝 *Confirm Kalos Offer*\n\n📄 *Collection:* \`${data0.contract}\`\n🏷 *Token:* \`${label}\`\n💰 *Offer:* \`${price} HYPE\`\n⏱ *Expiry:* \`${formatDuration(days)}\`\n\nTap below or reply *YES*:`,
         { parse_mode: "Markdown", reply_markup: kb }
       );
       return;
@@ -760,15 +771,15 @@ export function registerHandlers(bot: Bot) {
       }
       let days = 7;
       if (p[2] !== undefined) {
-        const d = Number(p[2]);
-        if (!Number.isInteger(d) || d < 1 || d > 30) {
-          await ctx.reply("Duration must be 1–30 days. Try again, e.g. `6187 0.5 3`.");
+        const dd = parseDurationDays(p[2]);
+        if (dd === null) {
+          await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. Try again, e.g. `6187 0.5 6h`.");
           userStates[userId] = { step: "awaiting_offer_tokenid", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
           return;
         }
-        days = d;
+        days = dd;
       }
-      await promptNftOffer(ctx, `${data0.contract} ${tid} ${p[1]} ${days}`);
+      await promptNftOffer(ctx, `${data0.contract} ${tid} ${p[1]} ${Math.max(1, Math.min(30, Math.round(days)))}`);
       return;
     }
 
@@ -782,21 +793,21 @@ export function registerHandlers(bot: Bot) {
       delete userStates[userId];
       const p = text.trim().split(/\s+/).filter(Boolean);
       if (p.length === 0 || !/^\d+(?:\.\d{1,18})?$/.test(p[0] ?? "") || Number(p[0]) <= 0) {
-        await ctx.reply("Send just the bid, e.g. `0.5`, optionally followed by days: `0.5 3`", { parse_mode: "Markdown" });
+        await ctx.reply("Send just the bid, e.g. `0.5`, optionally followed by duration: `0.5 6h`", { parse_mode: "Markdown" });
         userStates[userId] = { step: "awaiting_offer_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
         return;
       }
       let days = 7;
       if (p[1] !== undefined) {
-        const d = Number(p[1]);
-        if (!Number.isInteger(d) || d < 1 || d > 30) {
-          await ctx.reply("Duration must be 1–30 days. Try again, e.g. `0.5 3`.");
+        const dd = parseDurationDays(p[1]);
+        if (dd === null) {
+          await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. Try again, e.g. `0.5 6h`.");
           userStates[userId] = { step: "awaiting_offer_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
           return;
         }
-        days = d;
+        days = dd;
       }
-      await promptNftOffer(ctx, `${data0.contract} ${data0.tokenId} ${p[0]} ${days}`);
+      await promptNftOffer(ctx, `${data0.contract} ${data0.tokenId} ${p[0]} ${Math.max(1, Math.min(30, Math.round(days)))}`);
       return;
     }
 
@@ -1042,32 +1053,41 @@ async function renderWalletMenu(ctx: Context, forceRefresh: boolean = false) {
 async function handleSweepCommand(ctx: Context, arg: string) {
   const userId = ctx.from?.id;
   if (!userId) return;
+  // /sweep <contract> [maxTotalHYPE] [count] — maxTotal is TOTAL SPEND across
+  // the whole sweep (what the user asked), count caps at 10.
+  // 2 numbers = total + count (order-free: int<=10 is the count).
   const parts = (arg ?? "").trim().split(/\s+/).filter(Boolean);
   const contract = parts[0] ?? "";
-  // /sweep <contract> [count] [maxHYPE] — e.g. /sweep 0x… 3 10
   let count = 1;
-  let maxPrice: string | undefined;
-  const nums = parts.slice(1).map((p) => Number(p)).filter((n) => Number.isFinite(n) && n > 0);
-  if (nums.length === 1) {
-    // Ambiguous: integer 1-10 = count, otherwise max price
-    if (Number.isInteger(nums[0]) && nums[0] <= 10 && !parts[1].includes(".")) count = Math.min(10, Math.floor(nums[0]));
-    else maxPrice = parts[1];
-  } else if (nums.length >= 2) {
-    count = Math.max(1, Math.min(10, Math.floor(nums[0])));
-    maxPrice = parts[2];
+  let maxTotal: string | undefined;
+  const rest = parts.slice(1);
+  if (rest.length === 1) {
+    if (/^\d+$/.test(rest[0]) && Number(rest[0]) >= 1 && Number(rest[0]) <= 10) count = Math.floor(Number(rest[0]));
+    else if (/^\d+(?:\.\d{1,18})?$/.test(rest[0]) && Number(rest[0]) > 0) maxTotal = rest[0];
+  } else if (rest.length >= 2) {
+    const ints = rest.map((p, i) => ({ p, i })).filter(({ p }) => /^\d+$/.test(p) && Number(p) >= 1 && Number(p) <= 10);
+    const amts = rest.map((p, i) => ({ p, i })).filter(({ p }) => /^\d+(?:\.\d{1,18})?$/.test(p) && Number(p) > 0);
+    if (ints.length === 1 && amts.length >= 1) {
+      count = Math.floor(Number(ints[0].p));
+      const other = amts.find((a) => a.i !== ints[0].i) ?? amts[0];
+      maxTotal = other.p;
+    } else if (amts.length >= 1) {
+      maxTotal = amts[0].p;
+      if (amts.length >= 2) count = Math.min(10, Math.max(1, Math.floor(Number(amts[1].p))));
+    }
   }
   if (!contract || !/^0x[a-fA-F0-9]{40}$/.test(contract)) {
     userStates[userId] = { step: "awaiting_sweep_contract" };
     await ctx.reply(
-      `🧹 *Sweep Floor on Kalos*\n\nReply with a collection + how many + max each:\n\n\`<0x…> [count] [maxHYPE]\`\n\n*Examples:*\n\`0xd0e6…5d95\` — cheapest 1\n\`0xd0e6…5d95 3\` — cheapest 3 in one tx\n\`0xd0e6…5d95 3 10\` — 3 cheapest under 10 HYPE each`,
+      `🧹 *Sweep Floor on Kalos*\n\nReply with a collection + total budget + how many:\n\n\`<0x…> [maxTotalHYPE] [count]\`\n\n*Examples:*\n\`0xd0e6…5d95\` — cheapest 1\n\`0xd0e6…5d95 10\` — up to 10 HYPE total\n\`0xd0e6…5d95 10 3\` — 3 cheapest, max 10 HYPE total`,
       { parse_mode: "Markdown" }
     );
     return;
   }
-  await renderSweepResults(ctx, contract as Address, maxPrice, count, true);
+  await renderSweepResults(ctx, contract as Address, maxTotal, count, true);
 }
 
-async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?: string, count: number = 1, fromCommand = false) {
+async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?: string, count: number = 1, fromCommand = false) {
   const userId = ctx.from?.id;
   const cfg = getChainConfig(ELYSIUM.key);
   await ctx.reply(`🔍 Scanning Kalos for the ${count > 1 ? `${count} cheapest live listings` : "cheapest live listing"}…`, { parse_mode: "Markdown" });
@@ -1076,11 +1096,11 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
   // "0" on RPC errors, which previously produced a bogus "No HYPE" message
   // for wallets that actually hold HYPE. Only a CONFIRMED zero blocks.
   const want = Math.max(1, Math.min(10, Math.floor(count)));
-  function maxPriceHypeSafe(v?: string): string { return String(v ?? ""); }
+  function maxTotalHypeSafe(v?: string): string { return String(v ?? ""); }
   // Multi-count sweeps: ask HOW MANY before scanning (count picker).
-  // Only for the bare "/sweep <contract>" command (no count, no max typed).
+  // Only for the bare "/sweep <contract>" command (no count, no total typed).
   // Button taps (card Sweep, Sweep-N, Re-scan) always scan directly.
-  const isBareCommand = fromCommand && want === 1 && (maxPriceEth === undefined || maxPriceEth === null);
+  const isBareCommand = fromCommand && want === 1 && (maxTotalEth === undefined || maxTotalEth === null);
   if (isBareCommand) {
     const floorPreview = await kalosService.getVerifiedFloor(contract).catch(() => null);
     const floorLine = floorPreview && floorPreview > 0n ? `${kalosService.formatPrice(floorPreview)} HYPE` : "checking…";
@@ -1093,29 +1113,35 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
       .text("🏷️ Collections", "menu_collections")
       .text("🔙 Main Menu", "menu_main");
     if (userId) {
-      userStates[userId] = { step: "awaiting_sweepN_pick", data: { contract, maxPriceEth: maxPriceEth ?? null, expiresAt: Date.now() + 5 * 60_000 } };
+      userStates[userId] = { step: "awaiting_sweepN_pick", data: { contract, maxTotalEth: (typeof maxTotalEth !== "undefined" ? maxTotalEth : null), expiresAt: Date.now() + 5 * 60_000 } };
     }
-    await ctx.reply(
-      `🧹 *Sweep Floor — how many?*\n\nContract: \`${contract}\`\nKalos floor: \`${floorLine}\`${maxPriceEth ? `\nMax filter: \`${maxPriceHypeSafe(maxPriceEth)} HYPE\`` : ""}\n\nTap how many cheapest listings to sweep in one transaction:`,
-      { parse_mode: "Markdown", reply_markup: kb }
-    );
+    await ctx.reply(`🧹 Pick count`, { parse_mode: "Markdown", reply_markup: kb });
     return;
   }
   let cheapest: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
   try {
-    cheapest = await kalosService.findCheapestListings(contract, { maxScan: 500, maxResults: Math.max(want, 5), maxPriceEth: maxPriceEth });
+    cheapest = await kalosService.findCheapestListings(contract, { maxScan: 500, maxResults: Math.max(want, 5) });
   } catch (e: any) {
-    await ctx.reply(`🔴 Kalos scan failed: ${e?.shortMessage ?? e?.message ?? "unknown"}`, { parse_mode: "Markdown" });
+    await ctx.reply(`🔴 Kalos scan failed`, { parse_mode: "Markdown" });
     return;
   }
+  try {
+    const __b = (typeof maxTotalEth !== "undefined" ? (maxTotalEth as unknown as string) : undefined);
+    if (__b) {
+      const { parseEther: __pe } = await import("viem");
+      const __budget = __pe(__b as `${number}`);
+      const __fit: typeof cheapest = []; let __run = 0n;
+      for (const __c of cheapest) { if (__run + __c.price <= __budget) { __fit.push(__c); __run += __c.price; } else break; }
+      cheapest = __fit;
+    }
+  } catch {}
   if (cheapest.length === 0) {
     let floorLine = "No active listings";
     try {
       const fp = await kalosService.getVerifiedFloor(contract);
       if (fp && fp > 0n) floorLine = `${kalosService.formatPrice(fp)} HYPE`;
     } catch {}
-    await ctx.reply(
-      `🧹 *Sweep Floor — no match*\n\nContract: \`${contract}\`\nKalos floor: \`${floorLine}\`\n${maxPriceEth ? `Max filter: \`${maxPriceEth} HYPE\`\n` : ""}\nNo live listing found in the first 60 tokenIds. The floor may be stale, expired, or above your max. Try without a max or tap Collections to browse.`,
+    await ctx.reply(`🧹 *Sweep Floor — no match*`,
       { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("🏷️ Collections", "menu_collections").text("🔙 Main Menu", "menu_main") }
     );
     return;
@@ -1181,6 +1207,33 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
     { name: "totalSupply", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   ] as const;
 
+  // Human durations everywhere: "6h" / "6hrs" / "6 hours", "30m" / "30mins" /
+  // "30 minutes", "2d" / "2 days", plain "3" = 3 days (legacy). Returns days
+  // as a float; callers round/clamp to what their tx needs (bids: 1-30 days).
+  function parseDurationDays(raw?: string): number | null {
+    if (raw === undefined) return null;
+    const t = String(raw).trim().toLowerCase();
+    if (/^\d+$/.test(t)) { const d = Number(t); return d >= 1 && d <= 30 ? d : null; }
+    let m = t.match(/^(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes)$/);
+    if (m) { const mins = Number(m[1]); if (!(mins > 0 && mins <= 60 * 24 * 30)) return null; return mins / (60 * 24); }
+    m = t.match(/^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours)$/);
+    if (m) { const h = Number(m[1]); if (!(h > 0 && h <= 24 * 30)) return null; return h / 24; }
+    m = t.match(/^(\d+(?:\.\d+)?)\s*(d|day|days)$/);
+    if (m) { const d = Number(m[1]); if (!(d >= 1 && d <= 30)) return null; return d; }
+    return null;
+  }
+  function formatDuration(days: number): string {
+    if (days < 1) {
+      const mins = Math.round(days * 24 * 60);
+      if (mins < 60) return `${mins} min${mins === 1 ? "" : "s"}`;
+      const h = days * 24;
+      const hr = Math.round(h * 10) / 10;
+      return `${hr} hour${hr === 1 ? "" : "s"}`;
+    }
+    const r = Math.round(days * 10) / 10;
+    return `${r} day${r === 1 ? "" : "s"}`;
+  }
+
   /** Best-effort collection metadata: name + symbol, with symbol fallback. Never throws. */
   async function readCollectionMeta(addr: Address): Promise<{ name: string; symbol: string }> {
     const fallback = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
@@ -1238,10 +1291,12 @@ async function renderSweepResults(ctx: Context, contract: Address, maxPriceEth?:
     return { text, plain };
   }
 
-  function collectionCardKeyboard(r: { address: Address; name: string; symbol: string; floorWei: bigint | null; floorStr: string }): InlineKeyboard {
+  function collectionCardKeyboard(r: { address: Address; name: string; symbol: string; floorWei: bigint | null; floorStr: string; count: number; unverified: boolean }): InlineKeyboard {
     const kb = new InlineKeyboard();
     const label = r.symbol ? `$${r.symbol}` : r.name.slice(0, 16);
-    if (r.floorWei && r.floorWei > 0n) kb.text(`🧹 Sweep ${label} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
+    // Sweep first whenever a floor exists — verified OR event-estimate.
+    // A stale "No active listings" row hid behind the estimate before.
+    if (r.floorWei && r.floorWei > 0n) kb.text(r.unverified ? `🧹 Sweep ~${label} — ${r.floorStr} ⏳` : `🧹 Sweep ${label} — ${r.floorStr}`, `kalos_sweep_${r.address}`).row();
     else kb.text(`🔍 Inspect ${label}`, `col_inspect_${r.address}`).row();
     kb.text("🛒 Buy", `kalos_buy_${r.address}`)
       .text("🏷️ List", `kalos_list_${r.address}`)
@@ -1361,18 +1416,24 @@ async function renderCollectionsMenu(ctx: Context) {
   void buildMenuText;
   void buildMenuKeyboard;
   /** Phase-2 MUST overwrite the floor line even when an edit partially fails:
-   * verified floors replace estimates, dead rows explicitly say so. */
+   * verified floors replace estimates; dead rows explicitly say so — but a
+   * floor that verified from EVENTS and just hasn't re-verified yet must NOT
+   * be wiped to "No active listings" by an empty phase-2 batch. */
   function applyVerifiedFloor(r: (typeof rows)[number], f: { floor: bigint | null; liveCount: number } | undefined) {
     if (f?.floor && f.floor > 0n) {
       r.floorWei = f.floor;
       r.floorStr = `${kalosService.formatPrice(f.floor)} HYPE`;
       r.count = f.liveCount;
+      r.unverified = false;
+    } else if (r.floorWei && r.floorWei > 0n && r.unverified) {
+      // Keep the event estimate (still shows Sweep with ⏳) — verification
+      // may have 429'd this cycle; don't flash "No active listings".
     } else {
       r.floorWei = null;
       r.floorStr = "No active listings";
       r.count = 0;
+      r.unverified = false;
     }
-    r.unverified = false;
     r.tag = undefined;
   }
   /** Tag one collection's card so phase-2 edits hit the RIGHT message. */
@@ -1588,8 +1649,11 @@ async function renderNFTsMenu(ctx: Context) {
 
   const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
   try {
+    // Cheap discovery: only ItemListed events, shared scan (45s cache).
     const discovered = await kalosService.discoverCollections({ blocksBack: 200_000 });
-    for (const col of discovered.slice(0, 30)) {
+    // Bound the ownership probe: 30 collections x tokensOfOwner is the RPC
+    // hotspot that starves the bid scan — 12 is enough, FIFO by discovery.
+    for (const col of discovered.slice(0, 12)) {
       try {
         const ids = await kalosService.tokensOfOwner(col, user.wallet_address as Address, { limit: 10 });
         for (const tid of ids) nfts.push({ collection: col, tokenId: tid });
@@ -1651,6 +1715,9 @@ async function renderNFTsMenu(ctx: Context) {
     const cardKb = (() => {
       const kb = new InlineKeyboard();
       if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${best.bidder}`).row();
+      for (const b of nftBids.slice(0, 3)) {
+        kb.text(`🤝 ${kalosService.formatPrice(b.price)} from ${b.bidder.slice(0, 6)}…${b.bidder.slice(-4)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${b.bidder}`).row();
+      }
       kb.text(`🔍 Collection`, `col_inspect_${nft.collection}`).row();
       kb.text("🔙 Menu", "menu_main");
       return kb;
@@ -1927,14 +1994,22 @@ async function promptNftOffer(ctx: Context, raw?: string) {
   const isAddr = (s?: string) => !!s && /^0x[a-fA-F0-9]{40}$/.test(s);
   const isTid = (s?: string) => !!s && /^\d+$/.test(s);
   const isPrice = (s?: string) => !!s && /^\d+(?:\.\d{1,18})?$/.test(s) && Number(s) > 0;
-  const isDays = (s?: string) => !!s && /^\d+$/.test(s) && Number(s) >= 1 && Number(s) <= 30;
-  // Accepted shapes (tokenId 0 = any token):
-  //   <contract> <price> [days] | <contract> <tokenId> <price> [days]
-  if (parts.length >= 2 && isAddr(parts[0]) && isPrice(parts[1]) && (parts[2] === undefined || isDays(parts[2]))) {
+  // Accepted shapes (tokenId 0 = any token, duration = days | 6h | 30m):
+  //   <contract> <price> [duration] | <contract> <tokenId> <price> [duration]
+  if (parts.length >= 2 && isAddr(parts[0]) && isPrice(parts[1])) {
     const anyContract = parts[0] as Address;
+    let anyDays = 7;
+    if (parts[2] !== undefined) {
+      const dd = parseDurationDays(parts[2]);
+      if (dd === null) {
+        await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. E.g. `<contract> 0.5 6h`.", { parse_mode: "Markdown" });
+        return;
+      }
+      anyDays = Math.max(1, Math.min(30, Math.round(dd)));
+    }
     userStates[userId] = {
       step: "awaiting_nftoffer_confirmation",
-      data: { contract: anyContract, tokenId: "0", priceHype: parts[1], days: parts[2] !== undefined ? Number(parts[2]) : 7, expiresAt: Date.now() + 5 * 60_000 },
+      data: { contract: anyContract, tokenId: "0", priceHype: parts[1], days: anyDays, expiresAt: Date.now() + 5 * 60_000 },
     };
   } else if (parts.length >= 3 && isAddr(parts[0]) && isTid(parts[1]) && isPrice(parts[2])) {
     const specContract = parts[0] as Address;
@@ -1942,11 +2017,12 @@ async function promptNftOffer(ctx: Context, raw?: string) {
     const specPrice = parts[2];
     let specDays = 7;
     if (parts[3] !== undefined) {
-      if (!isDays(parts[3])) {
-        await ctx.reply("Duration must be 1–30 days. Try again, e.g. `<contract> 6187 0.5 3`.", { parse_mode: "Markdown" });
+      const dd = parseDurationDays(parts[3]);
+      if (dd === null) {
+        await ctx.reply("Duration: `3` = 3 days, or `6h` / `30m` / `2d`. E.g. `<contract> 6187 0.5 6h`.", { parse_mode: "Markdown" });
         return;
       }
-      specDays = Number(parts[3]);
+      specDays = Math.max(1, Math.min(30, Math.round(dd)));
     }
 
     userStates[userId] = {
@@ -1963,7 +2039,7 @@ async function promptNftOffer(ctx: Context, raw?: string) {
     quote += `📄 *Collection:* \`${specContract}\`\n`;
     quote += `🏷 *Token:* \`${tokenLabel}\`\n`;
     quote += `💰 *Offer Price:* \`${specPrice} HYPE\`\n`;
-    quote += `⏱ *Expiry:* \`${specDays} days\`\n\n`;
+    quote += `⏱ *Expiry:* \`${formatDuration(specDays)}\`\n\n`;
     quote += `Tap the button below or reply *YES* to proceed:`;
     await ctx.reply(quote, { parse_mode: "Markdown", reply_markup: kb });
     return;
@@ -1971,7 +2047,7 @@ async function promptNftOffer(ctx: Context, raw?: string) {
       // Fell through (e.g. bad shape) — show the flexible prompt.
       userStates[userId] = { step: "awaiting_nftoffer_params" };
       await ctx.reply(
-        `🤝 *Make Offer on Kalos*\n\nSend ONE of:\n\n\`<collection> <price> [days]\` — any token\n\`<collection> <tokenId> <price> [days]\` — specific token\n\n*Example:*\n\`0x123... 0.5\` or \`0x123... 1 0.1 7\`\n\nOr reply \`/cancel\`.`,
+        `🤝 *Make Offer on Kalos*\n\nSend ONE of:\n\n\`<collection> <price> [duration]\` — any token\n\`<collection> <tokenId> <price> [duration]\` — specific token\n\n*Duration:* \`3\` = 3 days, \`6h\` = 6 hours, \`30m\` = 30 mins\n\n*Example:*\n\`0x123... 0.5 6h\` or \`0x123... 1 0.1 3d\`\n\nOr reply \`/cancel\`.`,
         { parse_mode: "Markdown" }
       );
       return;
@@ -1979,7 +2055,7 @@ async function promptNftOffer(ctx: Context, raw?: string) {
 
   userStates[userId] = { step: "awaiting_nftoffer_params" };
   await ctx.reply(
-    `🤝 *Make Offer on Kalos*\n\nSend ONE of:\n\n\`<collection> <price> [days]\` — offer on *any* token\n\`<collection> <tokenId> <price> [days]\` — offer on a *specific* token\n\n*Example:*\n\`0x123... 0.5\` or \`0x123... 1 0.1 7\`\n\nOr reply \`/cancel\`.`,
+    `🤝 *Make Offer on Kalos*\n\nSend ONE of:\n\n\`<collection> <price> [duration]\` — offer on *any* token\n\`<collection> <tokenId> <price> [duration]\` — offer on a *specific* token\n\n*Duration:* \`3\` = 3 days, \`6h\` = 6 hours, \`30m\` = 30 mins\n\n*Example:*\n\`0x123... 0.5 6h\` or \`0x123... 1 0.1 3d\`\n\nOr reply \`/cancel\`.`,
     { parse_mode: "Markdown" }
   );
 }
@@ -2438,16 +2514,18 @@ async function renderHelpMenu(ctx: Context) {
   let msg = `ℹ️ *Zensweep — fastest finger on Kalos (Elysium NFTs)*\n\n`;
   msg += `*Find it:*\n`;
   msg += `• \`/collections\` — live feed, real names + floors\n`;
-  msg += `• \`/sweep <0x…> [maxHYPE]\` — cheapest live ask, 1-tap buy\n`;
-  msg += `\n*Bid it:*\n`;
-  msg += `• \`/offer <collection> [tokenId] <price> [days]\` — fire-and-forget bid, ping on fill\n`;
+  msg += `• \`/sweep <contract> [maxTotalHYPE] [count]\` — cheapest live asks, total-budget capped\n`;
+  msg += `  e.g. \`/sweep 0x… 10 3\` — 3 cheapest, max 10 HYPE total\n`;
+  msg += `\n*Bid it (durations: 3 = 3 days, 6h = 6 hours, 30m = 30 mins):*\n`;
+  msg += `• \`/offer <collection> [tokenId] <price> [duration]\` — any-token or specific\n`;
+  msg += `  e.g. \`/offer 0x… 0.5 6h\` — 0.5 on any token, 6 hours\n`;
   msg += `• \`/accept <collection> <tokenId> <bidder>\` — accept a bid on your NFT\n`;
   msg += `\n*Track it:*\n`;
   msg += `• \`/watch <0x…> [label]\` — floor-drop + new-deployment pings\n`;
   msg += `• \`/watchlist\` — your tracked collections\n`;
   msg += `• \`/alerts\` — ping settings\n`;
   msg += `\n*Your stuff:*\n`;
-  msg += `• \`/nfts\` — what you own + your live offers\n`;
+  msg += `• \`/nfts\` — what you own + live offers (tap to accept)\n`;
   msg += `• \`/wallet\` — HYPE + WHYPE balances, wrap/unwrap + faucet inside\n`;
   msg += `\nBids escrow in *WHYPE* (wrapped HYPE) — convert inside \`/wallet\`. Kalos takes its marketplace fee on every trade; Zensweep adds nothing on testnet.`;
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: mainKeyboard });
