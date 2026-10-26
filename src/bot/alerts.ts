@@ -9,7 +9,7 @@ import type { Address } from "viem";
 /**
  * Background alert scheduler.
  *
- * Four jobs, run on an interval:
+ * Five jobs, run on an interval:
  *   1. Launch-status watcher — refetches the launch board and DMs every user
  *      when a project changes status (e.g. upcoming → minting → live).
  *   2. Mint-window watcher — DMs when a mint window flips to "opens_soon" or
@@ -18,6 +18,8 @@ import type { Address } from "viem";
  *      deployments on Elysium (new launches appearing on-chain).
  *   4. Watch-motion watcher — DMs watch owners when a tracked address's
  *      balance moves or fresh transfers appear.
+ *   5. Kalos listing watcher — DMs sellers when THEIR listing sells, cancels
+ *      or expires (reconciles local DB against getListing + ItemSold events).
  * Floor watcher (OpenSea-backed) is retained for EVM snipe tasks.
  *
  * All sends are best-effort; a failed DM never crashes the loop.
@@ -203,6 +205,46 @@ async function checkWatchMotion() {
   }
 }
 
+/** DM every user with an active Kalos listing that just sold, cancelled or expired. */
+async function checkListingSales() {
+  if (!bot) return;
+  let actives: Array<{ id: number; user_id: number }>;
+  try { actives = dbService.getAllActiveListings(); } catch { return; }
+  if (actives.length === 0) return;
+  const cfg = getChainConfig(ELYSIUM.key);
+  for (const l of actives.slice(0, 25)) {
+    try {
+      const { kalosService } = await import("../engine/kalos");
+      const res = await kalosService.reconcileListing(l.id, l.user_id);
+      if (!res || res.status === "live") continue;
+      if (res.status === "sold") {
+        const price = res.priceWei ? `${kalosService.formatPrice(res.priceWei)} HYPE` : "sold";
+        const row = dbService.getListing(l.id, l.user_id);
+        const link = res.txHash ? `\n🔗 [View sale](${cfg.explorerUrl}/tx/${res.txHash})` : "";
+        try {
+          await bot.api.sendMessage(
+            l.user_id,
+            `💰 *NFT Sold on Kalos!*\n\nToken \`#${row?.token_id ?? "?"}\` sold for \`${price}\`${res.buyer ? `\nBuyer: \`${res.buyer}\`` : ""}${link}`,
+            { parse_mode: "Markdown" }
+          );
+        } catch {}
+      } else if (res.status === "expired") {
+        const row = dbService.getListing(l.id, l.user_id);
+        try {
+          await bot.api.sendMessage(l.user_id, `⏰ *Kalos listing expired* — Token \`#${row?.token_id ?? "?"}\` is no longer listed. Relist with /nftlist to sell it.`, { parse_mode: "Markdown" });
+        } catch {}
+      } else {
+        const row = dbService.getListing(l.id, l.user_id);
+        try {
+          await bot.api.sendMessage(l.user_id, `❌ *Kalos listing closed* — Token \`#${row?.token_id ?? "?"}\` is no longer listed (cancelled or moved).`, { parse_mode: "Markdown" });
+        } catch {}
+      }
+    } catch {
+      // one bad listing never blocks the rest
+    }
+  }
+}
+
 async function tick() {
   try {
     await checkLaunches();
@@ -210,6 +252,7 @@ async function tick() {
     await checkElysiumDeployments();
     await checkWatchMotion();
     await checkFloors();
+    await checkListingSales();
   } catch (err) {
     console.error("Alert tick failed:", err);
   }

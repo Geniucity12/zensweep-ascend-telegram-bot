@@ -2204,6 +2204,15 @@ async function renderNFTsMenu(ctx: Context) {
   await ctx.reply(`🔍 Scanning your wallet on *${chain.toUpperCase()}* for NFTs…`, { parse_mode: "Markdown" });
 
   const nfts = await marketplaceService.getNFTsForUser(user.wallet_address, chain);
+  // Self-heal BEFORE rendering: re-check every tracked listing on-chain so a
+  // sold/cancelled listing never shows as "Active" (the #4727 bug).
+  const trackedBefore = dbService.getUserListings(userId);
+  if (trackedBefore.length > 0) {
+    try {
+      const { kalosService: _kalos } = await import("../engine/kalos");
+      await Promise.all(trackedBefore.slice(0, 10).map((l) => _kalos.reconcileListing(l.id, userId).catch(() => null)));
+    } catch {}
+  }
   const activeListings = dbService.getUserListings(userId);
 
   if (nfts.length === 0 && activeListings.length === 0) {

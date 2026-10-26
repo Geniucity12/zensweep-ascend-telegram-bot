@@ -2,6 +2,7 @@ import { createPublicClient, createWalletClient, http, parseEther, formatEther, 
 import { privateKeyToAccount } from "viem/accounts";
 import { getChainConfig, KALOS_MARKETPLACE_ADDRESS, ELYSIUM } from "../config";
 import kalosAbi from "../abi/kalosMarketplace.json";
+import { dbService } from "../db";
 const ZERO = "0x0000000000000000000000000000000000000000" as Address;
 const NATIVE = ZERO;
 /** WHYPE on Elysium testnet (verified on-chain: wnative() + paymentToken()). */
@@ -451,6 +452,82 @@ export const kalosService = {
       } as any).catch(() => null)) as Address | null;
       if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) return null; // sold or transferred
       return listing.pricePerItem;
+    } catch { return null; }
+  },
+  /**
+   * Reconcile ONE tracked DB listing against the chain. Returns what happened
+   * (or null if nothing changed). Marks the DB row inactive on sale/cancel.
+   * This is the shared primitive behind the sale watcher AND the /nfts screen,
+   * so both always agree.
+   */
+  async reconcileListing(
+    listingId: number, userId: number
+  ): Promise<{ status: "sold" | "delisted" | "expired" | "live"; buyer?: Address; priceWei?: bigint; txHash?: string } | null> {
+    const row = dbService.getListing(listingId, userId);
+    if (!row || row.active !== 1) return null;
+    try {
+      const seller = (dbService.getKey(userId)?.address ?? "") as Address;
+      if (!seller || !/^0x[a-fA-F0-9]{40}$/.test(seller)) return null;
+      const collection = row.contract as Address;
+      const tid = BigInt(row.token_id);
+      const live = await this.getListing(collection, tid, seller);
+      const client = publicClient();
+      const ownerNow = (await client.readContract({
+        address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tid],
+      } as any).catch(() => null)) as Address | null;
+      // Still listed by the seller -> nothing to do.
+      if (live && live.pricePerItem > 0n && ownerNow && ownerNow.toLowerCase() === seller.toLowerCase()) {
+        return { status: "live" };
+      }
+      // Listing gone. Find out WHY via the marketplace events for this token.
+      const addr = kalosAddr()!;
+      const latest = await client.getBlockNumber();
+      const from = latest > 200_000n ? latest - 200_000n : 0n;
+      const [soldLogs, cancelLogs] = await Promise.all([
+        client.getContractEvents({ address: addr, abi: kalosAbi as any, eventName: "ItemSold", fromBlock: from, toBlock: latest } as any).catch(() => [] as any[]),
+        client.getContractEvents({ address: addr, abi: kalosAbi as any, eventName: "ItemCanceled", fromBlock: from, toBlock: latest } as any).catch(() => [] as any[]),
+      ]);
+      // Most recent relevant event wins. Sold involving us as seller = sale.
+      type Ev = { blockNumber: bigint; transactionHash?: Hex; args: any; kind: "sold" | "canceled" };
+      const rel: Ev[] = [];
+      for (const l of soldLogs as any[]) {
+        try {
+          const a = (l as any).args as any;
+          if (String(a.nftAddress).toLowerCase() === collection.toLowerCase() && String(BigInt(a.tokenId)) === String(tid) && String(a.seller).toLowerCase() === seller.toLowerCase()) {
+            rel.push({ blockNumber: BigInt((l as any).blockNumber ?? 0), transactionHash: (l as any).transactionHash, args: a, kind: "sold" });
+          }
+        } catch {}
+      }
+      for (const l of cancelLogs as any[]) {
+        try {
+          const a = (l as any).args as any;
+          if (String(a.nftAddress).toLowerCase() === collection.toLowerCase() && String(BigInt(a.tokenId)) === String(tid) && String(a.seller).toLowerCase() === seller.toLowerCase()) {
+            rel.push({ blockNumber: BigInt((l as any).blockNumber ?? 0), transactionHash: (l as any).transactionHash, args: a, kind: "canceled" });
+          }
+        } catch {}
+      }
+      rel.sort((a, b) => (a.blockNumber < b.blockNumber ? 1 : a.blockNumber > b.blockNumber ? -1 : 0));
+      // Expired (never sold/cancelled, just timed out) — owner usually still holds.
+      if (rel.length === 0) {
+        if (live && live.expirationTime > 0n && live.expirationTime < BigInt(Math.floor(Date.now() / 1000))) {
+          dbService.delist(listingId, userId);
+          return { status: "expired" };
+        }
+        if (ownerNow && ownerNow.toLowerCase() === seller.toLowerCase()) {
+          dbService.delist(listingId, userId);
+          return { status: "delisted" };
+        }
+      }
+      const top = rel[0];
+      if (top && top.kind === "sold") {
+        const buyer = top.args.buyer as Address;
+        const priceWei = BigInt(top.args.pricePerItem ?? row.price_eth ?? 0);
+        dbService.delist(listingId, userId);
+        try { dbService.recordTrade(userId, "elysium", row.contract, row.token_id, Number(priceWei) / 1e18, (top.transactionHash ?? "") as string, "sell"); } catch {}
+        return { status: "sold", buyer, priceWei, txHash: top.transactionHash };
+      }
+      dbService.delist(listingId, userId);
+      return { status: "delisted" };
     } catch { return null; }
   },
   /** Decode ANY Kalos custom error from a reverted call (buy, list, bid, accept…). */

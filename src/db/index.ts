@@ -442,6 +442,11 @@ export const dbService = {
     return id;
   },
 
+  /** All active listings across every user (for the sale watcher). */
+  getAllActiveListings(): ListingRow[] {
+    return store.schema.listings.filter((l) => l.active === 1);
+  },
+
   getUserListings(userId: number): ListingRow[] {
     return store.schema.listings.filter((l) => l.user_id === userId && l.active === 1);
   },
