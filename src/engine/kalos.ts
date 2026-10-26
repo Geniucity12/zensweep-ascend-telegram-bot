@@ -594,6 +594,68 @@ export const kalosService = {
   decodeBuyError(err: any): string | null {
     return this.decodeContractError(err);
   },
+  /** Live token bids ON your tokens: who offered what, verified against getTokenBid. */
+  async getIncomingBids(
+    tokens: Array<{ collection: Address; tokenId: bigint }>,
+    owner: Address,
+    opts?: { perToken?: number }
+  ): Promise<Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }>> {
+    const per = opts?.perToken ?? 8;
+    const addr = kalosAddr()!;
+    const client = publicClient();
+    const out: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
+    const latest = await client.getBlockNumber().catch(() => 0n);
+    const from = latest > 200_000n ? latest - 200_000n : 0n;
+    let bidLogs: any[] = [];
+    try {
+      bidLogs = (await client.getContractEvents({
+        address: addr, abi: kalosAbi as any, eventName: "TokenBidCreatedOrUpdated",
+        fromBlock: from, toBlock: latest,
+      } as any).catch(() => [])) as any[];
+    } catch { return []; }
+    // bidder+token -> newest event wins
+    const seen = new Map<string, { collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; bn: bigint }>();
+    for (const l of bidLogs) {
+      try {
+        const a = (l as any).args as any;
+        const col = String(a.nftAddress).toLowerCase();
+        const tid = BigInt(a.tokenId);
+        const key = `${col}:${tid.toString()}:${String(a.bidder).toLowerCase()}`;
+        const bn = BigInt((l as any).blockNumber ?? 0);
+        const price = BigInt(a.pricePerItem ?? 0);
+        const exp = BigInt(a.expirationTime ?? 0);
+        if (price <= 0n) continue;
+        const prev = seen.get(key);
+        if (!prev || bn > prev.bn) {
+          seen.set(key, { collection: a.nftAddress as Address, tokenId: tid, bidder: a.bidder as Address, price, expiration: exp, bn });
+        }
+      } catch {}
+    }
+    const wanted = new Set(tokens.map((t) => `${t.collection.toLowerCase()}:${t.tokenId.toString()}`));
+    const cands = [...seen.values()]
+      .filter((c) => wanted.has(`${String(c.collection).toLowerCase()}:${c.tokenId.toString()}`))
+      .sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0))
+      .slice(0, Math.max(8, per * Math.max(1, tokens.length)));
+    const verified = await mapLimit(cands, 6, async (c) => {
+      try {
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        if (c.expiration > 0n && c.expiration < now) return null;
+        const live: any = await client.readContract({
+          address: addr, abi: kalosAbi as any, functionName: "getTokenBid",
+          args: [c.collection, c.tokenId, c.bidder],
+        } as any).catch(() => null);
+        const livePrice = BigInt(live?.pricePerItem ?? live?.[1] ?? 0);
+        if (livePrice <= 0n) return null;
+        const ownerNow = (await client.readContract({
+          address: c.collection, abi: erc721Abi as any, functionName: "ownerOf", args: [c.tokenId],
+        } as any).catch(() => null)) as Address | null;
+        if (!ownerNow || ownerNow.toLowerCase() !== owner.toLowerCase()) return null;
+        return { collection: c.collection, tokenId: c.tokenId, bidder: c.bidder, price: livePrice, expiration: BigInt(live?.expirationTime ?? live?.[2] ?? c.expiration) };
+      } catch { return null; }
+    });
+    for (const v of verified) if (v) out.push(v);
+    return out.sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0));
+  },
   /**
    * Dry-run a buy against the CURRENT chain state without spending gas.
    * Returns { ok: true } or { ok: false, reason } with a human explanation.

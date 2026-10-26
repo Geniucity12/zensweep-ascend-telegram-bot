@@ -687,6 +687,12 @@ export function registerHandlers(bot: Bot) {
     }
   });
 
+  // 1-tap Accept from an /nfts card: straight to the confirm quote, no typing.
+  bot.callbackQuery(/^kalos_accept_(0x[a-fA-F0-9]{40})_(\d+)_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    await promptNftAccept(ctx, `${ctx.match[1]} ${ctx.match[2]} ${ctx.match[3]}`);
+  });
+
   bot.callbackQuery("confirm_nftdelist", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     const userId = ctx.from?.id;
@@ -2307,15 +2313,14 @@ async function renderNFTsMenu(ctx: Context) {
   await ctx.reply(`🔍 Scanning your wallet on *${chain.toUpperCase()}* for NFTs…`, { parse_mode: "Markdown" });
 
   const nfts = await marketplaceService.getNFTsForUser(user.wallet_address, chain);
-  // Self-heal BEFORE rendering: re-check every tracked listing on-chain so a
-  // sold/cancelled listing never shows as "Active" (the #4727 bug).
-  const trackedBefore = dbService.getUserListings(userId);
-  if (trackedBefore.length > 0) {
-    try {
-      const { kalosService: _kalos } = await import("../engine/kalos");
-      await Promise.all(trackedBefore.slice(0, 10).map((l) => _kalos.reconcileListing(l.id, userId).catch(() => null)));
-    } catch {}
-  }
+  // Self-heal tracked listings FIRST so a sold/cancelled listing never shows
+  // as "Active" (the #4727 bug) — then render from the cleaned list.
+  try {
+    const trackedBefore = dbService.getUserListings(userId);
+    if (trackedBefore.length > 0) {
+      await Promise.all(trackedBefore.slice(0, 10).map((l) => kalosService.reconcileListing(l.id, userId).catch(() => null)));
+    }
+  } catch {}
   const activeListings = dbService.getUserListings(userId);
 
   if (nfts.length === 0 && activeListings.length === 0) {
@@ -2340,6 +2345,44 @@ async function renderNFTsMenu(ctx: Context) {
   let msg = `🖼 *My NFT Inventory (${chain.toUpperCase()})*\n` +
             `*Wallet:* \`${user.wallet_address}\`\n\n`;
 
+  // Incoming live offers on YOUR tokens (verified via getTokenBid + ownership).
+  let incomingBids: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
+  try {
+    const myTokens = nfts.slice(0, 12).map((n) => ({ collection: n.contract as Address, tokenId: BigInt(n.tokenId) }));
+    if (myTokens.length > 0) {
+      incomingBids = await kalosService.getIncomingBids(myTokens, user.wallet_address as Address, { perToken: 4 });
+    }
+  } catch { incomingBids = []; }
+
+  // ONE card per NFT: held tokens first, each with its own buttons.
+  // Cards include live offer (if any) + 1-tap Accept — no typing.
+  for (const nft of nfts.slice(0, 12)) {
+    const nftBids = incomingBids.filter(
+      (b) => b.collection.toLowerCase() === String(nft.contract).toLowerCase() && b.tokenId.toString() === String(nft.tokenId)
+    );
+    const best = nftBids.length > 0 ? nftBids[0] : null;
+    const offerLine = best
+      ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\``
+      : `\n🤝 *Offers:* \`none right now\``;
+    const extraLine = nftBids.length > 1 ? ` (+${nftBids.length - 1} more)` : "";
+    let text = `🖼️ *${escMd(nft.title)}*\n\`${nft.contract}\` • Token \`#${escMd(String(nft.tokenId))}\`${offerLine}${extraLine}`;
+    try {
+      await ctx.reply(text, {
+        parse_mode: "Markdown",
+        reply_markup: (() => {
+          const kb = new InlineKeyboard();
+          kb.text(`🏷️ List #${nft.tokenId}`, `kalos_list_${nft.contract}_${nft.tokenId}`).row();
+          if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)} HYPE`, `kalos_accept_${nft.contract}_${nft.tokenId}_${best.bidder}`).row();
+          else kb.text(`🤝 Offer #${nft.tokenId}`, `kalos_offer_${nft.contract}_${nft.tokenId}`).row();
+          kb.text(`🔍 Collection`, `col_inspect_${nft.contract}`).text("🔙 Menu", "menu_main");
+          return kb;
+        })(),
+      });
+    } catch {
+      try { await ctx.reply(text.replace(/[`*_]/g, "")); } catch {}
+    }
+  }
+
   if (nfts.length > 0) {
     msg += `*Held NFTs (${nfts.length}):*\n`;
     for (const nft of nfts.slice(0, 8)) {
@@ -2355,12 +2398,6 @@ async function renderNFTsMenu(ctx: Context) {
   }
 
   const kb = new InlineKeyboard();
-  for (const nft of nfts.slice(0, 8)) {
-    kb.text(`🏷️ List ${nft.title}`, `kalos_list_${nft.contract}_${nft.tokenId}`).row();
-  }
-  for (const l of activeListings.slice(0, 4)) {
-    kb.text(`❌ Cancel ${l.contract.slice(0, 6)}… #${l.token_id}`, `listing_cancel_${l.id}`).row();
-  }
   kb.text("⚡ Direct Mint", "menu_mint")
     .text("🏷️ Collections", "menu_collections").row()
     .text("🔙 Main Menu", "menu_main");
