@@ -1426,7 +1426,7 @@ async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?:
   function buildCollectionCard(r: {
     name: string; symbol: string; address: Address;
     floorWei: bigint | null; floorStr: string; count: number;
-    unverified: boolean; scannedAt: string;
+    unverified: boolean; scannedAt: string; topBid?: bigint | null;
   }): { text: string; plain: string } {
     const title = r.symbol ? `${r.name} ($${r.symbol})` : r.name;
     const floorEmoji = !r.floorWei || r.floorWei <= 0n ? "⚪" : r.unverified ? "🟡" : "🟢";
@@ -1435,16 +1435,19 @@ async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?:
         ? `💰 *Floor:* \`~${r.floorStr}\` *(unconfirmed — still checking)*`
         : `💰 *Floor:* \`${r.floorStr}\` *(live)*`
       : `💰 *Floor:* \`No live asks found\``;
+    const topBidLine = r.topBid && r.topBid > 0n
+      ? `\n🤝 *Top offer:* \`${kalosService.formatPrice(r.topBid)} HYPE\``
+      : ``;
     const liveLine = r.count > 0
       ? r.unverified
         ? `📊 *Seen in recent events:* \`${r.count}\` *(confirming…)*`
-        : `📊 *Live asks:* \`${r.count} live\``
-      : `📊 *Live asks:* \`none found\``;
+        : ``
+      : ``;
     const text =
       `🖼️ *${escMd(title)}*\n` +
       `📄 \`${r.address}\`\n\n` +
-      `${floorEmoji} ${floorLine}\n` +
-      `${liveLine}\n` +
+      `${floorEmoji} ${floorLine}${topBidLine}\n` +
+      (liveLine ? `${liveLine}\n` : ``) +
       `🏛 *Market:* Kalos on Elysium L2`;
     const plain = text.replace(/[`*_]/g, "");
     return { text, plain };
@@ -1468,21 +1471,33 @@ async function renderSweepResults(ctx: Context, contract: Address, maxTotalEth?:
 async function renderCollectionsMenu(ctx: Context) {
   const cfg = getChainConfig(ELYSIUM.key);
   const kalosAddress = kalosService.address();
-  const sentScanning = await ctx.reply(`🔍 Scanning Kalos — discovering live collections…`, { parse_mode: "Markdown" }).catch(() => null);
+  const sentScanning = await ctx.reply(`🔍 Loading Kalos collections…`, { parse_mode: "Markdown" }).catch(() => null);
 
-  // Discover EVERY live Kalos collection on-chain — no hardcoding.
-  // One shared scan feeds discovery AND all floor rows (cached 45s).
-  // Scan depth covers well beyond the last 50k blocks so collections whose
-  // listings are older still appear (up to ~24+ on Kalos testnet).
+  // PRIMARY: kalos.fun indexer — all 27 collections + floors + topBids in ONE call.
+  // Matches kalos.fun exactly. RPC scan is the fallback (indexer down / unregistered CAs).
+  let indexCols: Array<{ slug: string; address: Address; name: string; symbol: string }> = [];
+  let indexStats = new Map<string, { floor: bigint | null; topBid: bigint | null }>();
+  let indexOk = false;
+  try {
+    const { getIndexDirectory } = await import("../engine/kalos");
+    const dir = await getIndexDirectory();
+    indexCols = dir.cols;
+    indexStats = dir.stats;
+    indexOk = indexCols.length > 0;
+  } catch { indexOk = false; }
   let discovered: Address[] = [];
   let sharedEvents: Awaited<ReturnType<typeof kalosService.cachedScan>> = [];
   let scanFailed = false;
+  if (indexOk) {
+    discovered = indexCols.map((c) => c.address);
+  } else {
   try {
     sharedEvents = await kalosService.cachedScan({ blocksBack: 200_000 });
     const seen = new Set<string>();
     for (const e of sharedEvents) seen.add(e.nftAddress.toLowerCase());
     discovered = [...seen] as Address[];
   } catch { scanFailed = true; }
+  }
   const watched: Address[] = [];
   try {
     const { dbService: _db } = await import("../db");
@@ -1498,9 +1513,24 @@ async function renderCollectionsMenu(ctx: Context) {
     seenAddr.add(k);
     merged.push(a);
   }
-  // Resolve names (bounded parallel: 5 at a time — the testnet RPC 429s on
-  // Promise.all bursts, which used to leave every card showing raw 0x…).
+  // Indexer names are authoritative — skip slow RPC name() lookups entirely.
+  // RPC meta only for unregistered CAs (indexer down path) or user listings.
+  const nameByAddr = new Map(indexCols.map((c) => [c.address.toLowerCase(), c]));
   const nameRows: Array<{ address: Address; name: string; symbol: string }> = [];
+  if (indexOk) {
+    for (const addr of merged) {
+      const hit = nameByAddr.get(addr.toLowerCase());
+      if (hit) nameRows.push({ address: addr, name: hit.name, symbol: hit.symbol });
+      else {
+        try {
+          const meta = await readCollectionMeta(addr);
+          nameRows.push({ address: addr, name: meta.name, symbol: meta.symbol });
+        } catch {
+          nameRows.push({ address: addr, name: `${addr.slice(0, 6)}…${addr.slice(-4)}`, symbol: "" });
+        }
+      }
+    }
+  } else {
   {
     const queue = [...merged];
     const workers = new Array(Math.min(5, queue.length)).fill(0).map(async () => {
@@ -1516,9 +1546,12 @@ async function renderCollectionsMenu(ctx: Context) {
     });
     await Promise.all(workers);
   }
-  // …then verified floors from ONE batched call (no per-collection scans).
-  // Two-phase menu: instant event-price estimates first, verified floors edited in.
-  let floors = new Map<string, { floor: bigint | null; liveCount: number }>();
+  }
+  // Floors: indexer stats when available (instant, exact), RPC phase-2 otherwise.
+  let floors = new Map<string, { floor: bigint | null; liveCount: number; topBid?: bigint | null }>();
+  if (indexOk) {
+    for (const [addr, s] of indexStats) floors.set(addr, { floor: s.floor, liveCount: s.floor ? 1 : 0, topBid: s.topBid });
+  }
   const eventFloor = (addr: Address): bigint | null => {
     let best: bigint | null = null;
     for (const e of sharedEvents) {
@@ -1537,14 +1570,14 @@ async function renderCollectionsMenu(ctx: Context) {
     }
     return n;
   };
-  // Resolve names + VERIFIED floors (cheapest live ask — getMinPrice returns 0 on Kalos)
-  type ColRow = { address: Address; name: string; symbol: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number; live: number; unverified: boolean };
+  // Resolve names + floors (indexer stats are final; RPC path fills estimates).
+  type ColRow = { address: Address; name: string; symbol: string; tag?: string; floorWei: bigint | null; floorStr: string; count: number; live: number; unverified: boolean; topBid?: bigint | null };
   const rows: ColRow[] = nameRows.map(({ address: addr, name, symbol }) => {
     const f = floors.get(addr.toLowerCase());
     const floorWei = f?.floor ?? null;
     const live = f?.liveCount ?? 0;
     const tag = undefined;
-    return { address: addr, name, symbol, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count: live, live, unverified: false };
+    return { address: addr, name, symbol, tag, floorWei, floorStr: floorWei && floorWei > 0n ? `${kalosService.formatPrice(floorWei)} HYPE` : "No active listings", count: live, live, unverified: false, topBid: (f as any)?.topBid ?? null };
   });
   const scannedAt = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const sortRows = () => rows.sort((a, b) => {
@@ -1558,14 +1591,14 @@ async function renderCollectionsMenu(ctx: Context) {
     m += `🌐 *Chain:* \`${cfg.name}\` (Chain ID \`${cfg.chainId}\`)\n`;
     m += `🏛 *Marketplace:* \`${kalosAddress || "0x0ff8b7afc288ac42f82320f54a49c400f233bf07"}\`\n`;
     m += `🔗 *Portal:* [kalos.fun](https://kalos.fun)\n`;
-    m += `🕒 *Scanned:* \`${scannedAt}\` · \`${rows.length} collections\`\n\n`;
+    m += `🕒 *Updated:* \`${scannedAt}\` · \`${rows.length} collections\`${indexOk ? ` · live from kalos.fun` : ``}\n\n`;
     if (rows.length === 0) {
       m += scanFailed
         ? `⚠️ *Kalos data temporarily unavailable* — the testnet RPC is not responding. This is usually brief maintenance; try again shortly. You can still paste any NFT contract \`0x…\` to inspect it directly.\n\n`
-        : `No live Kalos collections found in recent blocks. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
+        : `No Kalos collections found. Paste any NFT contract \`0x…\` to inspect it directly.\n\n`;
     } else {
       m += verified
-        ? `*Live on Kalos (floor = cheapest live ask):*\n`
+        ? `*Live on Kalos (floor = cheapest live ask, top offer shown):*\n`
         : `*Live on Kalos (prices are first guesses — confirming each one…):*\n`;
     }
     return m;
@@ -1614,7 +1647,9 @@ async function renderCollectionsMenu(ctx: Context) {
     const bf = b.floorWei ?? 10n ** 30n;
     return af < bf ? -1 : af > bf ? 1 : 0;
   });
-  // Phase 1: instant estimates (marked ⏳ unverified) — one card per collection.
+  // Phase 1: indexer rows are already final — send once, no estimates.
+  // RPC fallback path keeps the old estimate-then-verify two-phase.
+  if (!indexOk) {
   for (const r of rows) {
     const ef = eventFloor(r.address);
     if (ef && ef > 0n) {
@@ -1623,6 +1658,7 @@ async function renderCollectionsMenu(ctx: Context) {
       r.count = eventCount(r.address);
       r.unverified = true;
     }
+  }
   }
   sortRows();
 
@@ -1672,20 +1708,30 @@ async function renderCollectionsMenu(ctx: Context) {
     return;
   }
 
-  // Phase-1 header + ALL collection cards (estimates, marked ⏳).
+  // Phase-1 header + ALL collection cards. Indexer path: final, send once.
+  // RPC fallback path: estimates first, phase-2 verifies and edits in place.
   let phase1CardIds = new Map<string, number>();
   try {
     const headerKb = new InlineKeyboard()
       .text("🔍 Inspect Any 0x... Contract", "col_inspect_prompt").row()
       .text("🔙 Main Menu", "menu_main");
-    const sent = await ctx.reply(buildHeaderText(false), { parse_mode: "Markdown", reply_markup: rows.length > 0 ? headerKb : footerKeyboard() });
+    const sent = await ctx.reply(buildHeaderText(indexOk), { parse_mode: "Markdown", reply_markup: rows.length > 0 ? headerKb : footerKeyboard() });
     headerMsgId = sent.message_id;
   } catch {}
   if (rows.length > 0) {
-    phase1CardIds = await sendCollectionCards(false);
+    phase1CardIds = await sendCollectionCards(indexOk);
+  }
+  if (indexOk) {
+    // Indexer data is final — append footer and return, no phase-2.
+    if (headerMsgId && ctx.chat) {
+      try {
+        await ctx.api.editMessageText(ctx.chat.id, headerMsgId, buildHeaderText(true) + footerText, { parse_mode: "Markdown" });
+      } catch {}
+    }
+    return;
   }
 
-  // Phase 2 (background): verify floors, then EDIT the SAME cards in place.
+  // Phase 2 (RPC fallback only): verify floors, then EDIT the SAME cards in place.
   // No re-sends, no deletes — each card's message id is stable per address.
   (async () => {
     try {
@@ -1734,7 +1780,23 @@ function kbLen(kb: InlineKeyboard): number {
 }
 
 async function renderCollectionDetail(ctx: Context, address: Address) {
-  const meta = await readCollectionMeta(address).catch(() => ({ name: `${address.slice(0, 6)}…${address.slice(-4)}`, symbol: "" }));
+  // Indexer first: name/symbol/floor/topBid straight from kalos.fun.
+  let idxName: string | null = null;
+  let idxSymbol = "";
+  let idxFloor: bigint | null = null;
+  let idxTopBid: bigint | null = null;
+  try {
+    const { getIndexDirectory } = await import("../engine/kalos");
+    const dir = await getIndexDirectory();
+    const hit = dir.cols.find((c) => c.address.toLowerCase() === address.toLowerCase());
+    if (hit) {
+      idxName = hit.name; idxSymbol = hit.symbol;
+      idxFloor = dir.stats.get(address.toLowerCase())?.floor ?? null;
+      idxTopBid = dir.stats.get(address.toLowerCase())?.topBid ?? null;
+    }
+  } catch { /* RPC fallback below */ }
+  const meta = idxName ? { name: idxName, symbol: idxSymbol }
+    : await readCollectionMeta(address).catch(() => ({ name: `${address.slice(0, 6)}…${address.slice(-4)}`, symbol: "" }));
 
   const name = meta.name;
   const symbol = meta.symbol ? ` ($${meta.symbol})` : "";
@@ -1742,10 +1804,16 @@ async function renderCollectionDetail(ctx: Context, address: Address) {
   const explorerUrl = explorer ? `${explorer}/address/${address}` : undefined;
 
   let floorStr = "No active listings";
+  let topBidStr = "";
+  if (idxFloor && idxFloor > 0n) {
+    floorStr = `${kalosService.formatPrice(idxFloor)} HYPE`;
+    if (idxTopBid && idxTopBid > 0n) topBidStr = `\n🤝 *Top Offer:* \`${kalosService.formatPrice(idxTopBid)} HYPE\``;
+  } else {
   try {
     const fp = await kalosService.getVerifiedFloor(address);
     if (fp && fp > 0n) floorStr = `${kalosService.formatPrice(fp)} HYPE`;
   } catch {}
+  }
 
   let userBalStr = "0";
   const userId = ctx.from?.id;
@@ -1768,7 +1836,7 @@ async function renderCollectionDetail(ctx: Context, address: Address) {
   let msg = `🖼️ *${escMd(name)}${symbol ? ` (${escMd(symbol.slice(2, -1))})` : ""}*\n`;
   msg += `\`${address}\`\n\n`;
   msg += `🏛 *Marketplace:* Kalos (Elysium L2)\n`;
-  msg += `💰 *Floor Price:* \`${floorStr}\`\n`;
+  msg += `💰 *Floor Price:* \`${floorStr}\`${topBidStr}\n`;
   msg += `💼 *Your Holdings:* \`${userBalStr} owned\``;
   const userTokens = user?.wallet_address ? await kalosService.tokensOfOwner(address, user.wallet_address as Address).catch(() => []) : [];
   const shownTokens = (userTokens ?? []).slice(0, 10);

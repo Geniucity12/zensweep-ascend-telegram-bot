@@ -58,8 +58,117 @@ const erc721Abi = [
   { name: "setApprovalForAll", type: "function", stateMutability: "nonpayable", inputs: [{ name: "operator", type: "address" }, { name: "approved", type: "bool" }], outputs: [] },
 ] as const;
 export interface KalosListing { quantity: bigint; pricePerItem: bigint; expirationTime: bigint; paymentTokenAddress: Address; }
-/** A decoded Kalos ItemListed event. */
+/** A decoded Kalos ItemListed event (RPC fallback path). */
 export interface ListedEvent { seller: Address; nftAddress: Address; tokenId: bigint; quantity: bigint; pricePerItem: bigint; expirationTime: bigint; paymentToken: Address; blockNumber?: bigint; }
+// ---- Kalos indexer client (kalos.fun's own data API) ----
+// kalos.fun exposes its indexer at /api/market-view:
+//   scope=directory            -> all collections + stats.{floor, topBid} (no listings/bids)
+//   scope=collection/<slug>    -> live listings[] + bids[] + stats for ONE collection
+// The bot uses this as PRIMARY (matches kalos.fun exactly) and falls back to
+// on-chain RPC reads when the API is unreachable.
+export interface KalosIndexCollection {
+  slug: string; address: Address; name: string; symbol: string;
+  category?: string; supply?: number; minted?: number; verified?: boolean;
+}
+export interface KalosIndexListing {
+  slug: string; tokenId: bigint; nft: Address; seller: Address;
+  price: bigint; paymentToken: Address; expiration: bigint;
+}
+export interface KalosIndexBid {
+  type: string; slug: string; nft: Address; tokenId: bigint; bidder: Address;
+  quantity: bigint; price: bigint; paymentToken: Address; expiration: bigint;
+  funded?: boolean; fillable?: string; at?: number;
+}
+interface MarketViewPayload {
+  generatedAt?: number; block?: string; collections?: any[]; listings?: any[];
+  bids?: any[]; stats?: Record<string, any>;
+}
+const KALOS_API_BASE = (process.env.KALOS_API_URL || "https://kalos.fun").replace(/\/$/, "");
+const indexCache: {
+  dir?: { at: number; cols: KalosIndexCollection[]; stats: Map<string, { floor: bigint | null; topBid: bigint | null }> };
+  col?: Map<string, { at: number; listings: KalosIndexListing[]; bids: KalosIndexBid[]; stats: { floor: bigint | null; topBid: bigint | null } }>;
+} = { col: new Map() };
+const INDEX_DIR_TTL_MS = 60_000;
+const INDEX_COL_TTL_MS = 30_000;
+function bi(v: any): bigint { try { return BigInt(v ?? 0); } catch { return 0n; } }
+async function fetchMarketView(scope: string): Promise<MarketViewPayload | null> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 12_000);
+  try {
+    const r = await fetch(`${KALOS_API_BASE}/api/market-view?scope=${encodeURIComponent(scope)}`, { signal: ctrl.signal });
+    if (!r.ok) return null;
+    return (await r.json()) as MarketViewPayload;
+  } catch { return null; }
+  finally { clearTimeout(t); }
+}
+
+/** All 27 kalos.fun collections + indexer floors/topBids. Cached 60s. */
+export async function getIndexDirectory(): Promise<{ cols: KalosIndexCollection[]; stats: Map<string, { floor: bigint | null; topBid: bigint | null }>; block?: string }> {
+  if (indexCache.dir && Date.now() - indexCache.dir.at < INDEX_DIR_TTL_MS) {
+    return { cols: indexCache.dir.cols, stats: indexCache.dir.stats };
+  }
+  const d = await fetchMarketView("directory");
+  if (!d || !Array.isArray(d.collections)) throw new Error("Kalos indexer unreachable");
+  const cols: KalosIndexCollection[] = (d.collections ?? []).map((c: any) => ({
+    slug: String(c.slug), address: c.address as Address,
+    name: String(c.name ?? c.slug), symbol: String(c.symbol ?? ""),
+    category: c.category, supply: c.supply, minted: c.minted, verified: !!c.verified,
+  }));
+  const stats = new Map<string, { floor: bigint | null; topBid: bigint | null }>();
+  const st = d.stats ?? {};
+  for (const c of cols) {
+    const s = st[c.slug];
+    if (!s) { stats.set(c.address.toLowerCase(), { floor: null, topBid: null }); continue; }
+    const f = s.floor != null ? bi(s.floor) : 0n;
+    const t = s.topBid != null ? bi(s.topBid) : 0n;
+    stats.set(c.address.toLowerCase(), { floor: f > 0n ? f : null, topBid: t > 0n ? t : null });
+  }
+  indexCache.dir = { at: Date.now(), cols, stats };
+  return { cols, stats, block: d.block };
+}
+
+/** Live listings + bids for ONE collection by slug. Cached 30s. */
+export async function getIndexCollection(slug: string): Promise<{ listings: KalosIndexListing[]; bids: KalosIndexBid[]; stats: { floor: bigint | null; topBid: bigint | null } }> {
+  const hit = indexCache.col!.get(slug);
+  if (hit && Date.now() - hit.at < INDEX_COL_TTL_MS) return hit;
+  const d = await fetchMarketView(`collection/${slug}`);
+  if (!d) throw new Error("Kalos indexer unreachable");
+  const listings: KalosIndexListing[] = (Array.isArray(d.listings) ? d.listings : [])
+    .filter((l: any) => String(l.slug) === slug)
+    .map((l: any) => ({
+      slug: String(l.slug), tokenId: bi(l.tokenId), nft: l.nft as Address, seller: l.seller as Address,
+      price: bi(l.price), paymentToken: l.paymentToken as Address, expiration: bi(l.expiration),
+    }))
+    .filter((l: KalosIndexListing) => l.price > 0n)
+    .sort((a: KalosIndexListing, b: KalosIndexListing) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0));
+  const bids: KalosIndexBid[] = (Array.isArray(d.bids) ? d.bids : [])
+    .filter((b: any) => String(b.slug) === slug)
+    .map((b: any) => ({
+      type: String(b.type ?? "token"), slug: String(b.slug), nft: b.nft as Address,
+      tokenId: bi(b.tokenId), bidder: b.bidder as Address, quantity: bi(b.quantity),
+      price: bi(b.price), paymentToken: b.paymentToken as Address, expiration: bi(b.expiration),
+      funded: b.funded, fillable: b.fillable, at: b.at,
+    }))
+    .filter((b: KalosIndexBid) => b.price > 0n)
+    .sort((a: KalosIndexBid, b: KalosIndexBid) => (a.price > b.price ? -1 : a.price < b.price ? 1 : 0));
+  const s = d.stats?.[slug];
+  const stats = {
+    floor: s?.floor != null && bi(s.floor) > 0n ? bi(s.floor) : (listings[0]?.price ?? null),
+    topBid: s?.topBid != null && bi(s.topBid) > 0n ? bi(s.topBid) : (bids[0]?.price ?? null),
+  };
+  const out = { listings, bids, stats };
+  indexCache.col!.set(slug, { at: Date.now(), ...out });
+  return out;
+}
+
+/** Slug for a collection address (directory lookup, cached). Null = unregistered (e.g. Spartan). */
+export async function slugForCollection(addr: Address): Promise<string | null> {
+  try {
+    const { cols } = await getIndexDirectory();
+    const hit = cols.find((c) => c.address.toLowerCase() === addr.toLowerCase());
+    return hit ? hit.slug : null;
+  } catch { return null; }
+}
 /** Module-level scan cache (shared across all kalosService calls in this process). */
 let scanCache: { at: number; blocksBack: number; events: ListedEvent[] } | null = null;
 /**
@@ -932,6 +1041,45 @@ export const kalosService = {
     const addr = kalosAddr()!;
     const client = publicClient();
     const out: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }> = [];
+    // 1) PRIMARY: kalos.fun indexer — bids per collection slug, exact match.
+    try {
+      const bySlug = new Map<string, Array<{ collection: Address; tokenId: bigint }>>();
+      try {
+        const { cols } = await getIndexDirectory();
+        const addrToSlug = new Map(cols.map((c) => [c.address.toLowerCase(), c.slug]));
+        for (const t of tokens) {
+          const slug = addrToSlug.get(t.collection.toLowerCase());
+          if (!slug) continue;
+          if (!bySlug.has(slug)) bySlug.set(slug, []);
+          bySlug.get(slug)!.push(t);
+        }
+      } catch { /* indexer down -> RPC */ }
+      if (bySlug.size > 0) {
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        for (const [slug, mine] of bySlug) {
+          let idx: { bids: KalosIndexBid[] } | null = null;
+          try { idx = await getIndexCollection(slug); } catch { continue; }
+          if (!idx || idx.bids.length === 0) continue;
+          for (const t of mine) {
+            const rel = idx.bids.filter((b) =>
+              b.nft.toLowerCase() === t.collection.toLowerCase() &&
+              (b.tokenId === t.tokenId || b.tokenId === 0n || b.type === "collection") &&
+              (b.expiration === 0n || b.expiration >= now));
+            for (const b of rel.slice(0, per)) {
+              out.push({
+                collection: t.collection, tokenId: t.tokenId, bidder: b.bidder,
+                price: b.price, expiration: b.expiration,
+                collectionWide: b.tokenId === 0n || b.type === "collection",
+              });
+            }
+          }
+        }
+        if (out.length > 0) {
+          return out.sort((a, b) => (a.price < b.price ? 1 : a.price > b.price ? -1 : 0));
+        }
+      }
+    } catch { /* fall through to RPC */ }
+    // 2) RPC fallback: event scan + getTokenBid verify.
     const latest = await client.getBlockNumber().catch(() => 0n);
     if (latest === 0n) return [];
     // Chunk the bid-event scan so a single range-limit error can't wipe out
@@ -1232,11 +1380,22 @@ export const kalosService = {
   /** Receipt-verified floor: cheapest listing that passes BOTH getListing AND
    *  an ItemSold check in the same scan window. Sold-then-relisted ghosts and
    *  stale events that never re-verify are excluded — this is what kills the
-   *  phantom "19 HYPE floor / No active listings" flip-flop. */
+   *  phantom "19 HYPE floor / No active listings" flip-flop.
+   *  PRIMARY: kalos.fun indexer (exact match). FALLBACK: on-chain RPC scan. */
   async getVerifiedFloor(
     collection: Address,
     opts?: { blocksBack?: number; candidates?: number; events?: ListedEvent[] }
   ): Promise<bigint | null> {
+    // 1) Indexer first — same number kalos.fun shows.
+    try {
+      const slug = await slugForCollection(collection);
+      if (slug) {
+        const idx = await getIndexCollection(slug);
+        if (idx.stats.floor && idx.stats.floor > 0n) return idx.stats.floor;
+        if (idx.listings.length > 0) return idx.listings[0].price;
+      }
+    } catch { /* fall through to RPC */ }
+    // 2) RPC fallback (unregistered CAs like Spartan, or indexer down).
     const maxCandidates = opts?.candidates ?? 80;
     const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 200_000 });
     const mine = events.filter((e) => e.nftAddress.toLowerCase() === collection.toLowerCase());
@@ -1246,15 +1405,25 @@ export const kalosService = {
     return verified[0].price;
   },
   /**
-   * Verified live-listing counts + floors for MANY collections from ONE scan.
-   * This is what /collections uses — one RPC scan, then batched verification.
-   * Collections are verified SEQUENTIALLY (bounded inner concurrency) so the
-   * public testnet RPC is never hammered into rate-limit errors.
+   * Floors for MANY collections. PRIMARY: kalos.fun indexer directory
+   * (one HTTP call, all 27 collections, exact match). FALLBACK: RPC scan.
    */
   async getCollectionFloors(
     collections: Address[],
     opts?: { blocksBack?: number; perCollection?: number; events?: ListedEvent[]; concurrency?: number }
-  ): Promise<Map<string, { floor: bigint | null; liveCount: number }>> {
+  ): Promise<Map<string, { floor: bigint | null; liveCount: number; topBid?: bigint | null }>> {
+    // 1) Indexer directory — single call covers everything.
+    try {
+      const { stats } = await getIndexDirectory();
+      const out = new Map<string, { floor: bigint | null; liveCount: number; topBid?: bigint | null }>();
+      let hits = 0;
+      for (const col of collections) {
+        const s = stats.get(col.toLowerCase());
+        if (s && (s.floor || s.topBid)) hits++;
+        out.set(col.toLowerCase(), { floor: s?.floor ?? null, liveCount: s?.floor ? 1 : 0, topBid: s?.topBid ?? null });
+      }
+      if (hits > 0) return out;
+    } catch { /* fall through to RPC */ }
     const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 200_000 });
     const perCollection = opts?.perCollection ?? 80;
     const conc = opts?.concurrency ?? 6;
@@ -1312,9 +1481,22 @@ export const kalosService = {
     const maxPrice = opts?.maxPriceEth ? parseEther(opts.maxPriceEth) : undefined;
     const client = publicClient();
     const out: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
-    // 1) On-chain event discovery: exact tokenIds with listings (properly decoded).
-    //    Same 200k depth as floors — shallow scans are what produced the
-    //    "No active listings while kalos.fun shows a floor" reports.
+    // 1) PRIMARY: kalos.fun indexer — exact live listings, cheapest-first.
+    try {
+      const slug = await slugForCollection(collection);
+      if (slug) {
+        const idx = await getIndexCollection(slug);
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        for (const l of idx.listings) {
+          if (out.length >= maxResults * 2) break;
+          if (maxPrice !== undefined && l.price > maxPrice) continue;
+          if (l.expiration > 0n && l.expiration < now) continue;
+          out.push({ tokenId: l.tokenId, seller: l.seller, price: l.price, expiration: l.expiration });
+        }
+        if (out.length > 0) return out.slice(0, maxResults);
+      }
+    } catch { /* fall through to RPC */ }
+    // 2) RPC fallback: on-chain event discovery + verify.
     try {
       const events = opts?.events ?? await this.cachedScan({ blocksBack: 200_000 });
       const mine = events.filter((e) => {
