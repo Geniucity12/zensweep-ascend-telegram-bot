@@ -730,6 +730,35 @@ export function registerHandlers(bot: Bot) {
     await executeNftOffer(ctx, data);
   });
 
+  bot.callbackQuery("wrap_and_bid", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data || userStates[userId].step !== "awaiting_offer_wrap_confirm") return;
+    const data = userStates[userId].data as { contract: Address; tokenId: string; priceHype: string; days: number; expiresAt?: number };
+    if (Date.now() > (data.expiresAt ?? 0)) { delete userStates[userId]; await ctx.reply("Offer session expired. Start again with /nftoffer."); return; }
+    delete userStates[userId];
+    const wallet = walletManager.getUserWallet(userId);
+    if (!wallet) { await ctx.reply("No wallet found."); return; }
+    try {
+      const scope = data.tokenId === "0" ? "any token" : `#${data.tokenId}`;
+      const shortfall = parseEther(data.priceHype); // worst case: wrap full bid; ensureBidFunds wraps only the shortfall
+      await ctx.reply(`🔄 Wrapping HYPE → WHYPE, then placing your ${scope} bid for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
+      await kalosService.ensureBidFunds(wallet.privateKey, data.contract, shortfall);
+      const hash = await kalosService.createTokenBid(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
+      const cfg = getChainConfig(ELYSIUM.key);
+      await ctx.reply(
+        `✅ *Offer Placed on Kalos!*\n\n` +
+        `📄 *Collection:* \`${data.contract}\`\n` +
+        `🏷 *Token:* \`${data.tokenId === "0" ? "any token" : `#${data.tokenId}`}\`\n` +
+        `💰 *Bid:* \`${data.priceHype} HYPE\` (wrapped + approved automatically)\n` +
+        `🔗 [View Transaction](${cfg.explorerUrl}/tx/${hash})`,
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+    } catch (e: any) {
+      await ctx.reply(`❌ Wrap-and-bid failed: ${e?.shortMessage || e?.message || "unknown"}\n\nNo bid was placed. Your HYPE is safe — retry or top up and try again.`);
+    }
+  });
+
   bot.callbackQuery("confirm_nftaccept", async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     const userId = ctx.from?.id;
@@ -3245,8 +3274,20 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
   try {
     const scope = data.tokenId === "0" ? "any token" : `#${data.tokenId}`;
     await ctx.reply(`⏳ Placing ${scope} bid on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
-    const dry = await kalosService.dryRunBid(data.contract, BigInt(data.tokenId), parseEther(data.priceHype), wallet.address as Address);
+    const need = parseEther(data.priceHype);
+    const dry = await kalosService.dryRunBid(data.contract, BigInt(data.tokenId), need, wallet.address as Address);
     if (!dry.ok) {
+      if (dry.code === "NEEDS_WRAP" && dry.shortfall && dry.shortfall > 0n) {
+        const shortStr = kalosService.formatPrice(dry.shortfall);
+        const kb = new InlineKeyboard().text(`🔄 Wrap ${shortStr} HYPE & Bid`, "wrap_and_bid").text("❌ Cancel", "cancel_action");
+        userStates[userId] = { step: "awaiting_offer_wrap_confirm", data: { ...data, expiresAt: Date.now() + 5 * 60_000 } };
+        await ctx.reply(
+          `🔄 *One tap to fix:* you hold 0 WHYPE but need *${data.priceHype} WHYPE* for this bid.\n\n` +
+          `Your HYPE is native — bids escrow in WHYPE. Tap below and I'll wrap *${shortStr} HYPE → WHYPE*, approve Kalos, then place your bid. Small gas applies to the wrap.`,
+          { parse_mode: "Markdown", reply_markup: kb }
+        );
+        return;
+      }
       await ctx.reply(`❌ *Offer would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
       return;
     }

@@ -45,6 +45,13 @@ function kalosAddr(): Address | null { const a = (KALOS_MARKETPLACE_ADDRESS || "
 export function isKalosConfigured(): boolean { return !!kalosAddr(); }
 function publicClient() { const cfg = getChainConfig(ELYSIUM.key); return createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) }); }
 function walletClient(pk: Hex) { const cfg = getChainConfig(ELYSIUM.key); const account = privateKeyToAccount(pk); return createWalletClient({ account, chain: cfg.viemChain, transport: http(cfg.rpcUrl) }); }
+const erc20Abi = [
+  { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "a", type: "address" }], outputs: [{ type: "uint256" }] },
+  { name: "allowance", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }], outputs: [{ type: "uint256" }] },
+  { name: "approve", type: "function", stateMutability: "nonpayable", inputs: [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }], outputs: [{ type: "bool" }] },
+  { name: "deposit", type: "function", stateMutability: "payable", inputs: [], outputs: [] },
+  { name: "withdraw", type: "function", stateMutability: "nonpayable", inputs: [{ name: "amount", type: "uint256" }], outputs: [] },
+] as const;
 const erc721Abi = [
   { name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] },
   { name: "isApprovedForAll", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "operator", type: "address" }], outputs: [{ type: "bool" }] },
@@ -243,6 +250,54 @@ export const kalosService = {
     ]);
     return { symbol: String(symbol ?? "WHYPE"), decimals: Number(decimals ?? 18), raw };
   },
+  /** Wrap native HYPE -> WHYPE (deposit). Returns tx hash. */
+  async wrapHype(privateKey: Hex, amountWei: bigint, payToken?: Address): Promise<Hash> {
+    const token = payToken ?? await this.wnative();
+    const wc = walletClient(privateKey); const pc = publicClient();
+    const hash = await wc.writeContract({ address: token, abi: erc20Abi as any, functionName: "deposit", value: amountWei } as any);
+    await pc.waitForTransactionReceipt({ hash }); return hash;
+  },
+  /** WHYPE allowance of owner -> Kalos marketplace. */
+  async paymentTokenAllowance(owner: Address, payToken: Address): Promise<bigint> {
+    try {
+      const v = await publicClient().readContract({ address: payToken, abi: erc20Abi as any, functionName: "allowance", args: [owner, kalosAddr()!] } as any);
+      return BigInt((v as any) ?? 0);
+    } catch { return 0n; }
+  },
+  /** Approve Kalos to pull WHYPE (max). No-op if allowance already covers need. */
+  async approvePaymentToken(privateKey: Hex, payToken: Address, need?: bigint): Promise<Hash | null> {
+    const account = privateKeyToAccount(privateKey);
+    const allow = await this.paymentTokenAllowance(account.address, payToken);
+    if (need !== undefined && allow >= need) return null;
+    if (need === undefined && allow > 0n) return null;
+    const wc = walletClient(privateKey); const pc = publicClient();
+    const max = (1n << 256n) - 1n;
+    const hash = await wc.writeContract({ address: payToken, abi: erc20Abi as any, functionName: "approve", args: [kalosAddr()!, max] } as any);
+    await pc.waitForTransactionReceipt({ hash }); return hash;
+  },
+  /**
+   * Ensure bidder can cover `need` in WHYPE: wrap native shortfall + approve Kalos.
+   * Keeps a small gas buffer so the wrap doesn't strand the wallet.
+   */
+  async ensureBidFunds(privateKey: Hex, nftAddress: Address, need: bigint): Promise<{ wrapHash: Hash | null; approveHash: Hash | null }> {
+    const account = privateKeyToAccount(privateKey);
+    const payToken = await this.paymentTokenFor(nftAddress);
+    const client = publicClient();
+    const bal = await this.paymentTokenBalance(account.address, nftAddress).catch(() => ({ raw: 0n }));
+    let wrapHash: Hash | null = null;
+    if ((bal as any).raw < need) {
+      const shortfall = need - (bal as any).raw;
+      const native = await client.getBalance({ address: account.address }).catch(() => 0n);
+      const buffer = parseEther("0.005");
+      const spendable = native > buffer ? native - buffer : 0n;
+      if (spendable < shortfall) {
+        throw new Error(`Not enough HYPE to wrap: need ${formatEther(shortfall)} WHYPE but only ${formatEther(spendable)} HYPE is spendable after gas. Top up, then retry.`);
+      }
+      wrapHash = await this.wrapHype(privateKey, shortfall, payToken);
+    }
+    const approveHash = await this.approvePaymentToken(privateKey, payToken, need);
+    return { wrapHash, approveHash };
+  },
   async createTokenBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId);
     if (tid < 0n) throw new Error("Token ID must be 0 (any token) or a positive token ID.");
@@ -256,6 +311,15 @@ export const kalosService = {
     }
     // Collection-pinned payment token (NOT blind wnative): PaymentTokenNotSupported reverts otherwise.
     const payToken = await this.paymentTokenFor(nftAddress);
+    // Auto-wrap native HYPE -> WHYPE shortfall + approve Kalos, so bids "just work".
+    // (dryRunBid surfaces NEEDS_WRAP first, but createTokenBid stays self-sufficient
+    // for any direct callers too.)
+    try {
+      await this.ensureBidFunds(privateKey, nftAddress, price * qty);
+    } catch (e: any) {
+      // ensureBidFunds throws only when even wrapping can't cover it — surface as-is.
+      throw new Error(e?.message || "Insufficient WHYPE and not enough HYPE to wrap.");
+    }
     const wc = walletClient(privateKey); const pc = publicClient();
     const param = { nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: payToken };
     try {
@@ -420,7 +484,7 @@ export const kalosService = {
     }
   },
   /** Gas-free pre-flight for createOrUpdateTokenBids. tokenId 0 = any token (collection-wide). */
-  async dryRunBid(collection: Address, tokenId: bigint, priceWei: bigint, bidder: Address, qty: bigint = 1n): Promise<{ ok: boolean; reason?: string }> {
+  async dryRunBid(collection: Address, tokenId: bigint, priceWei: bigint, bidder: Address, qty: bigint = 1n): Promise<{ ok: boolean; reason?: string; code?: string; need?: bigint; shortfall?: bigint; payToken?: Address }> {
     const now = BigInt(Math.floor(Date.now() / 1000));
     if (priceWei <= 0n) return { ok: false, reason: "Offer price must be above 0." };
     if (tokenId < 0n) return { ok: false, reason: "Token ID must be 0 (any token) or a positive token ID." };
@@ -432,14 +496,24 @@ export const kalosService = {
     }
     // 1) Global + collection gates — these revert before anything else.
     const gates = await this.bidGates(collection).catch(() => ({ bidsActive: true, collectionApproved: true }));
-    if (!gates.bidsActive) return { ok: false, reason: "Bidding is currently disabled on Kalos (areBidsActive = false). Bids cannot land until the marketplace re-enables them." };
-    if (!gates.collectionApproved) return { ok: false, reason: "This collection is not approved for trading on Kalos (collectionApprovals = 0). Only approved collections accept bids/listings." };
+    if (!gates.bidsActive) return { ok: false, code: "BIDS_DISABLED", reason: "Bidding is currently disabled on Kalos (areBidsActive = false). Bids cannot land until the marketplace re-enables them." };
+    if (!gates.collectionApproved) return { ok: false, code: "COLLECTION_NOT_APPROVED", reason: "This collection is not approved for trading on Kalos (collectionApprovals = 0). Only approved collections accept bids/listings." };
     // 2) Bidder must hold the payment token (bids escrow in WHYPE, not native HYPE).
+    //    If WHYPE is short but native HYPE covers it, return NEEDS_WRAP so the
+    //    bot can one-tap wrap + approve instead of hard-failing.
     const payToken = await this.paymentTokenFor(collection);
     const bal = await this.paymentTokenBalance(bidder, collection).catch(() => ({ symbol: "WHYPE", decimals: 18, raw: 0n }));
     const need = priceWei * (qty > 0n ? qty : 1n);
     if (bal.raw < need) {
-      return { ok: false, reason: `Insufficient ${bal.symbol}: you hold ${kalosService.formatPrice(bal.raw)} ${bal.symbol} but this bid needs ${kalosService.formatPrice(need)} ${bal.symbol}. Bids escrow in ${bal.symbol} (payment token ${payToken.slice(0, 10)}…), not native HYPE — wrap/bridge first, then retry.` };
+      const shortfall = need - bal.raw;
+      let nativeBal = 0n;
+      try { nativeBal = await publicClient().getBalance({ address: bidder }); } catch {}
+      const buffer = parseEther("0.005");
+      const spendable = nativeBal > buffer ? nativeBal - buffer : 0n;
+      if (spendable >= shortfall) {
+        return { ok: false, code: "NEEDS_WRAP", need, shortfall, payToken, reason: `Needs wrap: you hold ${kalosService.formatPrice(bal.raw)} WHYPE but this bid needs ${kalosService.formatPrice(need)} WHYPE. You have ${kalosService.formatPrice(nativeBal)} HYPE — wrap ${kalosService.formatPrice(shortfall)} HYPE to cover it.` };
+      }
+      return { ok: false, code: "INSUFFICIENT_WHYPE", need, shortfall, payToken, reason: `Insufficient WHYPE: you hold ${kalosService.formatPrice(bal.raw)} WHYPE but this bid needs ${kalosService.formatPrice(need)} WHYPE. You only have ${kalosService.formatPrice(nativeBal)} native HYPE, so even wrapping can't cover it — top up, then retry. Bids escrow in WHYPE (payment token ${payToken.slice(0, 10)}…), not native HYPE.` };
     }
     const param = { nftAddress: collection, tokenId, quantity: qty, pricePerItem: priceWei, expirationTime: now + 7n * 86400n, paymentToken: payToken };
     try {
