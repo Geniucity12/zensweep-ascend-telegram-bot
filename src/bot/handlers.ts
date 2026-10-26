@@ -1033,17 +1033,14 @@ async function renderWalletMenu(ctx: Context, forceRefresh: boolean = false) {
   let whypeLine = "";
   try {
     const w = await kalosService.whypeBalance(user.wallet_address as Address);
-    whypeLine = `💎 wrapped *Balance:* \`${kalosService.formatPrice(w.raw)} ${w.symbol}\` (bids escrow in this)\n`;
+    whypeLine = `💎 \`${kalosService.formatPrice(w.raw)} ${w.symbol}\`\n`;
   } catch { whypeLine = ""; }
 
   let msg = `🟢 *Your Trading Wallet* — Elysium\n\n`;
   msg += `🌐 *Chain:* \`${chainConfig.name}\`\n`;
   msg += `📫 *Address:* \`${user.wallet_address}\`\n`;
-  msg += `💰 native *Balance:* \`${balance.eth} ${balance.symbol}\`\n`;
-  msg += whypeLine + `\n`;
-  msg += `Bids escrow in *WHYPE*, not native HYPE. Tap 💰 *Wrap HYPE→WHYPE* below (or /wrap 0.1) to convert, 💎 *Unwrap* to go back.\n`;
-  msg += `This is a server-managed wallet; its signing key stays on the bot host.\n`;
-  msg += `*Deposit:* Send native tokens (${balance.symbol}) only if you are comfortable with that custody model. Use Withdraw to move funds out.`;
+  msg += `💰 \`${balance.eth} ${balance.symbol}\`\n`;
+  msg += whypeLine;
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: walletKeyboard });
 }

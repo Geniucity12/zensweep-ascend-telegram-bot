@@ -969,7 +969,7 @@ export const kalosService = {
   async verifyCandidateListings(
     collection: Address,
     candidates: Array<{ tokenId: bigint; seller: Address; price?: bigint; blockNumber?: bigint }>,
-    opts?: { maxPrice?: bigint; limit?: number; concurrency?: number }
+    opts?: { maxPrice?: bigint; limit?: number; concurrency?: number; checkSold?: boolean }
   ): Promise<Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }>> {
     const maxPrice = opts?.maxPrice;
     const limit = opts?.limit ?? 60;
@@ -988,8 +988,31 @@ export const kalosService = {
     const survivors = phase1.filter((x): x is NonNullable<typeof x> => !!x);
     if (survivors.length === 0) return [];
     const client = publicClient();
+    // Optional sold-ghost filter: if an ItemSold for (tokenId, seller) exists
+    // at/after the listing's block, the listing is dead even when getListing
+    // still returns a stale struct. Fetched ONCE per call, not per candidate.
+    let soldKeys = new Set<string>();
+    if (opts?.checkSold) {
+      try {
+        const cur = await client.getBlockNumber().catch(() => 0n);
+        const from = cur > 200_000n ? cur - 200_000n : 0n;
+        const sold = (await client.getContractEvents({
+          address: kalosAddr()!, abi: kalosAbi as any, eventName: "ItemSold",
+          fromBlock: from, toBlock: cur,
+        } as any).catch(() => [])) as any[];
+        for (const l of sold ?? []) {
+          try {
+            const a = (l as any).args as any;
+            if (String(a.nftAddress).toLowerCase() === collection.toLowerCase()) {
+              soldKeys.add(`${BigInt(a.tokenId).toString()}:${String(a.seller).toLowerCase()}`);
+            }
+          } catch {}
+        }
+      } catch { /* best-effort: no sold filter this pass */ }
+    }
     const checked = await mapLimit(survivors, conc, async (s) => {
       try {
+        if (soldKeys.has(`${s.tokenId.toString()}:${s.seller.toLowerCase()}`)) return null;
         const ownerNow = (await client.readContract({
           address: collection, abi: erc721Abi as any,
           functionName: "ownerOf", args: [s.tokenId],
@@ -1044,21 +1067,19 @@ export const kalosService = {
     }
     return out;
   },
-  /**
-   * Cheapest VERIFIED live ask for a collection. Scans recent ItemListed events,
-   * verifies candidates (getListing + ownerOf + expiry), returns the minimum.
-   * Replaces getMinPriceForCollection, which returns 0 on-chain for all collections.
-   * Pass pre-scanned events to share one scan across many collections.
-   */
+  /** Receipt-verified floor: cheapest listing that passes BOTH getListing AND
+   *  an ItemSold check in the same scan window. Sold-then-relisted ghosts and
+   *  stale events that never re-verify are excluded — this is what kills the
+   *  phantom "19 HYPE floor / No active listings" flip-flop. */
   async getVerifiedFloor(
     collection: Address,
     opts?: { blocksBack?: number; candidates?: number; events?: ListedEvent[] }
   ): Promise<bigint | null> {
     const maxCandidates = opts?.candidates ?? 80;
-    const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 50_000 });
+    const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 200_000 });
     const mine = events.filter((e) => e.nftAddress.toLowerCase() === collection.toLowerCase());
     const sorted = this.orderCandidates(mine);
-    const verified = await this.verifyCandidateListings(collection, sorted, { limit: maxCandidates });
+    const verified = await this.verifyCandidateListings(collection, sorted, { limit: maxCandidates, checkSold: true });
     if (verified.length === 0) return null;
     return verified[0].price;
   },
@@ -1072,7 +1093,7 @@ export const kalosService = {
     collections: Address[],
     opts?: { blocksBack?: number; perCollection?: number; events?: ListedEvent[]; concurrency?: number }
   ): Promise<Map<string, { floor: bigint | null; liveCount: number }>> {
-    const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 50_000 });
+    const events = opts?.events ?? await this.scanListedEvents({ blocksBack: opts?.blocksBack ?? 200_000 });
     const perCollection = opts?.perCollection ?? 80;
     const conc = opts?.concurrency ?? 6;
     const out = new Map<string, { floor: bigint | null; liveCount: number }>();
@@ -1129,15 +1150,17 @@ export const kalosService = {
     const maxPrice = opts?.maxPriceEth ? parseEther(opts.maxPriceEth) : undefined;
     const client = publicClient();
     const out: Array<{ tokenId: bigint; seller: Address; price: bigint; expiration: bigint }> = [];
-    // 1) On-chain event discovery: exact tokenIds with listings (properly decoded)
+    // 1) On-chain event discovery: exact tokenIds with listings (properly decoded).
+    //    Same 200k depth as floors — shallow scans are what produced the
+    //    "No active listings while kalos.fun shows a floor" reports.
     try {
-      const events = opts?.events ?? await this.cachedScan({ blocksBack: 50_000 });
+      const events = opts?.events ?? await this.cachedScan({ blocksBack: 200_000 });
       const mine = events.filter((e) => {
         try { return e.nftAddress.toLowerCase() === collection.toLowerCase(); } catch { return false; }
       });
       // Verify: cheapest + most-recent interleaved, getListing first, ownerOf only for survivors
       const cands = this.orderCandidates(mine, { maxPrice });
-      const verified = await this.verifyCandidateListings(collection, cands, { maxPrice, limit: 80 });
+      const verified = await this.verifyCandidateListings(collection, cands, { maxPrice, limit: 80, checkSold: true });
       for (const v of verified) out.push(v);
       if (out.length > 0) {
         return out.slice(0, maxResults);
