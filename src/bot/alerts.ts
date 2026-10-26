@@ -19,6 +19,51 @@ const seenDeploymentTx = new Set<string>();
 const initialized = { value: false };
 /** Last verified floor per collection (lowercase) — floor-drop detection. */
 const lastFloors = new Map<string, bigint>();
+/** Last alerted floor per collection — dedupes restart re-pings of the same floor. */
+const lastAlertedFloor = new Map<string, { floor: bigint; at: number }>();
+/** Collection name cache: names rarely change — avoids hammering the RPC every tick. */
+const alertMetaCache = new Map<string, { name: string; symbol: string; at: number }>();
+const ALERT_META_TTL_MS = 60 * 60_000;
+
+function escAlertMd(s: string): string {
+  return String(s ?? "").replace(/([_*`[])/g, "\\$1");
+}
+
+/** Best-effort on-chain collection name + symbol for alert DMs. Never throws. */
+async function getAlertCollectionMeta(addr: Address): Promise<{ name: string; symbol: string }> {
+  const fallback = `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+  const key = addr.toLowerCase();
+  const cached = alertMetaCache.get(key);
+  if (cached && Date.now() - cached.at < ALERT_META_TTL_MS && cached.name !== fallback) return cached;
+  try {
+    const { createPublicClient, http } = await import("viem");
+    const cfg = getChainConfig(ELYSIUM.key);
+    const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+    const ABI = [
+      { name: "name", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+      { name: "symbol", type: "function", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+    ] as const;
+    let n: string | null = null;
+    let s: string | null = null;
+    for (let attempt = 0; attempt < 2 && (n === null || s === null); attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt));
+      try { n = (await pc.readContract({ address: addr, abi: ABI as any, functionName: "name" } as any).catch(() => null)) as string | null; } catch { /* retry */ }
+      try { s = (await pc.readContract({ address: addr, abi: ABI as any, functionName: "symbol" } as any).catch(() => null)) as string | null; } catch { /* retry */ }
+    }
+    if (typeof n === "string" && n.trim().length > 0) {
+      const meta = { name: n.trim(), symbol: typeof s === "string" ? s.trim() : "" };
+      alertMetaCache.set(key, { ...meta, at: Date.now() });
+      return meta;
+    }
+    if (typeof s === "string" && s.trim().length > 0) {
+      const meta = { name: `${s.trim()} Collection`, symbol: s.trim() };
+      alertMetaCache.set(key, { ...meta, at: Date.now() });
+      return meta;
+    }
+  } catch { /* fall through to fallback */ }
+  if (cached) return { name: cached.name, symbol: cached.symbol };
+  return { name: fallback, symbol: "" };
+}
 
 /** DM only users who have deployment alerts enabled. */
 async function notifyDeployUsers(text: string) {
@@ -75,13 +120,31 @@ async function checkWatchFloors() {
     const prev = lastFloors.get(col);
     lastFloors.set(col, floor);
     if (prev === undefined || floor >= prev) continue; // first sighting or no drop
+    // Noise gate: ignore dips under ~2% (e.g. 22 -> 21.9). Ratchets via
+    // lastFloors above, so a slow bleed still pings once it crosses 2% total.
+    const dropBps = prev > 0n ? Number(((prev - floor) * 10_000n) / prev) : 0;
+    if (dropBps < 200) continue;
+    // Dedup restarts: if we already pinged this exact floor recently, skip.
+    const alerted = lastAlertedFloor.get(col);
+    if (alerted && alerted.floor === floor && Date.now() - alerted.at < 60 * 60_000) continue;
+    lastAlertedFloor.set(col, { floor, at: Date.now() });
+    const meta = await getAlertCollectionMeta(col as Address).catch(() => ({ name: `${col.slice(0, 6)}…${col.slice(-4)}`, symbol: "" }));
+    const title = meta.symbol ? `${meta.name} ($${meta.symbol})` : meta.name;
+    const label = watches.find((w) => (w.address as string).toLowerCase() === col)?.label;
+    const labelLine = label ? `\n👀 *Watch:* ${escAlertMd(label)}` : ``;
     const owners = [...new Set(watches.filter((w) => (w.address as string).toLowerCase() === col).map((w) => w.user_id))];
     for (const uid of owners.slice(0, 50)) {
       try {
+        const kb = new InlineKeyboard()
+          .text(`🧹 Sweep ${meta.symbol ? `$${meta.symbol}` : "floor"} — ${kalosService.formatPrice(floor)}`, `kalos_sweep_${col}`).row()
+          .text(`🤝 Offer`, `kalos_offer_${col}`)
+          .text(`🔍 Inspect`, `col_inspect_${col}`).row()
+          .text(`👀 Watchlist`, `menu_watchlist`)
+          .text(`🔙 Menu`, `menu_main`);
         await bot.api.sendMessage(
           uid,
-          `📉 *Floor drop:* \`${col}\`\n💰 Now \`${kalosService.formatPrice(floor)} HYPE\` (was \`${kalosService.formatPrice(prev)} HYPE\`)\n\n/sweep to grab it, /offer to bid below.`,
-          { parse_mode: "Markdown" }
+          `📉 *Floor drop: ${escAlertMd(title)}*${labelLine}\n\`${col}\`\n💰 Now \`${kalosService.formatPrice(floor)} HYPE\` (was \`${kalosService.formatPrice(prev)} HYPE\`)\n\nTap Sweep to grab it or Offer to bid below.`,
+          { parse_mode: "Markdown", reply_markup: kb }
         );
       } catch {}
     }
