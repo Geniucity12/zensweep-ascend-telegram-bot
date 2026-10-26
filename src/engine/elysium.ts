@@ -291,4 +291,65 @@ export async function getWalletActivity(
   };
 }
 
+/** Recent ERC-721 receives for a wallet: exact (collection, tokenId) pairs.
+ * Scans Transfer events TO the address across known Kalos collections, then
+ * filters to tokens still owned. Bounded + sequential to respect the RPC. */
+export async function getWalletNFTReceives(
+  address: Address,
+  maxResults: number = 25
+): Promise<Array<{ collection: Address; tokenId: bigint; blockNumber?: bigint }>> {
+  const { cfg, client } = clientFor(ELYSIUM.key);
+  const transferEvent = {
+    name: "Transfer", type: "event", stateMutability: "nonpayable",
+    inputs: [
+      { name: "from", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "tokenId", type: "uint256", indexed: true },
+    ],
+  } as const;
+  // Collections to scan: kalos.fun directory first (authoritative list).
+  let collections: Address[] = [];
+  try {
+    const { getIndexDirectory } = await import("./kalos");
+    collections = (await getIndexDirectory()).cols.map((c) => c.address);
+  } catch { collections = []; }
+  const out: Array<{ collection: Address; tokenId: bigint; blockNumber?: bigint }> = [];
+  const seen = new Set<string>();
+  const latest = await client.getBlockNumber().catch(() => 0n);
+  if (latest === 0n) return [];
+  // 200k blocks ≈ 7h on Elysium — covers today's buys; older NFTs come via the
+  // directory ownership probe. Depth is per-collection so one slow collection
+  // can't starve the rest.
+  const blocksBack = 200_000n;
+  const from = latest > blocksBack ? latest - blocksBack : 0n;
+  for (const col of collections) {
+    if (out.length >= maxResults * 2) break;
+    try {
+      const logs = (await client.getContractEvents({
+        address: col, abi: [transferEvent] as any, eventName: "Transfer",
+        args: { to: address }, fromBlock: from, toBlock: latest,
+      } as any).catch(() => [])) as Array<any>;
+      for (const l of logs ?? []) {
+        try {
+          const tid = BigInt((l?.args as any)?.tokenId ?? -1);
+          if (tid < 0n) continue;
+          const k = `${col.toLowerCase()}:${tid.toString()}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push({ collection: col, tokenId: tid, blockNumber: (l as any)?.blockNumber });
+        } catch { /* skip malformed */ }
+      }
+    } catch { /* next collection */ }
+    // Gentle pacing so 27 collections don't 429 the RPC.
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  // Newest first (blockNumber desc) so last buys surface first.
+  out.sort((a, b) => {
+    const ab = a.blockNumber ?? 0n;
+    const bb = b.blockNumber ?? 0n;
+    return ab < bb ? 1 : ab > bb ? -1 : 0;
+  });
+  return out.slice(0, maxResults);
+}
+
 

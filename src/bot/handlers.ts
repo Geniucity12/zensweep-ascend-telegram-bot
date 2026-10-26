@@ -1895,9 +1895,39 @@ async function renderNFTsMenu(ctx: Context) {
   await ctx.reply(`🔍 Scanning your Elysium wallet for NFTs…`, { parse_mode: "Markdown" });
 
   const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
+  // Your last buys first: the wallet's own recent receives pin the exact
+  // collection+tokenIds, so a just-bought NFT shows even when the
+  // directory-order probe hasn't reached that collection yet.
+  const priority: Array<{ collection: Address; tokenId: bigint }> = [];
+  try {
+    const { getWalletNFTReceives } = await import("../engine/elysium");
+    const recents = await getWalletNFTReceives(user.wallet_address as Address, 25).catch(() => []);
+    const seenP = new Set<string>();
+    for (const r of recents) {
+      const k = `${r.collection.toLowerCase()}:${r.tokenId.toString()}`;
+      if (seenP.has(k)) continue;
+      seenP.add(k);
+      try {
+        const { createPublicClient, http } = await import("viem");
+        const cfg = getChainConfig(ELYSIUM.key);
+        const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+        const own = (await pc.readContract({
+          address: r.collection, abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as any,
+          functionName: "ownerOf", args: [r.tokenId],
+        } as any).catch(() => null)) as Address | null;
+        if (own && own.toLowerCase() === (user.wallet_address as string).toLowerCase()) {
+          priority.push({ collection: r.collection, tokenId: r.tokenId });
+        }
+      } catch { /* skip unverifiable */ }
+      if (priority.length >= 12) break;
+    }
+  } catch { /* best-effort: fall through to directory probe */ }
+  for (const p of priority) nfts.push(p);
   try {
     // Indexer-first: every known collection (whatever count kalos.fun lists),
     // then probe ownership. RPC event scan is the fallback (indexer down).
+    // Skip collections already covered by priority (your recent buys).
+    const haveCols = new Set(nfts.map((n) => n.collection.toLowerCase()));
     let discovered: Address[] = [];
     try {
       const { getIndexDirectory } = await import("../engine/kalos");
@@ -1913,7 +1943,9 @@ async function renderNFTsMenu(ctx: Context) {
     }
     // Bound the ownership probe: N collections x tokensOfOwner is the RPC
     // hotspot that starves the bid scan — 12 is enough, FIFO by discovery.
-    for (const col of discovered.slice(0, 12)) {
+    // Priority hits already counted, so probe fewer when we have them.
+    const budget = Math.max(0, 12 - nfts.length);
+    for (const col of discovered.filter((c) => !haveCols.has(c.toLowerCase())).slice(0, budget)) {
       try {
         const ids = await kalosService.tokensOfOwner(col, user.wallet_address as Address, { limit: 10 });
         for (const tid of ids) nfts.push({ collection: col, tokenId: tid });
