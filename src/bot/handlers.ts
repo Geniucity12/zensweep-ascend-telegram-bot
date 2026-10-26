@@ -4291,8 +4291,11 @@ async function renderHelpMenu(ctx: Context) {
   msg += `• \`/nftbuy <0x…> <tokenId> [maxPrice]\` — Buy item on Kalos\n`;
   msg += `• \`/nftlist <0x…> <tokenId> <price> [days]\` — List NFT for sale on Kalos\n`;
   msg += `• \`/nftdelist <0x…> <tokenId>\` — Cancel listing on Kalos\n`;
-  msg += `• \`/nftoffer <0x…> <tokenId> <price> [days]\` — Place bid on Kalos\n`;
+  msg += `• \`/nftoffer <0x…> <tokenId> <price> [days]\` — Place bid on Kalos (or \`/offer\`) — auto-wraps HYPE→WHYPE as needed\n`;
   msg += `• \`/nftaccept <0x…> <tokenId> <bidder>\` — Accept Kalos bid\n`;
+  msg += `• \`/wrap <amount|max>\` / \`/unwrap <amount|max>\` — Convert HYPE ↔ WHYPE (bids escrow in WHYPE)\n`;
+  msg += `• \`/faucet\` — Get testnet HYPE when your wallet is empty\n`;
+  msg += `• \`/sweep <0x…> [maxHYPE]\` — Auto-find cheapest live ask + 1-tap buy\n`;
   msg += `\n*Safety — Zensweep engine*\n`;
   msg += `Pre-buy simulation FROM your wallet (your real amount). Flags honeypot, mint, blacklist, proxy. If it flags a scam, Zensweep blocks or asks you to confirm. No scan can guarantee safety.\n`;
   msg += `\n*Your funds*\n`;
