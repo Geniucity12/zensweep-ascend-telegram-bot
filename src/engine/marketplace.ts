@@ -199,8 +199,9 @@ export const marketplaceService = {
               } catch {}
 
               const count = Number(bal);
-              for (let i = 0; i < Math.min(count, 5); i++) {
-                let tid = String(i + 1);
+              // 1) Enumerable fast path: tokenOfOwnerByIndex gives EXACT ids.
+              const enumIds: string[] = [];
+              for (let i = 0; i < Math.min(count, 25); i++) {
                 try {
                   const onChainTid = await client.readContract({
                     address: colAddr,
@@ -208,15 +209,26 @@ export const marketplaceService = {
                     functionName: "tokenOfOwnerByIndex",
                     args: [address as Address, BigInt(i)],
                   }) as bigint;
-                  tid = onChainTid.toString();
+                  enumIds.push(onChainTid.toString());
                 } catch {
-                  // Not ERC721Enumerable, use sequential index placeholder
+                  break; // not enumerable — fall through to Transfer-event scan
                 }
-                results.push({
-                  title: `${colName} #${tid}`,
-                  contract: colAddr,
-                  tokenId: tid,
-                });
+              }
+              if (enumIds.length > 0) {
+                for (const tid of enumIds.slice(0, 8)) {
+                  results.push({ title: `${colName} #${tid}`, contract: colAddr, tokenId: tid });
+                }
+                continue;
+              }
+              // 2) Non-enumerable fallback: ids from Transfer TO the user minus
+              // Transfers FROM the user, confirmed by ownerOf. No more guessing i+1.
+              try {
+                const owned = await kalosService.tokensOfOwner(colAddr, address as Address, { limit: 8 });
+                for (const tid of owned) {
+                  results.push({ title: `${colName} #${tid.toString()}`, contract: colAddr, tokenId: tid.toString() });
+                }
+              } catch {
+                // leave empty — shown as "No NFTs detected" rather than wrong ids
               }
             }
           } catch {

@@ -74,9 +74,35 @@ export const kalosService = {
     const addr = kalosAddr(); if (!addr) throw new Error("Kalos not configured");
     const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); if (price <= 0n) throw new Error("Price must be > 0");
     const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
+    // 1) You must own the token — otherwise the contract reverts (NotOwningItem).
+    const account = privateKeyToAccount(privateKey);
+    const client = publicClient();
+    const ownerNow = (await client.readContract({
+      address: nftAddress, abi: erc721Abi as any, functionName: "ownerOf", args: [tid],
+    } as any).catch(() => null)) as Address | null;
+    if (!ownerNow) throw new Error(`Token #${tid} does not exist in collection ${nftAddress.slice(0, 10)}… (ownerOf reverted). Check the token ID.`);
+    if (ownerNow.toLowerCase() !== account.address.toLowerCase()) {
+      throw new Error(`You don't own #${tid}: it belongs to ${ownerNow.slice(0, 10)}…, not your wallet ${account.address.slice(0, 10)}…. List only tokens you hold (see /nfts).`);
+    }
     await this.ensureApprovedForAll(privateKey, nftAddress);
+    // 2) List in the marketplace's native quote token (WHYPE), NOT zero address.
+    // Verified on-chain: paymentToken() == wnative() == WHYPE and every live
+    // listing uses it. Zero-address listings revert.
+    const payToken = await this.wnative();
     const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateListings", args: [[{ nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: NATIVE }]] } as any);
+    const param = { nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: payToken };
+    // 3) Gas-free dry-run so a revert never costs gas — decode the contract reason.
+    try {
+      await pc.simulateContract({
+        address: addr, abi: kalosAbi as any, functionName: "createOrUpdateListings",
+        args: [[param]], account: account.address,
+      } as any);
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      throw new Error(`Listing would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+    }
+    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateListings", args: [[param]] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
   async cancelListing(privateKey: Hex, nftAddress: Address, tokenId: string | bigint): Promise<Hash> {
@@ -136,23 +162,59 @@ export const kalosService = {
 
   async createTokenBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
+    const payToken = await this.wnative();
     const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateTokenBids", args: [[{ nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: NATIVE }]] } as any);
+    const param = { nftAddress, tokenId: tid, quantity: qty, pricePerItem: price, expirationTime: exp, paymentToken: payToken };
+    try {
+      await pc.simulateContract({
+        address: addr, abi: kalosAbi as any, functionName: "createOrUpdateTokenBids",
+        args: [[param]], account: privateKeyToAccount(privateKey).address,
+      } as any);
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      throw new Error(`Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+    }
+    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateTokenBids", args: [[param]] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
   async createCollectionBid(privateKey: Hex, nftAddress: Address, pricePerItemEth: string, opts?: { quantity?: number; days?: number }): Promise<Hash> {
     const addr = kalosAddr()!; const qty = BigInt(opts?.quantity ?? 1); const price = parseEther(pricePerItemEth); const exp = BigInt(Math.floor(Date.now()/1000) + (opts?.days ?? 7)*86400);
+    const payToken = await this.wnative();
     const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateCollectionBid", args: [nftAddress, qty, price, exp, NATIVE] } as any);
+    try {
+      await pc.simulateContract({
+        address: addr, abi: kalosAbi as any, functionName: "createOrUpdateCollectionBid",
+        args: [nftAddress, qty, price, exp, payToken], account: privateKeyToAccount(privateKey).address,
+      } as any);
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      throw new Error(`Collection offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+    }
+    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "createOrUpdateCollectionBid", args: [nftAddress, qty, price, exp, payToken] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
   async acceptBid(privateKey: Hex, nftAddress: Address, tokenId: string | bigint, bidder: Address, opts?: { quantity?: number; priceEth?: string }): Promise<Hash> {
     const addr = kalosAddr()!; const tid = BigInt(tokenId); const qty = BigInt(opts?.quantity ?? 1);
     let price = opts?.priceEth ? parseEther(opts.priceEth) : 0n;
-    if (!price) { const client = publicClient(); const bid:any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, tid, bidder] } as any); if (!bid || bid.pricePerItem===0n) throw new Error("Bid not found"); price = bid.pricePerItem; }
+    let payToken: Address | null = null;
+    if (!price) { const client = publicClient(); const bid:any = await client.readContract({ address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [nftAddress, tid, bidder] } as any); if (!bid || bid.pricePerItem===0n) throw new Error("Bid not found"); price = bid.pricePerItem; payToken = (bid.paymentToken ?? null) as Address | null; }
+    if (!payToken) payToken = await this.wnative();
     await this.ensureApprovedForAll(privateKey, nftAddress);
     const wc = walletClient(privateKey); const pc = publicClient();
-    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "acceptBids", args: [[{ bidType: 0, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: NATIVE }]] } as any);
+    const param = { bidType: 0, nftAddress, tokenId: tid, bidder, quantity: qty, pricePerItem: price, paymentToken: payToken };
+    try {
+      await pc.simulateContract({
+        address: addr, abi: kalosAbi as any, functionName: "acceptBids",
+        args: [[param]], account: privateKeyToAccount(privateKey).address,
+      } as any);
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      throw new Error(`Accept would revert${decoded ? ` with ${decoded}` : ""}: ${cause}`);
+    }
+    const hash = await wc.writeContract({ address: addr, abi: kalosAbi as any, functionName: "acceptBids", args: [[param]] } as any);
     await pc.waitForTransactionReceipt({ hash }); return hash;
   },
   formatPrice(bi: bigint): string { return formatEther(bi); },
@@ -208,6 +270,97 @@ export const kalosService = {
       })
     );
     return out;
+  },
+  /** Gas-free pre-flight for createListing: ownership + dry-run simulate. */
+  async dryRunList(
+    collection: Address, tokenId: bigint, owner: Address, priceWei: bigint, expiration: bigint
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const client = publicClient();
+    const ownerNow = (await client.readContract({
+      address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tokenId],
+    } as any).catch(() => null)) as Address | null;
+    if (!ownerNow) return { ok: false, reason: `Token #${tokenId} does not exist in this collection (ownerOf reverted). Check the token ID with /nfts first.` };
+    if (ownerNow.toLowerCase() !== owner.toLowerCase()) {
+      return { ok: false, reason: `You don't own #${tokenId}: it belongs to ${ownerNow.slice(0, 10)}…. List only tokens you hold (see /nfts).` };
+    }
+    const payToken = await this.wnative();
+    const param = { nftAddress: collection, tokenId, quantity: 1n, pricePerItem: priceWei, expirationTime: expiration, paymentToken: payToken };
+    try {
+      await client.simulateContract({
+        address: kalosAddr()!, abi: kalosAbi as any, functionName: "createOrUpdateListings",
+        args: [[param]], account: owner,
+      } as any);
+      return { ok: true };
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      return { ok: false, reason: `Listing would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
+    }
+  },
+  /** Gas-free pre-flight for cancelListing: verifies the caller actually has a listing. */
+  async dryRunCancel(collection: Address, tokenId: bigint, seller: Address): Promise<{ ok: boolean; reason?: string }> {
+    const listing = await this.getListing(collection, tokenId, seller);
+    if (!listing || listing.pricePerItem === 0n) {
+      return { ok: false, reason: `No live listing for #${tokenId} by your wallet — nothing to cancel. It may already be sold, delisted, or listed from a different wallet.` };
+    }
+    const client = publicClient();
+    try {
+      await client.simulateContract({
+        address: kalosAddr()!, abi: kalosAbi as any, functionName: "cancelListings",
+        args: [[{ nftAddress: collection, tokenId }]], account: seller,
+      } as any);
+      return { ok: true };
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      return { ok: false, reason: `Cancel would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
+    }
+  },
+  /** Gas-free pre-flight for createOrUpdateTokenBids. */
+  async dryRunBid(collection: Address, tokenId: bigint, priceWei: bigint, bidder: Address, qty: bigint = 1n): Promise<{ ok: boolean; reason?: string }> {
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    if (priceWei <= 0n) return { ok: false, reason: "Offer price must be above 0." };
+    const payToken = await this.wnative();
+    const param = { nftAddress: collection, tokenId, quantity: qty, pricePerItem: priceWei, expirationTime: now + 7n * 86400n, paymentToken: payToken };
+    try {
+      await publicClient().simulateContract({
+        address: kalosAddr()!, abi: kalosAbi as any, functionName: "createOrUpdateTokenBids",
+        args: [[param]], account: bidder,
+      } as any);
+      return { ok: true };
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      return { ok: false, reason: `Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
+    }
+  },
+  /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token. */
+  async dryRunAccept(collection: Address, tokenId: bigint, bidder: Address, seller: Address): Promise<{ ok: boolean; reason?: string }> {
+    const client = publicClient();
+    const bid: any = await client.readContract({
+      address: kalosAddr()!, abi: kalosAbi as any, functionName: "getTokenBid", args: [collection, tokenId, bidder],
+    } as any).catch(() => null);
+    if (!bid || bid.pricePerItem === 0n) {
+      return { ok: false, reason: `No live bid on #${tokenId} from ${bidder.slice(0, 10)}…. It may have been cancelled or already accepted.` };
+    }
+    const ownerNow = (await client.readContract({
+      address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tokenId],
+    } as any).catch(() => null)) as Address | null;
+    if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) {
+      return { ok: false, reason: `You don't own #${tokenId} right now — only the current owner can accept bids.` };
+    }
+    const param = { bidType: 0, nftAddress: collection, tokenId, bidder, quantity: 1n, pricePerItem: bid.pricePerItem as bigint, paymentToken: (bid.paymentToken ?? await this.wnative()) as Address };
+    try {
+      await client.simulateContract({
+        address: kalosAddr()!, abi: kalosAbi as any, functionName: "acceptBids",
+        args: [[param]], account: seller,
+      } as any);
+      return { ok: true };
+    } catch (e: any) {
+      const decoded = this.decodeContractError(e);
+      const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
+      return { ok: false, reason: `Accept would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
+    }
   },
   /** List token IDs owned by `owner` in an ERC-721 collection (enumerable fast path + event fallback). */
   async tokensOfOwner(collection: Address, owner: Address, opts?: { maxScan?: number; limit?: number }): Promise<bigint[]> {
@@ -300,8 +453,8 @@ export const kalosService = {
       return listing.pricePerItem;
     } catch { return null; }
   },
-  /** Decode the contract's custom error from a reverted buy simulation. Returns e.g. "NotListed()" or null. */
-  decodeBuyError(err: any): string | null {
+  /** Decode ANY Kalos custom error from a reverted call (buy, list, bid, accept…). */
+  decodeContractError(err: any): string | null {
     try {
       const data = err?.cause?.data ?? err?.data;
       if (!data || data === "0x") return null;
@@ -310,6 +463,10 @@ export const kalosService = {
       const args = (dec.args ?? []).map((a) => (typeof a === "bigint" ? a.toString() : String(a))).join(", ");
       return `${dec.errorName}(${args})`;
     } catch { return null; }
+  },
+  /** Verify a batch of (tokenId, seller) candidates for one collection (verifyListing single-check above is the per-item version). */
+  decodeBuyError(err: any): string | null {
+    return this.decodeContractError(err);
   },
   /**
    * Dry-run a buy against the CURRENT chain state without spending gas.

@@ -2243,13 +2243,11 @@ async function renderNFTsMenu(ctx: Context) {
   }
 
   const kb = new InlineKeyboard();
-  if (nfts.length > 0) {
-    const first = nfts[0];
-    kb.text(`🏷️ List #${first.tokenId}`, `kalos_list_${first.contract}_${first.tokenId}`)
-      .text(`🤝 Offer #${first.tokenId}`, `kalos_offer_${first.contract}_${first.tokenId}`).row();
+  for (const nft of nfts.slice(0, 8)) {
+    kb.text(`🏷️ List ${nft.title}`, `kalos_list_${nft.contract}_${nft.tokenId}`).row();
   }
-  if (activeListings.length > 0) {
-    kb.text(`❌ Cancel Listing #${activeListings[0].id}`, `listing_cancel_${activeListings[0].id}`).row();
+  for (const l of activeListings.slice(0, 4)) {
+    kb.text(`❌ Cancel ${l.contract.slice(0, 6)}… #${l.token_id}`, `listing_cancel_${l.id}`).row();
   }
   kb.text("⚡ Direct Mint", "menu_mint")
     .text("🏷️ Collections", "menu_collections").row()
@@ -2689,6 +2687,14 @@ async function executeNftList(ctx: Context, data: { contract: Address; tokenId: 
   if (!wallet) { await ctx.reply("No wallet found."); return; }
 
   try {
+    await ctx.reply(`⏳ Checking #${data.tokenId} on Kalos…`, { parse_mode: "Markdown" });
+    const { parseEther: parseEtherList } = await import("viem");
+    const expList = BigInt(Math.floor(Date.now() / 1000) + (data.days ?? 7) * 86400);
+    const dryList = await kalosService.dryRunList(data.contract, BigInt(data.tokenId), wallet.address as Address, parseEtherList(data.priceHype), expList);
+    if (!dryList.ok) {
+      await ctx.reply(`❌ *Listing would fail — no gas spent.*\n\n${dryList.reason}`, { parse_mode: "Markdown" });
+      return;
+    }
     await ctx.reply(`⏳ Approving & creating listing on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
     const hash = await kalosService.createListing(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
     const localId = dbService.createListing(userId, ELYSIUM.key, data.contract, data.tokenId, Number(data.priceHype), hash, null);
@@ -2704,7 +2710,9 @@ async function executeNftList(ctx: Context, data: { contract: Address; tokenId: 
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (err: any) {
-    await ctx.reply(`❌ Listing failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+    const decoded = kalosService.decodeContractError(err);
+    const detail = decoded ? `Contract error: \`${decoded}\`` : (err?.shortMessage || err?.message || "Reverted");
+    await ctx.reply(`❌ Listing failed: ${detail}\n\nTip: check /nfts — it now shows your EXACT token IDs. List only a token you hold.`);
   }
 }
 
@@ -2763,6 +2771,11 @@ async function executeNftDelist(ctx: Context, data: { contract: Address; tokenId
 
   try {
     await ctx.reply(`⏳ Cancelling listing on Kalos...`, { parse_mode: "Markdown" });
+    const dry = await kalosService.dryRunCancel(data.contract, BigInt(data.tokenId), wallet.address as Address);
+    if (!dry.ok) {
+      await ctx.reply(`❌ *Cancel would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
+      return;
+    }
     const hash = await kalosService.cancelListing(wallet.privateKey, data.contract, data.tokenId);
     if (data.listingId) {
       dbService.delist(data.listingId, userId);
@@ -2774,7 +2787,9 @@ async function executeNftDelist(ctx: Context, data: { contract: Address; tokenId
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (err: any) {
-    await ctx.reply(`❌ Delisting failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+    const decoded = kalosService.decodeContractError(err);
+    const detail = decoded ? `Contract error: \`${decoded}\`` : (err?.shortMessage || err?.message || "Reverted");
+    await ctx.reply(`❌ Delisting failed: ${detail}`);
   }
 }
 
@@ -2833,6 +2848,11 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
 
   try {
     await ctx.reply(`⏳ Placing token bid on Kalos for *${data.priceHype} HYPE*...`, { parse_mode: "Markdown" });
+    const dry = await kalosService.dryRunBid(data.contract, BigInt(data.tokenId), parseEther(data.priceHype), wallet.address as Address);
+    if (!dry.ok) {
+      await ctx.reply(`❌ *Offer would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
+      return;
+    }
     const hash = await kalosService.createTokenBid(wallet.privateKey, data.contract, data.tokenId, data.priceHype, { days: data.days });
     const cfg = getChainConfig(ELYSIUM.key);
     await ctx.reply(
@@ -2844,7 +2864,9 @@ async function executeNftOffer(ctx: Context, data: { contract: Address; tokenId:
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (err: any) {
-    await ctx.reply(`❌ Offer failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+    const decoded = kalosService.decodeContractError(err);
+    const detail = decoded ? `Contract error: \`${decoded}\`` : (err?.shortMessage || err?.message || "Reverted");
+    await ctx.reply(`❌ Offer failed: ${detail}`);
   }
 }
 
@@ -2903,6 +2925,11 @@ async function executeNftAccept(ctx: Context, data: { contract: Address; tokenId
 
   try {
     await ctx.reply(`⏳ Accepting bid and executing transfer on Kalos...`, { parse_mode: "Markdown" });
+    const dry = await kalosService.dryRunAccept(data.contract, BigInt(data.tokenId), data.bidder, wallet.address as Address);
+    if (!dry.ok) {
+      await ctx.reply(`❌ *Accept would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
+      return;
+    }
     const hash = await kalosService.acceptBid(wallet.privateKey, data.contract, data.tokenId, data.bidder, { priceEth: data.priceHype });
     const cfg = getChainConfig(ELYSIUM.key);
     dbService.recordTrade(userId, ELYSIUM.key, data.contract, data.tokenId, Number(data.priceHype || "0"), hash, "sell");
@@ -2912,7 +2939,9 @@ async function executeNftAccept(ctx: Context, data: { contract: Address; tokenId
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   } catch (err: any) {
-    await ctx.reply(`❌ Accept failed: ${err?.shortMessage || err?.message || "Reverted"}`);
+    const decoded = kalosService.decodeContractError(err);
+    const detail = decoded ? `Contract error: \`${decoded}\`` : (err?.shortMessage || err?.message || "Reverted");
+    await ctx.reply(`❌ Accept failed: ${detail}`);
   }
 }
 
