@@ -1085,6 +1085,34 @@ export function registerHandlers(bot: Bot) {
       return;
     }
 
+    if (state?.step === "awaiting_nftlist_price") {
+      const data0 = state.data ?? {};
+      if (!data0.contract || !data0.tokenId || Date.now() > (data0.expiresAt ?? 0)) {
+        delete userStates[userId];
+        await ctx.reply("Listing session expired. Tap 🏷️ List on the NFT card again.");
+        return;
+      }
+      delete userStates[userId];
+      const p = text.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 0 || !/^\d+(?:\.\d{1,18})?$/.test(p[0] ?? "") || Number(p[0]) <= 0) {
+        await ctx.reply("Send just the price, e.g. `0.55`, optionally followed by days: `0.55 3`", { parse_mode: "Markdown" });
+        userStates[userId] = { step: "awaiting_nftlist_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+        return;
+      }
+      let days = 7;
+      if (p[1] !== undefined) {
+        const d = Number(p[1]);
+        if (!Number.isInteger(d) || d < 1 || d > 30) {
+          await ctx.reply("Duration must be 1–30 days. Try again, e.g. `0.55 3`.");
+          userStates[userId] = { step: "awaiting_nftlist_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+          return;
+        }
+        days = d;
+      }
+      await promptNftList(ctx, `${data0.contract} ${data0.tokenId} ${p[0]} ${days}`);
+      return;
+    }
+
     if (state?.step === "awaiting_nftbuy_params") {
       delete userStates[userId];
       await promptNftBuy(ctx, text);
@@ -2796,11 +2824,23 @@ async function promptNftList(ctx: Context, raw?: string) {
   }
 
   const parts = (raw || "").trim().split(/\s+/).filter(Boolean);
-  if (parts.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(parts[0]) && /^\d+$/.test(parts[1]) && /^\d+(?:\.\d{1,18})?$/.test(parts[2])) {
-    const contract = parts[0] as Address;
-    const tokenId = parts[1];
-    const priceHype = parts[2];
-    const days = parts[3] ? Number(parts[3]) : 7;
+  if (parts.length === 2 && /^0x[a-fA-F0-9]{40}$/.test(parts[0] as string) && /^\d+$/.test(parts[1] as string)) {
+    const preContract = parts[0] as Address;
+    const preTokenId = parts[1];
+    userStates[userId] = { step: "awaiting_nftlist_price", data: { contract: preContract, tokenId: preTokenId, expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(
+      `🏷 *List #${preTokenId} on Kalos*\n\nReply with price + optional days:\n\n\`<price_hype> [days]\`\n\n*Examples:*\n\`0.55\` — list at 0.55 HYPE for 7 days\n\`0.55 3\` — list at 0.55 HYPE for 3 days`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+  // (two-part prefill handled above)
+  const partsFull = (raw || "").trim().split(/\s+/).filter(Boolean);
+  if (partsFull.length >= 3 && /^0x[a-fA-F0-9]{40}$/.test(partsFull[0]) && /^\d+$/.test(partsFull[1]) && /^\d+(?:\.\d{1,18})?$/.test(partsFull[2])) {
+    const contract = partsFull[0] as Address;
+    const tokenId = partsFull[1];
+    const priceHype = partsFull[2];
+    const days = partsFull[3] ? Number(partsFull[3]) : 7;
 
     userStates[userId] = {
       step: "awaiting_nftlist_confirmation",
