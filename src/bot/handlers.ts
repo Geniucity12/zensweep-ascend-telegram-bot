@@ -18,6 +18,26 @@ function escMd(input: string): string {
   return String(input ?? "").replace(/([_*`[])/g, "\\$1");
 }
 
+/** Escape dynamic ERROR/reason text before embedding in a Markdown message.
+ * viem shortMessages contain raw `*` (e.g. "gas * gas fee"), backticks and
+ * brackets — one unescaped char kills the whole send with "can't parse
+ * entities" and the user sees the crash instead of the message. */
+function escErr(input: unknown): string {
+  return String(input ?? "").replace(/\\/g, "\\\\").replace(/([_*`[\]])/g, "\\$1");
+}
+
+/** Reply with Markdown; if Telegram rejects the entities (dynamic text),
+ * retry as plain text with formatting stripped. Never throws. */
+async function safeReply(ctx: Context, text: string, extra?: Record<string, unknown>): Promise<void> {
+  try {
+    await ctx.reply(text, { parse_mode: "Markdown", ...(extra ?? {}) } as any);
+  } catch {
+    try {
+      await ctx.reply(text.replace(/[*_`[\]]/g, ""), { ...(extra ?? {}) } as any);
+    } catch { /* give up silently — never crash a flow on a send */ }
+  }
+}
+
 // Collection metadata cache: names rarely change — avoid re-hammering the RPC every menu open.
 const collectionMetaCache = new Map<string, { name: string; symbol: string; at: number }>();
 const COLLECTION_META_TTL_MS = 10 * 60_000;
@@ -2147,9 +2167,9 @@ async function executeSweepBuy(ctx: Context, contract: Address, items: Array<{ t
     const first = take[0];
     const dry = await kalosService.dryRunBuy(contract, BigInt(first.tokenId), first.seller as Address, wallet.address as Address, 1n);
     if (!dry.ok) {
-      await ctx.reply(
-        `❌ *Sweep would fail — no gas spent.*\n\n${dry.reason}\n\nTap 🧹 Re-scan floor and try again.`,
-        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      await safeReply(ctx,
+        `❌ *Sweep would fail — no gas spent.*\n\n${escErr(dry.reason)}\n\nTap 🧹 Re-scan floor and try again.`,
+        { reply_markup: mainKeyboard }
       );
       return;
     }
@@ -2167,8 +2187,8 @@ async function executeSweepBuy(ctx: Context, contract: Address, items: Array<{ t
     );
   } catch (e: any) {
     const decoded = kalosService.decodeBuyError(e);
-    const detail = decoded ? `Contract error: \`${decoded}\`` : (e?.shortMessage ?? e?.message ?? "unknown");
-    await ctx.reply(`❌ Sweep failed: ${detail}\n\nListings may have sold. Tap 🧹 Re-scan floor and try again.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+    const detail = decoded ? `Contract error: \`${escErr(decoded)}\`` : escErr(e?.shortMessage ?? e?.message ?? "unknown");
+    await safeReply(ctx, `❌ Sweep failed: ${detail}\n\nListings may have sold. Tap 🧹 Re-scan floor and try again.`, { reply_markup: mainKeyboard });
   }
 }
 
@@ -2195,12 +2215,25 @@ async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId:
     // user the decoded contract reason instead of spending gas on a failure.
     const dry = await kalosService.dryRunBuy(data.collection, BigInt(data.tokenId), data.owner, wallet.address as Address, 1n);
     if (!dry.ok) {
-      await ctx.reply(
-        `❌ *Buy would fail — no gas spent.*\n\n${dry.reason}\n\nTap 🧹 Re-scan floor for a live listing.`,
-        { parse_mode: "Markdown", reply_markup: makeCollectionKeyboard(data.collection) }
+      await safeReply(ctx,
+        `❌ *Buy would fail — no gas spent.*\n\n${escErr(dry.reason)}\n\nTap 🧹 Re-scan floor for a live listing.`,
+        { reply_markup: makeCollectionKeyboard(data.collection) }
       );
       return;
     }
+    // Balance gate: show a clean insufficient-funds message BEFORE writing.
+    try {
+      const { createPublicClient: cpc, http: chttp, formatEther: cfmt } = await import("viem");
+      const pc2 = cpc({ chain: getChainConfig(ELYSIUM.key).viemChain, transport: chttp(getChainConfig(ELYSIUM.key).rpcUrl) });
+      const bal = await pc2.getBalance({ address: wallet.address as Address }).catch(() => 0n);
+      if (bal < listing.pricePerItem) {
+        await safeReply(ctx,
+          `💸 *Not enough HYPE for this buy.*\n\nListing: \`${escErr(livePrice)} HYPE\`\nYour balance: \`${escErr(cfmt(bal))} HYPE\`\n\nTop up via 💧 Get Testnet HYPE in /wallet, or sweep a cheaper collection.`,
+          { reply_markup: mainKeyboard }
+        );
+        return;
+      }
+    } catch { /* best-effort: buy() will surface the real revert */ }
     await ctx.reply(`⏳ Purchasing #${data.tokenId} on Kalos for ~${livePrice} HYPE…`, { parse_mode: "Markdown" });
     const hash = await kalosService.buy(wallet.privateKey, data.collection, data.tokenId, data.owner, {
       maxPriceEth: data.maxPriceHype,
@@ -2216,8 +2249,8 @@ async function executeNftBuy(ctx: Context, data: { collection: Address; tokenId:
     );
   } catch (err: any) {
     const decoded = kalosService.decodeBuyError(err);
-    const detail = decoded ? `Contract error: \`${decoded}\`` : (err?.shortMessage || err?.message || "Contract reverted");
-    await ctx.reply(`❌ Buy failed: ${detail}`);
+    const raw = decoded ? `Contract error: \`${escErr(decoded)}\`` : escErr(err?.shortMessage || err?.message || "Contract reverted");
+    await safeReply(ctx, `❌ Buy failed: ${raw}`);
   }
 }
 
