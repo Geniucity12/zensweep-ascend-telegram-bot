@@ -581,11 +581,32 @@ export function registerHandlers(bot: Bot) {
     await promptNftDelist(ctx, `${ctx.match[1]} ${ctx.match[2]}`);
   });
 
-  bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
+  // Collection-level Offer tap = "I want to bid on THIS collection":
+  // ask ONLY for token ID, then price — contract rides along from the card.
+  bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    userStates[userId] = { step: "awaiting_offer_tokenid", data: { contract: ctx.match[1] as Address, expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(
+      `🤝 *Make an Offer on this collection*\n\nReply with the token ID + your bid:\n\n\`<tokenId> <priceHYPE> [days]\`\n\n*Example:*\n\`6187 0.5\` — bid 0.5 HYPE on #6187\n\`6187 0.5 3\` — bid 0.5 HYPE, 3-day expiry`,
+      { parse_mode: "Markdown" }
+    );
+  });
+
+  bot.callbackQuery(/^kalos_offer_(0x[a-fA-F0-9]{40})_(\d+)$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     const col = ctx.match[1] as Address;
     const tid = ctx.match[2];
-    await promptNftOffer(ctx, tid ? `${col} ${tid}` : col);
+    const userId = ctx.from?.id;
+    if (!userId) return;
+    // Token-level Offer tap (from sweep results / NFT cards): contract + token
+    // known, only price + days still needed — mirror the List flow.
+    userStates[userId] = { step: "awaiting_offer_price", data: { contract: col, tokenId: tid, expiresAt: Date.now() + 5 * 60_000 } };
+    await ctx.reply(
+      `🤝 *Offer on #${tid}*\n\nReply with your bid + optional days:\n\n\`<price_hype> [days]\`\n\n*Examples:*\n\`0.5\` — bid 0.5 HYPE for 7 days\n\`0.5 3\` — bid 0.5 HYPE for 3 days`,
+      { parse_mode: "Markdown" }
+    );
   });
   bot.callbackQuery(/^kalos_sweep_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
@@ -1110,6 +1131,76 @@ export function registerHandlers(bot: Bot) {
         days = d;
       }
       await promptNftList(ctx, `${data0.contract} ${data0.tokenId} ${p[0]} ${days}`);
+      return;
+    }
+
+    if (state?.step === "awaiting_offer_tokenid") {
+      const data0 = state.data ?? {};
+      if (!data0.contract || Date.now() > (data0.expiresAt ?? 0)) {
+        delete userStates[userId];
+        await ctx.reply("Offer session expired. Tap 🤝 Offer on the collection card again.");
+        return;
+      }
+      delete userStates[userId];
+      const p = text.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 0 || !/^\d+$/.test(p[0] ?? "")) {
+        await ctx.reply("Send just the token ID first, e.g. `6187` — or with your bid: `6187 0.5`", { parse_mode: "Markdown" });
+        userStates[userId] = { step: "awaiting_offer_tokenid", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+        return;
+      }
+      const tid = p[0];
+      if (p.length === 1) {
+        userStates[userId] = { step: "awaiting_offer_price", data: { contract: data0.contract, tokenId: tid, expiresAt: Date.now() + 5 * 60_000 } };
+        await ctx.reply(
+          `🤝 *Offer on #${tid}*\n\nReply with your bid + optional days:\n\n\`<price_hype> [days]\`\n\n*Example:* \`0.5 3\` — bid 0.5 HYPE for 3 days`,
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+      if (!/^\d+(?:\.\d{1,18})?$/.test(p[1] ?? "") || Number(p[1]) <= 0) {
+        await ctx.reply("Bid must be a positive HYPE amount, e.g. `6187 0.5`. Try again.");
+        userStates[userId] = { step: "awaiting_offer_tokenid", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+        return;
+      }
+      let days = 7;
+      if (p[2] !== undefined) {
+        const d = Number(p[2]);
+        if (!Number.isInteger(d) || d < 1 || d > 30) {
+          await ctx.reply("Duration must be 1–30 days. Try again, e.g. `6187 0.5 3`.");
+          userStates[userId] = { step: "awaiting_offer_tokenid", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+          return;
+        }
+        days = d;
+      }
+      await promptNftOffer(ctx, `${data0.contract} ${tid} ${p[1]} ${days}`);
+      return;
+    }
+
+    if (state?.step === "awaiting_offer_price") {
+      const data0 = state.data ?? {};
+      if (!data0.contract || !data0.tokenId || Date.now() > (data0.expiresAt ?? 0)) {
+        delete userStates[userId];
+        await ctx.reply("Offer session expired. Tap 🤝 Offer on the token card again.");
+        return;
+      }
+      delete userStates[userId];
+      const p = text.trim().split(/\s+/).filter(Boolean);
+      if (p.length === 0 || !/^\d+(?:\.\d{1,18})?$/.test(p[0] ?? "") || Number(p[0]) <= 0) {
+        await ctx.reply("Send just the bid, e.g. `0.5`, optionally followed by days: `0.5 3`", { parse_mode: "Markdown" });
+        userStates[userId] = { step: "awaiting_offer_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+        return;
+      }
+      let days = 7;
+      if (p[1] !== undefined) {
+        const d = Number(p[1]);
+        if (!Number.isInteger(d) || d < 1 || d > 30) {
+          await ctx.reply("Duration must be 1–30 days. Try again, e.g. `0.5 3`.");
+          userStates[userId] = { step: "awaiting_offer_price", data: { ...data0, expiresAt: Date.now() + 5 * 60_000 } };
+          return;
+        }
+        days = d;
+      }
+      await promptNftOffer(ctx, `${data0.contract} ${data0.tokenId} ${p[0]} ${days}`);
       return;
     }
 
@@ -2068,6 +2159,21 @@ async function renderCollectionsMenu(ctx: Context) {
   const buildMenuKeyboard = (): InlineKeyboard => new InlineKeyboard();
   void buildMenuText;
   void buildMenuKeyboard;
+  /** Phase-2 MUST overwrite the floor line even when an edit partially fails:
+   * verified floors replace estimates, dead rows explicitly say so. */
+  function applyVerifiedFloor(r: (typeof rows)[number], f: { floor: bigint | null; liveCount: number } | undefined) {
+    if (f?.floor && f.floor > 0n) {
+      r.floorWei = f.floor;
+      r.floorStr = `${kalosService.formatPrice(f.floor)} HYPE`;
+      r.count = f.liveCount;
+    } else {
+      r.floorWei = null;
+      r.floorStr = "No active listings";
+      r.count = 0;
+    }
+    r.unverified = false;
+    r.tag = undefined;
+  }
   /** Tag one collection's card so phase-2 edits hit the RIGHT message. */
   const COLLECTION_CARD_TAG = "kalos_collection_card";
   function collectionCardTag(r: { address: Address }): string {
@@ -2181,29 +2287,26 @@ async function renderCollectionsMenu(ctx: Context) {
       floors = await kalosService.getCollectionFloors(nameRows.map((r) => r.address), { events: sharedEvents, perCollection: 80 });
     } catch { floors = new Map(); }
     for (const r of rows) {
-      const f = floors.get(r.address.toLowerCase());
-      if (f?.floor && f.floor > 0n) {
-        r.floorWei = f.floor;
-        r.floorStr = `${kalosService.formatPrice(f.floor)} HYPE`;
-        r.count = f.liveCount;
-        r.unverified = false;
-      } else {
-        r.floorWei = null;
-        r.floorStr = "No active listings";
-        r.count = 0;
-        r.unverified = false;
-      }
+      applyVerifiedFloor(r, floors.get(r.address.toLowerCase()));
       const lf = launchFloors.get(r.address.toLowerCase());
       if (lf && lf !== "—") launchFloors.set(r.address.toLowerCase(), r.floorStr);
     }
     sortRows();
     // Edit each card IN PLACE (same message ids) — the chat never gets a second dump.
+    // Retry once per card: a single failed edit must not leave a stale ⏳ estimate.
     if (rows.length > 0 && ctx.chat) {
       for (const r of rows) {
         const msgId = phase1CardIds.get(r.address.toLowerCase());
         if (!msgId) continue;
         const kb = collectionCardKeyboard(r);
-        await editCollectionCard(ctx.chat.id, msgId, r, kb);
+        try {
+          await editCollectionCard(ctx.chat.id, msgId, r, kb);
+        } catch {
+          try {
+            await new Promise((res) => setTimeout(res, 800));
+            await editCollectionCard(ctx.chat.id, msgId, r, kb);
+          } catch {}
+        }
       }
       try {
         if (headerMsgId) {
@@ -2374,13 +2477,17 @@ async function renderNFTsMenu(ctx: Context) {
             `*Wallet:* \`${user.wallet_address}\`\n\n`;
 
   // Incoming live offers on YOUR tokens (verified via getTokenBid + ownership).
+  // Shows a checking line first so "none right now" only appears AFTER a real scan.
   let incomingBids: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
+  let bidsScanned = false;
+  await ctx.reply(`🤝 Checking live offers on your NFTs…`, { parse_mode: "Markdown" }).catch(() => null);
   try {
     const myTokens = nfts.slice(0, 12).map((n) => ({ collection: n.contract as Address, tokenId: BigInt(n.tokenId) }));
     if (myTokens.length > 0) {
       incomingBids = await kalosService.getIncomingBids(myTokens, user.wallet_address as Address, { perToken: 4 });
     }
-  } catch { incomingBids = []; }
+    bidsScanned = true;
+  } catch { incomingBids = []; bidsScanned = true; }
 
    // ONE card per NFT: List + Accept-Offer / Make-Offer on the card itself.
   // No giant shared wall — each token carries its own actions. If the card
@@ -2390,9 +2497,11 @@ async function renderNFTsMenu(ctx: Context) {
       (b) => b.collection.toLowerCase() === String(nft.contract).toLowerCase() && b.tokenId.toString() === String(nft.tokenId)
     );
     const best = nftBids.length > 0 ? nftBids[0] : null;
-    const offerLine = best
-      ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\``
-      : `\n🤝 *Offers:* \`none right now\``;
+    const offerLine = !bidsScanned
+      ? `\n🤝 *Offers:* \`checking…\``
+      : best
+        ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\``
+        : `\n🤝 *Offers:* \`none right now\``;
     const extraLine = nftBids.length > 1 ? ` (+${nftBids.length - 1} more)` : "";
     const text = `🖼️ *${escMd(nft.title)}*\n\`${nft.contract}\` • Token \`#${escMd(String(nft.tokenId))}\`${offerLine}${extraLine}`;
     const cardKb = (() => {

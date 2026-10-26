@@ -594,7 +594,9 @@ export const kalosService = {
   decodeBuyError(err: any): string | null {
     return this.decodeContractError(err);
   },
-  /** Live token bids ON your tokens: who offered what, verified against getTokenBid. */
+  /** Live token bids ON your tokens: who offered what, verified against getTokenBid.
+   * Hardened: tolerant getTokenBid decoding (named OR ANY positional slot),
+   * ownerOf gate, chunked event scan so one RPC failure can't blank everything. */
   async getIncomingBids(
     tokens: Array<{ collection: Address; tokenId: bigint }>,
     owner: Address,
@@ -605,14 +607,31 @@ export const kalosService = {
     const client = publicClient();
     const out: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint }> = [];
     const latest = await client.getBlockNumber().catch(() => 0n);
-    const from = latest > 200_000n ? latest - 200_000n : 0n;
+    if (latest === 0n) return [];
+    // Chunk the bid-event scan (2 x 100k) so a single range-limit error
+    // can't wipe out all bid visibility.
+    const spans: Array<{ from: bigint; to: bigint }> = [];
+    {
+      let e = latest;
+      while (e > 0n && spans.length < 3) {
+        const s = e > 100_000n ? e - 100_000n : 0n;
+        spans.push({ from: s, to: e });
+        if (s === 0n) break;
+        e = s - 1n;
+      }
+    }
     let bidLogs: any[] = [];
-    try {
-      bidLogs = (await client.getContractEvents({
-        address: addr, abi: kalosAbi as any, eventName: "TokenBidCreatedOrUpdated",
-        fromBlock: from, toBlock: latest,
-      } as any).catch(() => [])) as any[];
-    } catch { return []; }
+    for (const sp of spans) {
+      try {
+        const part = (await client.getContractEvents({
+          address: addr, abi: kalosAbi as any, eventName: "TokenBidCreatedOrUpdated",
+          fromBlock: sp.from, toBlock: sp.to,
+        } as any).catch(() => [])) as any[];
+        bidLogs = bidLogs.concat(part ?? []);
+        if (bidLogs.length >= 500) break; // enough signal
+      } catch { /* next chunk */ }
+    }
+    if (bidLogs.length === 0) return [];
     // bidder+token -> newest event wins
     const seen = new Map<string, { collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; bn: bigint }>();
     for (const l of bidLogs) {
@@ -644,13 +663,22 @@ export const kalosService = {
           address: addr, abi: kalosAbi as any, functionName: "getTokenBid",
           args: [c.collection, c.tokenId, c.bidder],
         } as any).catch(() => null);
-        const livePrice = BigInt(live?.pricePerItem ?? live?.[1] ?? 0);
+        if (!live) return null;
+        // Tolerant decode: named fields OR any positional slot, any reasonable order.
+        const pickBig = (...vals: any[]): bigint => {
+          for (const v of vals) {
+            try { const b = BigInt(v ?? -1); if (b > 0n) return b; } catch {}
+          }
+          return 0n;
+        };
+        const livePrice = pickBig(live?.pricePerItem, live?.[4], live?.[1], live?.price, live?.amount);
         if (livePrice <= 0n) return null;
+        const liveExp = pickBig(live?.expirationTime, live?.[5], live?.[2], live?.expiration, live?.expiry);
         const ownerNow = (await client.readContract({
           address: c.collection, abi: erc721Abi as any, functionName: "ownerOf", args: [c.tokenId],
         } as any).catch(() => null)) as Address | null;
         if (!ownerNow || ownerNow.toLowerCase() !== owner.toLowerCase()) return null;
-        return { collection: c.collection, tokenId: c.tokenId, bidder: c.bidder, price: livePrice, expiration: BigInt(live?.expirationTime ?? live?.[2] ?? c.expiration) };
+        return { collection: c.collection, tokenId: c.tokenId, bidder: c.bidder, price: livePrice, expiration: liveExp > 0n ? liveExp : c.expiration };
       } catch { return null; }
     });
     for (const v of verified) if (v) out.push(v);
