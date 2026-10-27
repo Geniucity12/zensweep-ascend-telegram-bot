@@ -3121,7 +3121,7 @@ async function handleUnwrap(ctx: Context, raw?: string) {
 async function renderHelpMenu(ctx: Context) {
   let msg = `ℹ️ *Zensweep — fastest finger on Kalos (Elysium NFTs)*\n\n`;
   msg += `*Find it:*\n`;
-  msg += `• \`/collections\` — live feed, real names + floors\n`;
+  msg += `• \`/collections\` — live feed, real names + floors + top offers\n`;
   msg += `• \`/sweep <contract> [maxTotalHYPE] [count]\` — cheapest live asks, total-budget capped\n`;
   msg += `  e.g. \`/sweep 0x… 10 3\` — 3 cheapest, max 10 HYPE total\n`;
   msg += `\n*Bid it (durations: 3 = 3 days, 6h = 6 hours, 30m = 30 mins):*\n`;
@@ -3133,12 +3133,16 @@ async function renderHelpMenu(ctx: Context) {
   msg += `  e.g. \`/nftlist 0x… 824 0.55 6h\`\n`;
   msg += `• \`/nftdelist <collection> <tokenId>\` — cancel your listing\n`;
   msg += `\n*Track it:*\n`;
-  msg += `• \`/watch <0x…> [label]\` — floor-drop + new-deployment pings\n`;
-  msg += `• \`/watchlist\` — your tracked collections\n`;
+  msg += `• \`/watch <0x…> [label]\` — floor-drop + pump pings on a collection\n`;
+  msg += `• \`/watchlist\` — your tracked collections (auto-named)\n`;
+  msg += `• \`/unwatch <watch_id>\` — stop tracking\n`;
   msg += `• \`/alerts\` — ping settings\n`;
   msg += `\n*Your stuff:*\n`;
-  msg += `• \`/nfts\` — what you own + live offers (tap to accept)\n`;
+  msg += `• \`/nfts\` — what you own + live offers (tap to accept, tap to list)\n`;
   msg += `• \`/wallet\` — HYPE + WHYPE balances, wrap/unwrap + faucet inside\n`;
+  msg += `• \`/wrap <amount|max>\` — wrap HYPE → WHYPE (bids escrow in WHYPE)\n`;
+  msg += `• \`/unwrap <amount|max>\` — unwrap WHYPE → HYPE\n`;
+  msg += `• \`/faucet\` — get testnet HYPE\n`;
   msg += `\nBids escrow in *WHYPE* (wrapped HYPE) — convert inside \`/wallet\`. Kalos takes its marketplace fee on every trade; Zensweep adds nothing on testnet.`;
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: mainKeyboard });
 }

@@ -30,20 +30,25 @@ async function main() {
     console.error("Bot error:", err.error);
   });
 
-  // Lean menu: 7 things done well — feed, sweep, bids, watches, inventory, wallet, help.
+  // Lean menu: feed, sweep, bids, listings, watches, inventory, wallet, help.
+  // Keep in sync with renderHelpMenu + registered bot.command()s below.
   const kiwiCommands = [
     { command: "start", description: "Open Zensweep — Kalos NFTs on Elysium" },
     { command: "collections", description: "Live Kalos NFT collections & floors" },
-    { command: "sweep", description: "Sweep floor — cheapest live listing" },
+    { command: "sweep", description: "Sweep floor — /sweep [contract] [total] [n]" },
     { command: "offer", description: "Place a bid — /offer [col] [id] [price]" },
     { command: "accept", description: "Accept a bid — /accept [col] [id] [bidder]" },
     { command: "nftlist", description: "List your NFT — /nftlist [col] [id] [price]" },
     { command: "nftdelist", description: "Cancel listing — /nftdelist [col] [id]" },
     { command: "watch", description: "Track a collection — /watch 0x…" },
     { command: "watchlist", description: "Your tracked collections" },
+    { command: "unwatch", description: "Untrack — /unwatch [watch_id]" },
     { command: "alerts", description: "Floor & deployment pings" },
     { command: "nfts", description: "Your NFTs & live offers" },
     { command: "wallet", description: "HYPE + WHYPE balances & wrap" },
+    { command: "wrap", description: "Wrap HYPE → WHYPE — /wrap [amount|max]" },
+    { command: "unwrap", description: "Unwrap WHYPE → HYPE — /unwrap [amount|max]" },
+    { command: "faucet", description: "Get testnet HYPE" },
     { command: "help", description: "How Zensweep works" },
   ];
 
