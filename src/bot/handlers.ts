@@ -1989,8 +1989,9 @@ async function renderNFTsMenu(ctx: Context) {
   } catch { incomingBids = []; bidsScanned = true; }
 
    // ONE card per NFT: top 3 live offers with Accept + List on the card itself.
-  // No giant shared wall — each token carries its own actions. If the card
-  // send fails (bad Markdown), fall back to PLAIN TEXT *WITH THE SAME BUTTONS*.
+  // No giant shared wall — each token carries its own actions. Cards send via
+  // safeReply so a Markdown entity crash can NEVER swallow them silently.
+  let cardsSent = 0;
   for (const nft of nfts.slice(0, 12) as Array<{ collection: Address; tokenId: bigint }>) {
     const nftBids = incomingBids.filter(
       (b) => b.collection.toLowerCase() === String(nft.collection).toLowerCase() && b.tokenId.toString() === String(nft.tokenId)
@@ -2003,7 +2004,16 @@ async function renderNFTsMenu(ctx: Context) {
         ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\`${tagFor(best)}`
         : `\n🤝 *Offers:* \`none right now — list it or wait for bids\``;
     const extraLine = nftBids.length > 1 ? ` (+${nftBids.length - 1} more)` : "";
-    const meta = await readCollectionMeta(nft.collection as Address).catch(() => ({ name: `#${String(nft.tokenId)}`, symbol: "" }));
+    let meta = { name: `#${String(nft.tokenId)}`, symbol: "" };
+    try {
+      const { getIndexDirectory } = await import("../engine/kalos");
+      const dir = await getIndexDirectory();
+      const hit = dir.cols.find((c) => c.address.toLowerCase() === String(nft.collection).toLowerCase());
+      if (hit) meta = { name: hit.name, symbol: hit.symbol };
+      else meta = await readCollectionMeta(nft.collection as Address);
+    } catch {
+      try { meta = await readCollectionMeta(nft.collection as Address); } catch { /* keep fallback */ }
+    }
     const text = `🖼️ *${escMd(meta.name)} #${escMd(String(nft.tokenId))}*\n\`${nft.collection}\`${offerLine}${extraLine}`;
     const cardKb = (() => {
       const kb = new InlineKeyboard();
@@ -2017,10 +2027,18 @@ async function renderNFTsMenu(ctx: Context) {
       return kb;
     })();
     try {
-      await ctx.reply(text, { parse_mode: "Markdown", reply_markup: cardKb });
-    } catch {
-      try { await ctx.reply(text.replace(/[`*_]/g, ""), { reply_markup: cardKb }); } catch {}
-    }
+      await safeReply(ctx, text, { reply_markup: cardKb });
+      cardsSent++;
+    } catch { /* safeReply never throws; belt-and-braces */ }
+  }
+  // Self-heal: if we found NFTs but ZERO cards sent, say so loudly instead of
+  // the lying "each has its own card above" footer your screenshot caught.
+  if (nfts.length > 0 && cardsSent === 0) {
+    await safeReply(ctx,
+      `⚠️ *Found ${nfts.length} NFT${nfts.length > 1 ? "s" : ""} but couldn't display the cards.*\n\n` +
+      nfts.slice(0, 12).map((n) => `• \`${n.collection}\` #${n.tokenId.toString()}`).join("\n") +
+      `\n\nTap 🔍 on each contract in /collections, or reply with the contract address to inspect it.`,
+    );
   }
 
   // Summary footer ONLY (counts + active listings with Cancel) — no per-NFT
