@@ -1991,9 +1991,9 @@ async function renderNFTsMenu(ctx: Context) {
   // in the background and edit/add cards. The old flow blocked the whole
   // /nfts on a 27-collection Transfer scan + per-token ownerOf confirms.
   const { getWalletNFTReceives } = await import("../engine/elysium").catch(() => ({ getWalletNFTReceives: null as any }));
-  const { getIndexDirectory: getDir } = await import("../engine/kalos").catch(() => ({ getIndexDirectory: null as any }));
-  let dirCols: Array<{ address: Address; name: string; symbol: string }> = [];
-  try { if (getDir) dirCols = (await getDir()).cols; } catch { /* live-scan fills in */ }
+  const { getIndexDirectory: getDir, getIndexHoldings } = await import("../engine/kalos").catch(() => ({ getIndexDirectory: null as any, getIndexHoldings: null as any }));
+  let dirCols: Array<{ address: Address; name: string; symbol: string; slug: string }> = [];
+  try { if (getDir) dirCols = (await getDir()).cols as any; } catch { /* live-scan fills in */ }
   const nameOf = (addr: string): { name: string; symbol: string } => {
     const hit = dirCols.find((c) => c.address.toLowerCase() === addr.toLowerCase());
     return hit ? { name: hit.name, symbol: hit.symbol } : { name: `#collection`, symbol: "" };
@@ -2047,11 +2047,67 @@ async function renderNFTsMenu(ctx: Context) {
     if (id) painted.set(k, id);
   };
   const priority: Array<{ collection: Address; tokenId: bigint }> = [];
-  if (getWalletNFTReceives) {
-  try {
-    const recents = await getWalletNFTReceives(user.wallet_address as Address, 12).catch(() => []);
-    const seenP = new Set<string>();
-    for (const r of recents) {
+  // FAST PATH (primary): kalos.fun indexer owners[] + holdings[] — exact token
+  // IDs per wallet, zero RPC scans. 30-120s cache. This is what finds MAYC
+  // instantly where the 27-collection Transfer scan never reached it.
+  // Pass cached NFTs as priority so the user's own collections scan first.
+  if (getIndexHoldings) {
+    try {
+      const held = await Promise.race([
+        (getIndexHoldings as any)(user.wallet_address as Address, { known: cachedNfts }).catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 25000)),
+      ]) as Array<{ collection: Address; tokenId: bigint }> | null;
+      if (held && held.length > 0) {
+        for (const r of held.slice(0, 12)) {
+          const k = `${String(r.collection).toLowerCase()}:${String(r.tokenId)}`;
+          if (seenLive.has(k) || painted.has(k)) continue;
+          priority.push({ collection: r.collection, tokenId: BigInt(r.tokenId as any) });
+          await pushLive(r.collection, BigInt(r.tokenId as any));
+        }
+      }
+      // BACKFILL: cached tokens the indexer no longer lists (stale owners[] —
+      // your #9269 case). ownerOf-verify each cached token; keep what you still
+      // own. Cheap (1 RPC each) and closes the stale-indexer gap.
+      if (cachedNfts.length > 0) {
+        try {
+          const { createPublicClient, http } = await import("viem");
+          const cfg = getChainConfig(ELYSIUM.key);
+          const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+          for (const c of cachedNfts.slice(0, 12)) {
+            const k = `${String(c.collection).toLowerCase()}:${String(c.tokenId)}`;
+            if (seenLive.has(k) || painted.has(k)) continue;
+            try {
+              const own = (await Promise.race([
+                pc.readContract({
+                  address: c.collection, abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as any,
+                  functionName: "ownerOf", args: [c.tokenId],
+                } as any),
+                new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000)),
+              ]).catch(() => null)) as Address | null;
+              if (own && own.toLowerCase() === (user.wallet_address as string).toLowerCase()) {
+                priority.push({ collection: c.collection, tokenId: c.tokenId });
+                await pushLive(c.collection, c.tokenId);
+              }
+            } catch { /* unverifiable — skip */ }
+          }
+        } catch { /* backfill best-effort */ }
+      }
+    } catch { /* indexer miss -> RPC fallback below */ }
+  }
+  // RPC fallback only when indexer missed: the old 27-collection Transfer scan
+  // with 200k-block depth never reaches old buys (your MAYC case), so keep it
+  // bounded and last-resort.
+  if (priority.length === 0) {
+    try {
+      const owned = await Promise.race([
+        (async () => {
+          if (!getWalletNFTReceives) return [];
+          return getWalletNFTReceives(user.wallet_address as Address, 12).catch(() => []);
+        })(),
+        new Promise<Array<never>>((resolve) => setTimeout(() => resolve([]), 12000)),
+      ]);
+      const seenP = new Set<string>();
+      for (const r of (owned as Array<{ collection: Address; tokenId: bigint }>)) {
       const k = `${r.collection.toLowerCase()}:${r.tokenId.toString()}`;
       if (seenP.has(k)) continue;
       seenP.add(k);
@@ -2073,6 +2129,10 @@ async function renderNFTsMenu(ctx: Context) {
   } catch { /* best-effort: fall through to directory probe */ }
   } // end if (getWalletNFTReceives)
   for (const p of priority) if (!seenLive.has(`${String(p.collection).toLowerCase()}:${String(p.tokenId)}`)) nfts.push(p);
+  // SKIP the directory/balanceOf probe when the indexer already found holdings —
+  // those 27 balanceOf calls + Transfer scans are exactly what made /nfts hang.
+  // Only probe when we still have nothing (indexer miss or brand-new wallet).
+  if (nfts.length === 0) {
   try {
     // Directory probe with whatever budget is left. Reuses the already-loaded
     // dirCols — no second directory fetch. Streams each find via pushLive.
@@ -2086,25 +2146,55 @@ async function renderNFTsMenu(ctx: Context) {
         if (!seenDisc.has(k)) { seenDisc.add(k); discovered.push(e.nftAddress as Address); }
       }
     }
-    // Bound the ownership probe: N collections x tokensOfOwner is the RPC
-    // hotspot that starves the bid scan — 12 is enough, FIFO by discovery.
-    // Priority hits already counted, so probe fewer when we have them.
+    // Bound the ownership probe — but SMART: balanceOf gate FIRST on ALL
+    // collections (cheap, parallel) so we only deep-scan the 1-2 collections
+    // where the wallet actually holds something. Old code probed the FIRST 12
+    // directory collections alphabetically — MAYC (#25) was never reached,
+    // and the empty result then WIPED the good cache (that's your blank).
     const budget = Math.max(0, 12 - nfts.length);
-    for (const col of discovered.filter((c) => !haveCols.has(c.toLowerCase())).slice(0, budget)) {
-      try {
-        const ids = await kalosService.tokensOfOwner(col, user.wallet_address as Address, { limit: 10 });
-        for (const tid of ids) {
-          await pushLive(col, tid);
+    if (budget > 0) {
+      const candidates = discovered.filter((c) => !haveCols.has(c.toLowerCase()));
+      const { createPublicClient, http } = await import("viem").catch(() => ({ createPublicClient: null as any, http: null as any }));
+      let holders: Address[] = [];
+      if (createPublicClient && http) {
+        try {
+          const cfg = getChainConfig(ELYSIUM.key);
+          const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+          const balances = await Promise.all(candidates.map((col) =>
+            pc.readContract({
+              address: col,
+              abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] }] as any,
+              functionName: "balanceOf", args: [user.wallet_address as Address],
+            } as any).then((b: unknown) => ({ col, bal: BigInt(b as any) })).catch(() => ({ col, bal: 0n }))
+          ));
+          holders = balances.filter((b) => b.bal > 0n).map((b) => b.col);
+        } catch { holders = []; }
+      }
+      // Deep-scan ONLY holders (with 3M-block depth so old buys are found),
+      // oldest-first so MAYC isn't starved by Genesis/Marble.
+      const targets = (holders.length > 0 ? [...holders].reverse() : candidates.slice(0, budget)).slice(0, Math.max(budget, holders.length));
+      for (const col of targets) {
+        try {
+          const ids = await kalosService.tokensOfOwner(col, user.wallet_address as Address, { limit: 10, blocksBack: 3_000_000 });
+          for (const tid of ids) {
+            await pushLive(col, tid);
+            if (nfts.length >= 12) break;
+          }
           if (nfts.length >= 12) break;
-        }
-        if (nfts.length >= 12) break;
-      } catch {}
+        } catch {}
+      }
     }
   } catch {}
-  // 3) Save live result to cache so the NEXT /nfts paints instantly.
+  } // end if (nfts.length === 0) — skip slow probe when indexer already delivered
+  // 3) Save live result to cache — but NEVER wipe a good cache with an empty
+  // scan. If the live pass found nothing (RPC hiccup), keep last-known so the
+  // NEXT /nfts still paints instantly instead of "No NFTs detected".
   try {
     const { dbService: _db2 } = await import("../db");
-    _db2.saveCachedNfts(userId, nfts.slice(0, 24).map((n) => ({ contract: String(n.collection), token_id: String(n.tokenId) })));
+    if (nfts.length > 0) {
+      _db2.saveCachedNfts(userId, nfts.slice(0, 24).map((n) => ({ contract: String(n.collection), token_id: String(n.tokenId) })));
+    }
+    // else: keep last-known cache — never overwrite good data with an empty scan.
   } catch { /* cache is best-effort */ }
   const activeListings: Array<never> = [];
 
@@ -2135,6 +2225,10 @@ async function renderNFTsMenu(ctx: Context) {
 
   // Live offers pass: merge into the ALREADY-PAINTED cards — edit in place,
   // paint only genuinely new NFTs. No second wall of cards, no resend.
+  // Time-boxed: kalos.fun collection scope answers in ~1-2s. If it hangs,
+  // cards keep "checking…" for max 8s then finalize as "none right now"
+  // rather than stalling the whole footer. Accuracy comes from the indexer
+  // (exact match, funded-gated) — the RPC deep-scan was the slow path.
   let incomingBids: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }> = [];
   let bidsScanned = false;
   try {
@@ -2143,9 +2237,14 @@ async function renderNFTsMenu(ctx: Context) {
       if (ctx.chat) {
         try { await ctx.api.sendChatAction(ctx.chat.id, "typing"); } catch { /* ignore */ }
       }
-      incomingBids = await kalosService.getIncomingBids(myTokens, user.wallet_address as Address, { perToken: 4 });
+      incomingBids = await Promise.race([
+        kalosService.getIncomingBids(myTokens, user.wallet_address as Address, { perToken: 4 }),
+        new Promise<Array<never>>((resolve) => setTimeout(() => resolve([]), 8000)),
+      ]);
+      bidsScanned = true;
+    } else {
+      bidsScanned = true;
     }
-    bidsScanned = true;
   } catch { incomingBids = []; bidsScanned = true; }
 
    // ONE card per NFT: top 3 live offers with Accept + List on the card itself.

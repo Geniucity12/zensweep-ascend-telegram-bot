@@ -82,8 +82,9 @@ export interface KalosIndexBid {
 interface MarketViewPayload {
   generatedAt?: number; block?: string; collections?: any[]; listings?: any[];
   bids?: any[]; stats?: Record<string, any>;
+  owners?: string[]; holdings?: Array<[string, string[], number[]]>;
 }
-const KALOS_API_BASE = (process.env.KALOS_API_URL || "https://kalos.fun").replace(/\/$/, "");
+const KALOS_API_BASE = (process.env.KALOS_API_URL || "https://www.kalos.fun").replace(/\/$/, "");
 const indexCache: {
   dir?: { at: number; cols: KalosIndexCollection[]; stats: Map<string, { floor: bigint | null; topBid: bigint | null }> };
   col?: Map<string, { at: number; listings: KalosIndexListing[]; bids: KalosIndexBid[]; stats: { floor: bigint | null; topBid: bigint | null } }>;
@@ -125,6 +126,74 @@ export async function getIndexDirectory(): Promise<{ cols: KalosIndexCollection[
   }
   indexCache.dir = { at: Date.now(), cols, stats };
   return { cols, stats, block: d.block };
+}
+
+const INDEX_HOLD_TTL_MS = 120_000;
+const indexHoldCache: Map<string, { at: number; tokens: Array<{ collection: Address; tokenId: bigint }> }> = new Map();
+/** Exact holdings for a wallet from the kalos.fun indexer (owners[] + holdings[]).
+ * This is the FAST path for /nfts: one cached HTTP call, no 27-collection RPC
+ * Transfer scan, no ownerOf-per-token loop. Verified: MAYC scope carries
+ * owners[163] = your wallet -> tokens list contains your IDs.
+ * Returns null when the indexer doesn't cover the wallet (then RPC fallback). */
+export async function getIndexHoldings(owner: Address, opts?: { known?: Array<{ collection: Address; tokenId: bigint }>; extraSlugs?: string[] }): Promise<Array<{ collection: Address; tokenId: bigint }> | null> {
+  const key = owner.toLowerCase();
+  const hit = indexHoldCache.get(key);
+  if (hit && Date.now() - hit.at < INDEX_HOLD_TTL_MS) return hit.tokens;
+  try {
+    const { cols } = await getIndexDirectory().catch(() => ({ cols: [] as KalosIndexCollection[] }));
+    const addrOf = new Map(cols.map((c) => [c.slug, c.address]));
+    const slugOf = new Map(cols.map((c) => [c.address.toLowerCase(), c.slug]));
+    // SMART ORDER: user's cached collections FIRST (their MAYC etc.), MAYC as
+    // fallback #1, then the rest. Old code scanned all 27 alphabetically.
+    const ordered: string[] = [];
+    const pushSlug = (s?: string | null) => { if (s && !ordered.includes(s)) ordered.push(s); };
+    for (const k of opts?.known ?? []) pushSlug(slugOf.get(String(k.collection).toLowerCase()));
+    for (const s of opts?.extraSlugs ?? []) pushSlug(s);
+    pushSlug("mutant-ape-yacht-club");
+    for (const c of cols) pushSlug(c.slug);
+    const out: Array<{ collection: Address; tokenId: bigint }> = [];
+    const scan = async (slug: string) => {
+      const d = await fetchMarketView(`collection/${slug}`).catch(() => null);
+      if (!d || !Array.isArray(d.owners) || !Array.isArray(d.holdings)) return;
+      const owners = d.owners as string[];
+      const idx = owners.findIndex((a) => String(a).toLowerCase() === key);
+      if (idx < 0) return;
+      const col = addrOf.get(slug);
+      if (!col) return;
+      for (const h of d.holdings as Array<[string, string[], number[]]>) {
+        if (!Array.isArray(h) || h.length < 3) continue;
+        const toks = h[1] as string[];
+        const ownIdx = h[2] as number[];
+        for (let i = 0; i < toks.length && i < ownIdx.length; i++) {
+          if (ownIdx[i] === idx) {
+            try { out.push({ collection: col as Address, tokenId: BigInt(toks[i]) }); } catch {}
+          }
+        }
+      }
+    };
+    // First 4 in parallel (covers cached + MAYC — the common case resolves here
+    // in ~2-4s). Rest only when nothing found yet.
+    const first = ordered.slice(0, 4);
+    await Promise.all(first.map((s) => scan(s)));
+    if (out.length === 0 && ordered.length > 4) {
+      const rest = ordered.slice(4);
+      // Next 8 in parallel, then sequential tail — never 27 sequential fetches.
+      const batch = rest.slice(0, 8);
+      await Promise.all(batch.map((s) => scan(s)));
+      if (out.length === 0) {
+        for (const s of rest.slice(8)) {
+          await scan(s);
+          if (out.length >= 12) break;
+        }
+      }
+    }
+    if (out.length > 0) {
+      const tokens = out.slice(0, 24);
+      indexHoldCache.set(key, { at: Date.now(), tokens });
+      return tokens;
+    }
+    return null;
+  } catch { return null; }
 }
 
 /** Live listings + bids for ONE collection by slug. Cached 30s. */
@@ -919,15 +988,22 @@ export const kalosService = {
     }
   },
   /** List token IDs owned by `owner` in an ERC-721 collection (enumerable fast path + event fallback). */
-  async tokensOfOwner(collection: Address, owner: Address, opts?: { maxScan?: number; limit?: number }): Promise<bigint[]> {
+  async tokensOfOwner(collection: Address, owner: Address, opts?: { maxScan?: number; limit?: number; blocksBack?: number | bigint }): Promise<bigint[]> {
     const limit = opts?.limit ?? 25;
+    const client = publicClient();
+    // Cheap gate: skip ALL scans when the wallet holds nothing here.
+    // (Old code ran 2 x Transfer scans per collection even with bal 0 —
+    //  that's the 27-collection hang that blanked /nfts.)
+    let bal = 0n;
     try {
-      const client = publicClient();
-      const bal = (await client.readContract({
+      bal = (await client.readContract({
         address: collection,
         abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ type: "uint256" }] }] as any,
         functionName: "balanceOf", args: [owner],
       } as any).catch(() => 0n)) as bigint;
+    } catch { bal = 0n; }
+    if (bal === 0n) return [];
+    try {
       if (bal > 0n) {
         const ids: bigint[] = [];
         for (let i = 0n; i < bal && ids.length < limit; i++) {
@@ -945,8 +1021,10 @@ export const kalosService = {
       }
     } catch {}
     // Fallback: tokenIds this owner RECEIVED in Transfer events (works for non-enumerable ERC-721).
+    // Depth is caller-controlled: /nfts passes ~3M blocks (~1 week on Elysium's ~0.2s
+    // blocks) for the 1-2 collections where balanceOf > 0, so old buys like
+    // MAYC #9269 are found. Chunked so one range-limit can't blank the scan.
     try {
-      const client = publicClient();
       const transferEvent = {
         name: "Transfer", type: "event", stateMutability: "nonpayable",
         inputs: [
@@ -956,29 +1034,38 @@ export const kalosService = {
         ],
       } as const;
       const latest = await client.getBlockNumber();
-      const blocksBack = 200_000n;
-      const from = latest > blocksBack ? latest - blocksBack : 0n;
-      const logs = await client.getContractEvents({
-        address: collection, abi: [transferEvent] as any, eventName: "Transfer",
-        args: { to: owner }, fromBlock: from, toBlock: latest,
-      } as any).catch(() => []);
+      const depth = BigInt(opts?.blocksBack ?? 200_000);
+      const from = latest > depth ? latest - depth : 0n;
+      const CHUNK = 500_000n;
+      const spans: Array<{ s: bigint; e: bigint }> = [];
+      { let e = latest; while (e > from && spans.length < 12) { const s = e > CHUNK ? e - CHUNK : 0n; spans.push({ s: s > from ? s : from, e }); if (s <= from) break; e = s - 1n; } }
       const owned = new Set<string>();
-      for (const l of (logs as Array<any>) ?? []) {
+      for (const sp of spans) {
         try {
-          const tid = BigInt((l?.args as any)?.tokenId ?? -1);
-          if (tid >= 0n) owned.add(tid.toString());
+          const logs = await client.getContractEvents({
+            address: collection, abi: [transferEvent] as any, eventName: "Transfer",
+            args: { to: owner }, fromBlock: sp.s, toBlock: sp.e,
+          } as any).catch(() => []);
+          for (const l of (logs as Array<any>) ?? []) {
+            try {
+              const tid = BigInt((l?.args as any)?.tokenId ?? -1);
+              if (tid >= 0n) owned.add(tid.toString());
+            } catch {}
+          }
         } catch {}
       }
       // Subtract tokens the owner sent away afterwards.
-      try {
-        const outLogs = await client.getContractEvents({
-          address: collection, abi: [transferEvent] as any, eventName: "Transfer",
-          args: { from: owner }, fromBlock: from, toBlock: latest,
-        } as any).catch(() => []);
-        for (const l of (outLogs as Array<any>) ?? []) {
-          try { owned.delete(BigInt((l?.args as any)?.tokenId ?? -1).toString()); } catch {}
-        }
-      } catch {}
+      for (const sp of spans) {
+        try {
+          const outLogs = await client.getContractEvents({
+            address: collection, abi: [transferEvent] as any, eventName: "Transfer",
+            args: { from: owner }, fromBlock: sp.s, toBlock: sp.e,
+          } as any).catch(() => []);
+          for (const l of (outLogs as Array<any>) ?? []) {
+            try { owned.delete(BigInt((l?.args as any)?.tokenId ?? -1).toString()); } catch {}
+          }
+        } catch {}
+      }
       // Confirm current ownership on-chain (cheap, bounded).
       const ids = [...owned].slice(0, limit).map(BigInt);
       const confirmed: bigint[] = await mapLimit(ids, 6, async (tid) => {
