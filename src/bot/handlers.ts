@@ -558,6 +558,24 @@ export function registerHandlers(bot: Bot) {
   });
 
   // ---- List on Kalos (restored): /nftlist + 1-tap List from /nfts cards ----
+  // One-tap approve BEFORE accepting a bid (accept transfers the NFT).
+  bot.callbackQuery("confirm_accept_approve", async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const userId = ctx.from?.id;
+    if (!userId || !userStates[userId]?.data) return;
+    const data = userStates[userId].data as { contract: Address; tokenId: string; bidder: Address; priceHype?: string; expiresAt?: number };
+    if (Date.now() > (data.expiresAt ?? 0)) { delete userStates[userId]; await ctx.reply("Approval session expired. Tap Accept again from /nfts."); return; }
+    delete userStates[userId];
+    const wallet = walletManager.getUserWallet(userId);
+    if (!wallet) { await ctx.reply("No wallet found."); return; }
+    try {
+      await ctx.reply(`🔐 Approving Kalos to move #${data.tokenId}…`, { parse_mode: "Markdown" });
+      await kalosService.approveMarketplace(wallet.privateKey, data.contract);
+      await executeNftAccept(ctx, data);
+    } catch (e: any) {
+      await safeReply(ctx, `❌ Approve failed: ${escErr(e?.shortMessage || e?.message || "unknown")}\n\nRetry Accept from /nfts.`);
+    }
+  });
   bot.callbackQuery(/^kalos_list_(0x[a-fA-F0-9]{40})(?:_(\d+))?$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     const col = ctx.match[1] as Address;
@@ -1059,6 +1077,28 @@ export function registerHandlers(bot: Bot) {
     if (state?.step === "awaiting_nftaccept_params") {
       delete userStates[userId];
       await promptNftAccept(ctx, text);
+      return;
+    }
+
+    if (state?.step === "awaiting_accept_approve") {
+      delete userStates[userId];
+      if (!state.data || Date.now() > state.data.expiresAt) {
+        await ctx.reply("Approval session expired. Tap Accept again from /nfts.");
+        return;
+      }
+      if (!isUserConfirmation(text)) {
+        await ctx.reply("Acceptance cancelled.", { reply_markup: mainKeyboard });
+        return;
+      }
+      const walletA = walletManager.getUserWallet(userId);
+      if (!walletA) { await ctx.reply("No wallet found."); return; }
+      try {
+        await ctx.reply(`🔐 Approving Kalos to move #${state.data.tokenId}…`, { parse_mode: "Markdown" });
+        await kalosService.approveMarketplace(walletA.privateKey, state.data.contract);
+        await executeNftAccept(ctx, state.data);
+      } catch (e: any) {
+        await safeReply(ctx, `❌ Approve failed: ${escErr(e?.shortMessage || e?.message || "unknown")}\n\nRetry Accept from /nfts.`);
+      }
       return;
     }
 
@@ -2622,9 +2662,16 @@ async function executeNftAccept(ctx: Context, data: { contract: Address; tokenId
 
   try {
     await ctx.reply(`⏳ Accepting bid and executing transfer on Kalos...`, { parse_mode: "Markdown" });
-    const dry = await kalosService.dryRunAccept(data.contract, BigInt(data.tokenId), data.bidder, wallet.address as Address);
+    const dry = await kalosService.dryRunAccept(data.contract, BigInt(data.tokenId), data.bidder, wallet.address as Address) as { ok: boolean; reason?: string; needsApproval?: boolean; needsDelist?: boolean };
     if (!dry.ok) {
-      await ctx.reply(`❌ *Accept would fail — no gas spent.*\n\n${dry.reason}`, { parse_mode: "Markdown" });
+      if (dry.needsApproval) {
+        const { InlineKeyboard: KB } = await import("grammy");
+        userStates[userId] = { step: "awaiting_accept_approve", data: { ...data, expiresAt: Date.now() + 5 * 60_000 } };
+        const kb = new KB().text("✅ Approve Kalos", "confirm_accept_approve").text("❌ Cancel", "cancel_action");
+        await ctx.reply(`🔐 *Approval needed before accepting.*\n\n${dry.reason}`, { parse_mode: "Markdown", reply_markup: kb });
+        return;
+      }
+      await safeReply(ctx, `❌ *Accept would fail — no gas spent.*\n\n${escErr(dry.reason)}`);
       return;
     }
     const hash = await kalosService.acceptBid(wallet.privateKey, data.contract, data.tokenId, data.bidder, { priceEth: data.priceHype });

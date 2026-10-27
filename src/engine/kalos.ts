@@ -807,9 +807,11 @@ export const kalosService = {
   },
   /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token.
    * Checks specific-token bid, any-token bid (id 0), AND collection-wide bid —
-   * same 3-way lookup acceptBid uses. The old version only checked getTokenBid
-   * for the exact tokenId, so any-token/collection offers always failed with
-   * "No live bid" even though accepting them works. */
+   * same 3-way lookup acceptBid uses. Also gates the two REAL blockers that
+   * surface as the opaque 0xf4d678b8 revert:
+   *   1) NFT must NOT be listed (accept-while-listed reverts);
+   *   2) Kalos must be approved for the collection (transfer step needs it).
+   * Both are checked with plain messages BEFORE any simulation. */
   async dryRunAccept(collection: Address, tokenId: bigint, bidder: Address, seller: Address): Promise<{ ok: boolean; reason?: string }> {
     const client = publicClient();
     const addr = kalosAddr()!;
@@ -857,6 +859,30 @@ export const kalosService = {
     if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) {
       return { ok: false, reason: `You don't own #${tokenId} right now — only the current owner can accept bids.` };
     }
+    // Blocker 1: Kalos must be approved to move this collection. The accept
+    // executes an NFT transfer; without setApprovalForAll the call reverts
+    // with the opaque 0xf4d678b8 selector and no decoded name.
+    try {
+      const approved = (await client.readContract({
+        address: collection, abi: erc721Abi as any, functionName: "isApprovedForAll",
+        args: [seller, addr],
+      } as any).catch(() => false)) as boolean;
+      if (!approved) {
+        return { ok: false, needsApproval: true, reason: `Kalos isn't approved to move #${tokenId} yet. The accept transfers your NFT, so approval comes first — tap Approve below, then accept again.` } as { ok: boolean; reason?: string };
+      }
+    } catch { /* best-effort: simulation will surface the real revert */ }
+    // Blocker 2: token must NOT be actively listed. Accepting a bid on a
+    // listed token reverts with the same opaque selector.
+    try {
+      const listing: any = await client.readContract({
+        address: addr, abi: kalosAbi as any, functionName: "getListing",
+        args: [collection, tokenId, seller],
+      } as any).catch(() => null);
+      const lp = (() => { try { return BigInt(listing?.pricePerItem ?? listing?.[1] ?? 0); } catch { return 0n; } })();
+      if (lp > 0n) {
+        return { ok: false, needsDelist: true, reason: `#${tokenId} is still listed for sale — Kalos won't let you accept a bid on a listed token (reverts 0xf4d678b8). Delist first (or cancel the listing), wait for confirmation, then accept.` } as { ok: boolean; reason?: string };
+      }
+    } catch { /* best-effort */ }
     // Simulate with bidType 0 AND 1 — collection-wide fills need bidType 1.
     // The old check only simulated bidType 0, so valid collection offers
     // reported "would revert" at the dry-run and never reached the write.
