@@ -1,4 +1,5 @@
 import { InlineKeyboard } from "grammy";
+import { SUPPORT_URL } from "../config";
 
 /**
  * Inline keyboards — lean bot: collections, sweep, bids, watches, inventory, wallet, help.
@@ -10,7 +11,8 @@ export const mainKeyboard = new InlineKeyboard()
   .text("👀 Watchlist", "menu_watchlist")
   .text("🔔 Alerts", "menu_alerts").row()
   .text("💰 Wallet", "menu_wallet")
-  .text("ℹ️ Help", "menu_help");
+  .text("ℹ️ Help", "menu_help").row()
+  .url("🆘 Support", SUPPORT_URL);
 
 export const walletKeyboard = new InlineKeyboard()
   .text("🔄 Refresh", "wallet_refresh")
@@ -21,13 +23,15 @@ export const walletKeyboard = new InlineKeyboard()
   .text("🔑 Export Key", "wallet_export").row()
   .text("📥 Import Wallet", "wallet_import")
   .text("🔄 Change Wallet", "wallet_change").row()
+  .url("🆘 Support", SUPPORT_URL)
   .text("🔙 Main Menu", "menu_main");
 
 export const noWalletKeyboard = new InlineKeyboard()
   .text("➕ Create Wallet", "wallet_generate")
   .text("📥 Import Wallet", "wallet_import")
   .row()
-  .text("ℹ️ Help", "menu_help");
+  .text("ℹ️ Help", "menu_help")
+  .url("🆘 Support", SUPPORT_URL);
 
 export function makeNftCardKeyboard(address: string, explorerUrl?: string, floorHype?: string): InlineKeyboard {
   const k = new InlineKeyboard();

@@ -1,7 +1,7 @@
 import { Bot, Context, InlineKeyboard } from "grammy";
 import { dbService } from "../db";
 import { walletManager } from "../wallet/manager";
-import { getChainConfig, ELYSIUM, DEFAULT_CHAIN_KEY } from "../config";
+import { getChainConfig, ELYSIUM, DEFAULT_CHAIN_KEY, BURNER_TIP, SUPPORT_URL } from "../config";
 import { getWalletActivity } from "../engine/elysium";
 import { kalosService } from "../engine/kalos";
 import {
@@ -91,12 +91,19 @@ export function registerHandlers(bot: Bot) {
       const balance = await walletManager.getBalance(user.wallet_address as Address, chain, false);
       message += `💳 *Wallet:* \`${user.wallet_address}\`\n`;
       message += `💰 *Balance:* \`${balance.eth} ${balance.symbol}\`\n\n`;
-      message += `Use Zensweep to sweep floors, place bids, and track collections — fastest finger on Kalos.`;
+      message += `Use Zensweep to sweep floors, place bids, and track collections — fastest finger on Kalos.\n\n${BURNER_TIP}`;
       await ctx.reply(message, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     } else {
-      message += `🔴 *No wallet connected yet.*\n\nCreate a server-managed wallet to get started. Your signing key stays on-host and never leaves the bot server.`;
+      message += `🔴 *No wallet connected yet.*\n\nCreate a server-managed wallet to get started. Your signing key stays on-host and never leaves the bot server.\n\n${BURNER_TIP}`;
       await ctx.reply(message, { parse_mode: "Markdown", reply_markup: noWalletKeyboard });
     }
+  });
+
+  bot.command("support", async (ctx) => {
+    await ctx.reply(
+      `🆘 *Need help?*\n\nQuestions, bugs, or stuck funds — tap below and DM us in the support channel. Include your wallet address + what you tapped.\n\n${BURNER_TIP}`,
+      { parse_mode: "Markdown", reply_markup: new InlineKeyboard().url("🆘 Open Support Chat", SUPPORT_URL).row().text("🔙 Main Menu", "menu_main") }
+    );
   });
 
   // Basic Commands
@@ -277,7 +284,7 @@ export function registerHandlers(bot: Bot) {
       const balance = await walletManager.getBalance(user.wallet_address as Address, chain, false);
       message += `💳 *Wallet:* \`${user.wallet_address}\`\n`;
       message += `💰 *Balance:* \`${balance.eth} ${balance.symbol}\`\n\n`;
-      message += `Select an option:`;
+      message += `Select an option:\n\n${BURNER_TIP}`;
       await ctx.editMessageText(message, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     } else {
       message += `🔴 *No wallet connected.*`;
@@ -317,7 +324,10 @@ export function registerHandlers(bot: Bot) {
     const newWallet = walletManager.createNewWallet(userId);
     const msg = `✅ *Server-managed EVM wallet created.*\n\n` +
       `💳 *Address:* \`${newWallet.address}\`\n\n` +
-      `The signing key stays on the bot host and is not sent through Telegram. Only deposit funds you are comfortable keeping in a bot-managed wallet. Use Withdraw to move funds out.`;
+      `The signing key stays on the bot host and is not sent through Telegram. Only deposit funds you are comfortable keeping in a bot-managed wallet. Use Withdraw to move funds out.\n\n` +
+      `${BURNER_TIP}`;
+
+    await ctx.reply(msg, { parse_mode: "Markdown" });
 
     await ctx.reply(msg, { parse_mode: "Markdown" });
     await renderWalletMenu(ctx);
@@ -1284,6 +1294,8 @@ async function renderWalletMenu(ctx: Context, forceRefresh: boolean = false) {
   msg += `📫 *Address:* \`${user.wallet_address}\`\n`;
   msg += `💰 \`${balance.eth} ${balance.symbol}\`\n`;
   msg += whypeLine;
+  msg += `\n${BURNER_TIP}\n`;
+  msg += `\nStuck? Tap 🆘 Support below — include your address + what you tapped.`;
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: walletKeyboard });
 }
@@ -1950,6 +1962,7 @@ async function renderCollectionDetail(ctx: Context, address: Address) {
     .text("👀 Watch", `watch_add_${address}`).row()
     .url("🌐 View on Kalos", "https://kalos.fun")
     .text("🏷️ All Collections", "menu_collections").row()
+    .url("🆘 Support", SUPPORT_URL)
     .text("🔙 Main Menu", "menu_main");
 
   await ctx.reply(msg, {
@@ -2206,7 +2219,8 @@ async function renderNFTsMenu(ctx: Context) {
 
   const kb = new InlineKeyboard();
   kb.text("🏷️ Collections", "menu_collections").row()
-    .text("🔙 Main Menu", "menu_main");
+    .text("🔙 Main Menu", "menu_main").row()
+    .url("🆘 Support — help / stuck funds", SUPPORT_URL);
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
 }
@@ -3144,5 +3158,7 @@ async function renderHelpMenu(ctx: Context) {
   msg += `• \`/unwrap <amount|max>\` — unwrap WHYPE → HYPE\n`;
   msg += `• \`/faucet\` — get testnet HYPE\n`;
   msg += `\nBids escrow in *WHYPE* (wrapped HYPE) — convert inside \`/wallet\`. Kalos takes its marketplace fee on every trade; Zensweep adds nothing on testnet.`;
+  msg += `\n\n🆘 *Need help?* \`/support\` — questions, bugs, stuck funds.`;
+  msg += `\n\n${BURNER_TIP}`;
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: mainKeyboard });
 }

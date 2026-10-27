@@ -49,6 +49,7 @@ async function main() {
     { command: "wrap", description: "Wrap HYPE → WHYPE — /wrap [amount|max]" },
     { command: "unwrap", description: "Unwrap WHYPE → HYPE — /unwrap [amount|max]" },
     { command: "faucet", description: "Get testnet HYPE" },
+    { command: "support", description: "Help / support chat" },
     { command: "help", description: "How Zensweep works" },
   ];
 
