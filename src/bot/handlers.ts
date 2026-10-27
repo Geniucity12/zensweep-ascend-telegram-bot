@@ -1968,7 +1968,11 @@ async function renderNFTsMenu(ctx: Context) {
     return;
   }
 
-  await ctx.reply(`🔍 Scanning your Elysium wallet for NFTs…`, { parse_mode: "Markdown" });
+  // Fire-and-forget: reply instantly, then scan in the BACKGROUND.
+  // The old code awaited a 27-collection Transfer scan + ownerOf confirms
+  // BEFORE the first card — that's the 10-20s "Scanning…" hang. Now the
+  // "Scanning…" message sends without awaiting, and cards stream in as found.
+  const scanningMsg = ctx.reply(`🔍 Scanning your Elysium wallet for NFTs…`, { parse_mode: "Markdown" }).catch(() => null);
 
   // Instant first paint: show cached inventory NOW (same-second), then live-scan
   // in the background and edit/add cards. The old flow blocked the whole
@@ -2017,8 +2021,18 @@ async function renderNFTsMenu(ctx: Context) {
   }
 
   const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
-  // 2) Live pass: fast receives check first (bounded, newest-first), then the
-  // directory probe with whatever budget is left. result saved to cache.
+  // 2) Live pass STREAMS cards as found: priority receives first (bounded),
+  // then the directory probe. Each confirmed NFT paints IMMEDIATELY via
+  // paintCard — no waiting for the full 12-budget scan. Cache saved at end.
+  const seenLive = new Set<string>();
+  const pushLive = async (col: Address, tid: bigint): Promise<void> => {
+    const k = `${String(col).toLowerCase()}:${String(tid)}`;
+    if (seenLive.has(k) || painted.has(k)) return;
+    seenLive.add(k);
+    nfts.push({ collection: col, tokenId: tid });
+    const id = await paintCard({ collection: col, tokenId: tid });
+    if (id) painted.set(k, id);
+  };
   const priority: Array<{ collection: Address; tokenId: bigint }> = [];
   if (getWalletNFTReceives) {
   try {
@@ -2038,16 +2052,17 @@ async function renderNFTsMenu(ctx: Context) {
         } as any).catch(() => null)) as Address | null;
         if (own && own.toLowerCase() === (user.wallet_address as string).toLowerCase()) {
           priority.push({ collection: r.collection, tokenId: r.tokenId });
+          await pushLive(r.collection, r.tokenId);
         }
       } catch { /* skip unverifiable */ }
       if (priority.length >= 12) break;
     }
   } catch { /* best-effort: fall through to directory probe */ }
   } // end if (getWalletNFTReceives)
-  for (const p of priority) nfts.push(p);
+  for (const p of priority) if (!seenLive.has(`${String(p.collection).toLowerCase()}:${String(p.tokenId)}`)) nfts.push(p);
   try {
     // Directory probe with whatever budget is left. Reuses the already-loaded
-    // dirCols — no second directory fetch.
+    // dirCols — no second directory fetch. Streams each find via pushLive.
     const haveCols = new Set(nfts.map((n) => n.collection.toLowerCase()));
     const discovered: Address[] = dirCols.map((c) => c.address);
     if (discovered.length === 0) {
@@ -2065,7 +2080,10 @@ async function renderNFTsMenu(ctx: Context) {
     for (const col of discovered.filter((c) => !haveCols.has(c.toLowerCase())).slice(0, budget)) {
       try {
         const ids = await kalosService.tokensOfOwner(col, user.wallet_address as Address, { limit: 10 });
-        for (const tid of ids) nfts.push({ collection: col, tokenId: tid });
+        for (const tid of ids) {
+          await pushLive(col, tid);
+          if (nfts.length >= 12) break;
+        }
         if (nfts.length >= 12) break;
       } catch {}
     }
@@ -2077,6 +2095,11 @@ async function renderNFTsMenu(ctx: Context) {
   } catch { /* cache is best-effort */ }
   const activeListings: Array<never> = [];
 
+  // Delete the "Scanning…" placeholder — cards are already streaming above.
+  try {
+    const sm = await scanningMsg;
+    if (sm && ctx.chat) { try { await ctx.api.deleteMessage(ctx.chat.id, sm.message_id); } catch { /* keep */ } }
+  } catch { /* ignore */ }
   if (nfts.length === 0) {
     const kb = new InlineKeyboard()
       .text("🏷️ Explore Collections", "menu_collections").row()
