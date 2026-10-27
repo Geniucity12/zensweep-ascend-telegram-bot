@@ -807,11 +807,11 @@ export const kalosService = {
   },
   /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token.
    * Checks specific-token bid, any-token bid (id 0), AND collection-wide bid —
-   * same 3-way lookup acceptBid uses. Also gates the two REAL blockers that
-   * surface as the opaque 0xf4d678b8 revert:
-   *   1) NFT must NOT be listed (accept-while-listed reverts);
-   *   2) Kalos must be approved for the collection (transfer step needs it).
-   * Both are checked with plain messages BEFORE any simulation. */
+   * same 3-way lookup acceptBid uses. Also gates the one REAL blocker that
+   * surfaces as the opaque 0xf4d678b8 revert:
+   *   Kalos must be approved for the collection (transfer step needs it).
+   * NOTE: listed tokens CAN be accept-filled — kalos.fun allows accept on
+   * listed NFTs, so there is deliberately NO delist gate here. */
   async dryRunAccept(collection: Address, tokenId: bigint, bidder: Address, seller: Address): Promise<{ ok: boolean; reason?: string }> {
     const client = publicClient();
     const addr = kalosAddr()!;
@@ -859,6 +859,23 @@ export const kalosService = {
     if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) {
       return { ok: false, reason: `You don't own #${tokenId} right now — only the current owner can accept bids.` };
     }
+    // Funded gate: the bidder's WHYPE escrow must still cover the price.
+    // kalos.fun flags dead escrow (withdrawn/cancelled bids) as funded=false
+    // or fillable=0 — those accept-buttons can never fill, so block with a
+    // plain "bid is dead" message instead of the opaque 0xf4d678b8 revert.
+    try {
+      const slug = await slugForCollection(collection);
+      if (slug) {
+        const idx = await getIndexCollection(slug);
+        const row = idx.bids.find((b) =>
+          b.nft.toLowerCase() === collection.toLowerCase() &&
+          b.bidder.toLowerCase() === bidder.toLowerCase() &&
+          (b.tokenId === tokenId || b.tokenId === 0n || b.type === "collection"));
+        if (row && (row.funded === false || row.fillable === "0")) {
+          return { ok: false, reason: `That bid is dead — the bidder withdrew their escrow (kalos.fun flags it unfunded). It can't fill even though it still shows in old lists. Run /nfts for fresh, funded offers.` };
+        }
+      }
+    } catch { /* best-effort: simulation below is authoritative */ }
     // Blocker 1: Kalos must be approved to move this collection. The accept
     // executes an NFT transfer; without setApprovalForAll the call reverts
     // with the opaque 0xf4d678b8 selector and no decoded name.
@@ -871,18 +888,7 @@ export const kalosService = {
         return { ok: false, needsApproval: true, reason: `Kalos isn't approved to move #${tokenId} yet. The accept transfers your NFT, so approval comes first — tap Approve below, then accept again.` } as { ok: boolean; reason?: string };
       }
     } catch { /* best-effort: simulation will surface the real revert */ }
-    // Blocker 2: token must NOT be actively listed. Accepting a bid on a
-    // listed token reverts with the same opaque selector.
-    try {
-      const listing: any = await client.readContract({
-        address: addr, abi: kalosAbi as any, functionName: "getListing",
-        args: [collection, tokenId, seller],
-      } as any).catch(() => null);
-      const lp = (() => { try { return BigInt(listing?.pricePerItem ?? listing?.[1] ?? 0); } catch { return 0n; } })();
-      if (lp > 0n) {
-        return { ok: false, needsDelist: true, reason: `#${tokenId} is still listed for sale — Kalos won't let you accept a bid on a listed token (reverts 0xf4d678b8). Delist first (or cancel the listing), wait for confirmation, then accept.` } as { ok: boolean; reason?: string };
-      }
-    } catch { /* best-effort */ }
+    // NOTE: no delist gate — listed tokens CAN be accept-filled on Kalos.
     // Simulate with bidType 0 AND 1 — collection-wide fills need bidType 1.
     // The old check only simulated bidType 0, so valid collection offers
     // reported "would revert" at the dry-run and never reached the write.
@@ -1140,7 +1146,12 @@ export const kalosService = {
           try { idx = await getIndexCollection(slug); } catch { continue; }
           if (!idx || idx.bids.length === 0) continue;
           for (const t of mine) {
+            // Funded-only: kalos.fun marks bids whose bidder escrow (WHYPE)
+            // still covers the price. Unfunded rows (withdrawn/cancelled
+            // escrow) show in the directory but can NEVER fill — accepting
+            // them reverts, so they must never appear as Accept buttons.
             const rel = idx.bids.filter((b) =>
+              b.funded !== false &&
               b.nft.toLowerCase() === t.collection.toLowerCase() &&
               (b.tokenId === t.tokenId || b.tokenId === 0n || b.type === "collection") &&
               (b.expiration === 0n || b.expiration >= now));

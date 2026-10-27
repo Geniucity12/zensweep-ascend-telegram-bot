@@ -2704,19 +2704,37 @@ async function renderWatchlistMenu(ctx: Context) {
     );
     return;
   }
+  // Backfill missing names from the Kalos indexer (one call for all watches),
+  // so old "Unnamed" rows heal themselves on open.
+  let nameByAddr = new Map<string, string>();
+  try {
+    const { getIndexDirectory } = await import("../engine/kalos");
+    const dir = await getIndexDirectory();
+    nameByAddr = new Map(dir.cols.map((c) => [c.address.toLowerCase(), c.symbol ? `${c.name} ($${c.symbol})` : c.name]));
+  } catch { /* labels stay as-is */ }
+  for (const w of watches) {
+    if (!w.label) {
+      const auto = nameByAddr.get((w.address as string).toLowerCase());
+      if (auto) {
+        w.label = auto;
+        try { dbService.updateWatchLabel(userId, w.id, auto); } catch { /* ignore */ }
+      }
+    }
+  }
 
   let msg = `🟡 *Watchlist* — ${watches.length} tracked\n\n`;
   const kb = new InlineKeyboard();
   for (const w of watches) {
     const cfg = getChainConfig(w.chain);
-    msg += `• *${w.label ?? "Unnamed"}* [${cfg.name}]\n  \`${w.address}\`\n`;
-    kb.text(`🔄 ${w.label ?? w.address.slice(0, 8) + "…"}`, `refresh_watch_${w.id}`)
+    const label = w.label ?? `Collection ${w.address.slice(0, 6)}…${w.address.slice(-4)}`;
+    msg += `• *${escMd(label)}* [${cfg.name}]\n  \`${w.address}\`\n`;
+    kb.text(`🔄 ${label.length > 20 ? label.slice(0, 20) + "…" : label}`, `refresh_watch_${w.id}`)
       .text(`❌ Unwatch`, `unwatch_${w.id}`)
       .row();
   }
   msg += `\nTap 🔄 for a live balance + activity check.`;
   kb.text("🔙 Main Menu", "menu_main");
-  await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+  await safeReply(ctx, msg, { reply_markup: kb });
 }
 
 async function promptWatchAddress(ctx: Context, arg: string) {
@@ -2768,8 +2786,23 @@ async function handleQuickWatch(ctx: Context, address: string) {
   if (!userId) return;
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return;
   const chain = dbService.getUser(userId)?.selected_chain || DEFAULT_CHAIN_KEY;
-  const id = dbService.watchAddress(userId, chain, address, null);
-  await ctx.reply(`✅ *Watch #${id} saved* for \`${address}\` on ${getChainConfig(chain).name}.`, {
+  // Auto-name from the Kalos indexer so watches never show "Unnamed".
+  let label: string | null = null;
+  try {
+    const { getIndexDirectory } = await import("../engine/kalos");
+    const dir = await getIndexDirectory();
+    const hit = dir.cols.find((c) => c.address.toLowerCase() === address.toLowerCase());
+    if (hit) label = hit.symbol ? `${hit.name} ($${hit.symbol})` : hit.name;
+  } catch { /* RPC fallback below */ }
+  if (!label) {
+    try {
+      const meta = await readCollectionMeta(address as Address);
+      if (meta && !meta.name.startsWith("0x")) label = meta.symbol ? `${meta.name} ($${meta.symbol})` : meta.name;
+    } catch { /* leave null */ }
+  }
+  const id = dbService.watchAddress(userId, chain, address, label);
+  try { dbService.updateWatchLabel(userId, id, label); } catch { /* ignore */ }
+  await safeReply(ctx, `✅ *Watch #${id} saved* for \`${escErr(address)}\`${label ? ` — *${escMd(label)}*` : ""} on ${getChainConfig(chain).name}.`, {
     parse_mode: "Markdown",
     reply_markup: mainKeyboard,
   });

@@ -492,6 +492,13 @@ export const dbService = {
   },
 
   // --- Watched addresses (on-chain wallet tracking) ---
+  updateWatchLabel(userId: number, watchId: number, label: string | null): boolean {
+    const row = store.schema.watches.find((w) => w.id === watchId && w.user_id === userId);
+    if (!row) return false;
+    row.label = label;
+    store.save();
+    return true;
+  },
   watchAddress(userId: number, chain: string, address: string, label?: string | null): number {
     const normalized = address.toLowerCase();
     const existing = store.schema.watches.find(
