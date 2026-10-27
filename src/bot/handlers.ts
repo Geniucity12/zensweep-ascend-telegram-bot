@@ -2033,15 +2033,27 @@ async function renderNFTsMenu(ctx: Context) {
     if (id) painted.set(`${String(nft.collection).toLowerCase()}:${String(nft.tokenId)}`, id);
   }
 
-  const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
+  const nfts: Array<{ collection: Address; tokenId: bigint }> = [...cachedNfts];
   // 2) Live pass STREAMS cards as found: priority receives first (bounded),
   // then the directory probe. Each confirmed NFT paints IMMEDIATELY via
   // paintCard — no waiting for the full 12-budget scan. Cache saved at end.
-  const seenLive = new Set<string>();
+  // NOTE: nfts is SEEDED with cached inventory so the footer + offers pass
+  // can never go blank when the live scan misses (your #824 screenshot bug:
+  // card painted from cache, but nfts[] stayed empty -> "No NFTs detected"
+  // + offers stuck on "checking…" forever).
+  const seenLive = new Set<string>(cachedNfts.map((n) => `${String(n.collection).toLowerCase()}:${String(n.tokenId)}`));
   const pushLive = async (col: Address, tid: bigint): Promise<void> => {
     const k = `${String(col).toLowerCase()}:${String(tid)}`;
-    if (seenLive.has(k) || painted.has(k)) return;
+    if (seenLive.has(k)) return;
     seenLive.add(k);
+    if (painted.has(k)) {
+      // Already painted from cache — ensure it's in nfts (it is, via seed)
+      // but never repaint. Just make sure nfts contains it.
+      if (!nfts.some((n) => `${String(n.collection).toLowerCase()}:${String(n.tokenId)}` === k)) {
+        nfts.push({ collection: col, tokenId: tid });
+      }
+      return;
+    }
     nfts.push({ collection: col, tokenId: tid });
     const id = await paintCard({ collection: col, tokenId: tid });
     if (id) painted.set(k, id);
@@ -2060,37 +2072,40 @@ async function renderNFTsMenu(ctx: Context) {
       if (held && held.length > 0) {
         for (const r of held.slice(0, 12)) {
           const k = `${String(r.collection).toLowerCase()}:${String(r.tokenId)}`;
-          if (seenLive.has(k) || painted.has(k)) continue;
+          if (seenLive.has(k)) continue;
           priority.push({ collection: r.collection, tokenId: BigInt(r.tokenId as any) });
           await pushLive(r.collection, BigInt(r.tokenId as any));
         }
       }
-      // BACKFILL: cached tokens the indexer no longer lists (stale owners[] —
-      // your #9269 case). ownerOf-verify each cached token; keep what you still
-      // own. Cheap (1 RPC each) and closes the stale-indexer gap.
+      // BACKFILL: cached tokens may be stale (sold/transferred since cache).
+      // ownerOf-verify each cached token; DROP ones you no longer own so sold
+      // NFTs disappear instead of lingering. Cheap (1 RPC each, 8s timeout).
+      // (Your #9269 case: if chain says you own it, it stays. If the indexer
+      // forgot it but chain confirms, it stays too — seed already has it.)
       if (cachedNfts.length > 0) {
         try {
           const { createPublicClient, http } = await import("viem");
           const cfg = getChainConfig(ELYSIUM.key);
           const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
-          for (const c of cachedNfts.slice(0, 12)) {
-            const k = `${String(c.collection).toLowerCase()}:${String(c.tokenId)}`;
-            if (seenLive.has(k) || painted.has(k)) continue;
-            try {
-              const own = (await Promise.race([
-                pc.readContract({
-                  address: c.collection, abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as any,
-                  functionName: "ownerOf", args: [c.tokenId],
-                } as any),
-                new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000)),
-              ]).catch(() => null)) as Address | null;
-              if (own && own.toLowerCase() === (user.wallet_address as string).toLowerCase()) {
-                priority.push({ collection: c.collection, tokenId: c.tokenId });
-                await pushLive(c.collection, c.tokenId);
-              }
-            } catch { /* unverifiable — skip */ }
+          const stillOwned = await Promise.all(cachedNfts.slice(0, 12).map((c) =>
+            Promise.race([
+              pc.readContract({
+                address: c.collection, abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as any,
+                functionName: "ownerOf", args: [c.tokenId],
+              } as any),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000)),
+            ]).then((o) => ({ c, owned: !!o && String(o).toLowerCase() === (user.wallet_address as string).toLowerCase() }))
+              .catch(() => ({ c, owned: true }))
+          ));
+          // Keep unverifiable (assume still owned — never blank on RPC hiccup),
+          // drop only PROVEN-sold.
+          const ownedKeys = new Set(stillOwned.filter((r) => r.owned).map((r) => `${String(r.c.collection).toLowerCase()}:${String(r.c.tokenId)}`));
+          for (let i = nfts.length - 1; i >= 0; i--) {
+            const k = `${String(nfts[i].collection).toLowerCase()}:${String(nfts[i].tokenId)}`;
+            const isCached = cachedNfts.some((c) => `${String(c.collection).toLowerCase()}:${String(c.tokenId)}` === k);
+            if (isCached && !ownedKeys.has(k)) nfts.splice(i, 1);
           }
-        } catch { /* backfill best-effort */ }
+        } catch { /* backfill best-effort — keep seed on failure */ }
       }
     } catch { /* indexer miss -> RPC fallback below */ }
   }
