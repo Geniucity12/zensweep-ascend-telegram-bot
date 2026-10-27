@@ -805,14 +805,51 @@ export const kalosService = {
       return { ok: false, reason: `Offer would revert${decoded ? ` with ${decoded}` : ""}: ${cause}.${bidHint}` };
     }
   },
-  /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token. */
+  /** Gas-free pre-flight for acceptBids: verifies the bid exists and the caller owns the token.
+   * Checks specific-token bid, any-token bid (id 0), AND collection-wide bid —
+   * same 3-way lookup acceptBid uses. The old version only checked getTokenBid
+   * for the exact tokenId, so any-token/collection offers always failed with
+   * "No live bid" even though accepting them works. */
   async dryRunAccept(collection: Address, tokenId: bigint, bidder: Address, seller: Address): Promise<{ ok: boolean; reason?: string }> {
     const client = publicClient();
-    const bid: any = await client.readContract({
-      address: kalosAddr()!, abi: kalosAbi as any, functionName: "getTokenBid", args: [collection, tokenId, bidder],
-    } as any).catch(() => null);
-    if (!bid || bid.pricePerItem === 0n) {
-      return { ok: false, reason: `No live bid on #${tokenId} from ${bidder.slice(0, 10)}…. It may have been cancelled or already accepted.` };
+    const addr = kalosAddr()!;
+    const pick = (b: any): { p: bigint; t: Address | null } | null => {
+      if (!b) return null;
+      let p = 0n;
+      try { p = BigInt(b?.pricePerItem ?? b?.[1] ?? 0); } catch { p = 0n; }
+      if (p <= 0n) return null;
+      const t = (b?.paymentTokenAddress ?? b?.paymentToken ?? b?.[3] ?? null) as Address | null;
+      return { p, t };
+    };
+    let live: { p: bigint; t: Address | null } | null = null;
+    let liveSource = "";
+    try {
+      const specific: any = await client.readContract({
+        address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [collection, tokenId, bidder],
+      } as any).catch(() => null);
+      live = pick(specific);
+      if (live) liveSource = `token #${tokenId}`;
+    } catch { /* next */ }
+    if (!live && tokenId !== 0n) {
+      try {
+        const anyToken: any = await client.readContract({
+          address: addr, abi: kalosAbi as any, functionName: "getTokenBid", args: [collection, 0n, bidder],
+        } as any).catch(() => null);
+        const a = pick(anyToken);
+        if (a) { live = a; liveSource = `any-token bid`; }
+      } catch { /* next */ }
+    }
+    if (!live) {
+      try {
+        const coll: any = await client.readContract({
+          address: addr, abi: kalosAbi as any, functionName: "getCollectionBid", args: [collection, bidder],
+        } as any).catch(() => null);
+        const c = pick(coll);
+        if (c) { live = c; liveSource = `collection-wide bid`; }
+      } catch { /* none found */ }
+    }
+    if (!live) {
+      return { ok: false, reason: `No live bid on #${tokenId} from ${bidder.slice(0, 10)}… (checked specific, any-token, and collection-wide bids). It may have been cancelled, expired, or already accepted. Try /nfts to refresh offers.` };
     }
     const ownerNow = (await client.readContract({
       address: collection, abi: erc721Abi as any, functionName: "ownerOf", args: [tokenId],
@@ -820,14 +857,30 @@ export const kalosService = {
     if (!ownerNow || ownerNow.toLowerCase() !== seller.toLowerCase()) {
       return { ok: false, reason: `You don't own #${tokenId} right now — only the current owner can accept bids.` };
     }
-    const param = { bidType: 0, nftAddress: collection, tokenId, bidder, quantity: 1n, pricePerItem: bid.pricePerItem as bigint, paymentToken: (bid.paymentToken ?? await this.wnative()) as Address };
-    try {
-      await client.simulateContract({
-        address: kalosAddr()!, abi: kalosAbi as any, functionName: "acceptBids",
-        args: [[param]], account: seller,
-      } as any);
+    // Simulate with bidType 0 AND 1 — collection-wide fills need bidType 1.
+    // The old check only simulated bidType 0, so valid collection offers
+    // reported "would revert" at the dry-run and never reached the write.
+    const payToken = live.t ?? await this.wnative();
+    const sellerAcct = seller;
+    let simOk = false;
+    let lastErr: any = null;
+    for (const bt of [0, 1]) {
+      const p = { bidType: bt, nftAddress: collection, tokenId, bidder, quantity: 1n, pricePerItem: live.p, paymentToken: payToken };
+      try {
+        await client.simulateContract({
+          address: kalosAddr()!, abi: kalosAbi as any, functionName: "acceptBids",
+          args: [[p]], account: sellerAcct,
+        } as any);
+        simOk = true;
+        break;
+      } catch (e: any) { lastErr = e; }
+    }
+    if (simOk) {
+      void liveSource;
       return { ok: true };
-    } catch (e: any) {
+    }
+    const e: any = lastErr;
+    {
       const decoded = this.decodeContractError(e);
       const cause = (e?.cause?.shortMessage || e?.shortMessage || e?.message || "unknown").slice(0, 220);
       return { ok: false, reason: `Accept would revert${decoded ? ` with ${decoded}` : ""}: ${cause}` };
