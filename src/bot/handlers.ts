@@ -133,6 +133,10 @@ export function registerHandlers(bot: Bot) {
   bot.command("inventory", async (ctx) => {
     await renderNFTsMenu(ctx);
   });
+  bot.command("addnft", async (ctx) => {
+    const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
+    await handleAddNft(ctx, raw);
+  });
 
   // Direct minting removed — mint on the collection site; the bot tracks, sweeps and bids.
 
@@ -2238,6 +2242,9 @@ async function renderNFTsMenu(ctx: Context) {
   let msg = `🖼 *My NFT Inventory*\n` +
             `*Wallet:* \`${user.wallet_address}\`\n\n`;
 
+  // Escape hatch: pin a token into cache with one message (ownerOf-verified).
+  // For stale-indexer cases like MAYC #9269 — kalos.fun forgot it, chain owns it.
+
   // Live offers pass: merge into the ALREADY-PAINTED cards — edit in place,
   // paint only genuinely new NFTs. No second wall of cards, no resend.
   // Time-boxed: kalos.fun collection scope answers in ~1-2s. If it hangs,
@@ -2337,6 +2344,45 @@ async function renderNFTsMenu(ctx: Context) {
     .url("🆘 Support — help / stuck funds", SUPPORT_URL);
 
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: kb });
+}
+
+/** Pin a token into /nfts cache: /addnft <contract> <tokenId>. ownerOf-verified. */
+async function handleAddNft(ctx: Context, raw?: string) {
+  const userId = ctx.from?.id; if (!userId) return;
+  const user = dbService.getUser(userId);
+  if (!user) { await ctx.reply("Connect a wallet first.", { reply_markup: noWalletKeyboard }); return; }
+  const parts = (raw ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2 || !/^0x[a-fA-F0-9]{40}$/.test(parts[0]) || !/^\d+$/.test(parts[1])) {
+    await ctx.reply(`Usage: \`/addnft <contract> <tokenId>\`\n\ne.g. \`/addnft 0x29061d3603ecdd2677f7eefef9f3f2ef5b8a771d 9269\``, { parse_mode: "Markdown" });
+    return;
+  }
+  const collection = parts[0] as Address;
+  const tokenId = BigInt(parts[1]);
+  try {
+    const { createPublicClient, http } = await import("viem");
+    const cfg = getChainConfig(ELYSIUM.key);
+    const pc = createPublicClient({ chain: cfg.viemChain, transport: http(cfg.rpcUrl) });
+    const own = (await Promise.race([
+      pc.readContract({
+        address: collection, abi: [{ name: "ownerOf", type: "function", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ type: "address" }] }] as any,
+        functionName: "ownerOf", args: [tokenId],
+      } as any),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 10000)),
+    ]).catch(() => null)) as Address | null;
+    if (!own) { await ctx.reply(`❌ Can't verify #${parts[1]} — RPC didn't answer. Retry in a few seconds.`); return; }
+    if (own.toLowerCase() !== (user.wallet_address as string).toLowerCase()) {
+      await ctx.reply(`❌ You don't own #${parts[1]} — chain says owner is \`${own}\`, your wallet is \`${user.wallet_address}\`.`, { parse_mode: "Markdown" });
+      return;
+    }
+    const existing = dbService.getCachedNfts(userId);
+    const has = existing.some((r) => r.contract.toLowerCase() === collection.toLowerCase() && r.token_id === parts[1]);
+    if (!has) {
+      dbService.saveCachedNfts(userId, [...existing.map((r) => ({ contract: r.contract, token_id: r.token_id })), { contract: collection, token_id: parts[1] }].slice(0, 24));
+    }
+    await ctx.reply(`✅ *Pinned #${parts[1]}* — verified on-chain, saved to your inventory. Tap /nfts to see it with live offers.`, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+  } catch (e: any) {
+    await ctx.reply(`❌ Pin failed: ${escErr(e?.message ?? "unknown")}`);
+  }
 }
 
 // Mint prompts removed — mint on the collection site.

@@ -45,6 +45,7 @@ async function main() {
     { command: "unwatch", description: "Untrack — /unwatch [watch_id]" },
     { command: "alerts", description: "Floor & deployment pings" },
     { command: "nfts", description: "Your NFTs & live offers" },
+    { command: "addnft", description: "Pin a token — /addnft [contract] [id]" },
     { command: "wallet", description: "HYPE + WHYPE balances & wrap" },
     { command: "wrap", description: "Wrap HYPE → WHYPE — /wrap [amount|max]" },
     { command: "unwrap", description: "Unwrap WHYPE → HYPE — /unwrap [amount|max]" },
