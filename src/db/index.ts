@@ -105,6 +105,14 @@ export interface PositionRow {
   updated_at: string;
 }
 
+/** Last-known NFT inventory per wallet (cache so /nfts paints instantly). */
+export interface NftCacheRow {
+  user_id: number;
+  contract: string; // lowercased collection address
+  token_id: string;
+  updated_at: string;
+}
+
 interface Schema {
   users: Record<number, UserRow>;
   keys: Record<number, KeyRow>;
@@ -114,6 +122,7 @@ interface Schema {
   serviceFees: ServiceFeeRow[];
   watches: WatchRow[];
   positions: PositionRow[];
+  nftCache: NftCacheRow[];
   counters: { task: number; trade: number; listing: number; serviceFee: number; watch: number };
 }
 
@@ -127,6 +136,7 @@ function emptySchema(): Schema {
     serviceFees: [],
     watches: [],
     positions: [],
+    nftCache: [],
     counters: { task: 0, trade: 0, listing: 0, serviceFee: 0, watch: 0 },
   };
 }
@@ -546,6 +556,24 @@ export const dbService = {
     if (!row) return;
     row.last_seen_balance_wei = balanceWei;
     row.last_seen_tx_count = txCount;
+    store.save();
+  },
+  /** Last-known NFT inventory (instant first paint for /nfts). */
+  getCachedNfts(userId: number): NftCacheRow[] {
+    const rows = (store.schema.nftCache ?? []).filter((r) => r.user_id === userId);
+    return rows.slice().sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+  },
+  saveCachedNfts(userId: number, nfts: Array<{ contract: string; token_id: string }>): void {
+    if (!Array.isArray(store.schema.nftCache)) store.schema.nftCache = [];
+    store.schema.nftCache = store.schema.nftCache.filter((r) => r.user_id !== userId);
+    const now = new Date().toISOString();
+    const seen = new Set<string>();
+    for (const n of nfts) {
+      const k = `${String(n.contract).toLowerCase()}:${String(n.token_id)}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      store.schema.nftCache.push({ user_id: userId, contract: String(n.contract).toLowerCase(), token_id: String(n.token_id), updated_at: now });
+    }
     store.save();
   },
   isDeployAlertsEnabled(userId: number): boolean {

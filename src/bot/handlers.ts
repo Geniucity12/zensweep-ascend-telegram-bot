@@ -1970,14 +1970,59 @@ async function renderNFTsMenu(ctx: Context) {
 
   await ctx.reply(`🔍 Scanning your Elysium wallet for NFTs…`, { parse_mode: "Markdown" });
 
-  const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
-  // Your last buys first: the wallet's own recent receives pin the exact
-  // collection+tokenIds, so a just-bought NFT shows even when the
-  // directory-order probe hasn't reached that collection yet.
-  const priority: Array<{ collection: Address; tokenId: bigint }> = [];
+  // Instant first paint: show cached inventory NOW (same-second), then live-scan
+  // in the background and edit/add cards. The old flow blocked the whole
+  // /nfts on a 27-collection Transfer scan + per-token ownerOf confirms.
+  const { getWalletNFTReceives } = await import("../engine/elysium").catch(() => ({ getWalletNFTReceives: null as any }));
+  const { getIndexDirectory: getDir } = await import("../engine/kalos").catch(() => ({ getIndexDirectory: null as any }));
+  let dirCols: Array<{ address: Address; name: string; symbol: string }> = [];
+  try { if (getDir) dirCols = (await getDir()).cols; } catch { /* live-scan fills in */ }
+  const nameOf = (addr: string): { name: string; symbol: string } => {
+    const hit = dirCols.find((c) => c.address.toLowerCase() === addr.toLowerCase());
+    return hit ? { name: hit.name, symbol: hit.symbol } : { name: `#collection`, symbol: "" };
+  };
+  // 1) Cached inventory: last-known (collection, tokenId) from the local DB.
+  // No RPC at all — renders in the same second as the tap.
+  const cachedNfts: Array<{ collection: Address; tokenId: bigint }> = [];
   try {
-    const { getWalletNFTReceives } = await import("../engine/elysium");
-    const recents = await getWalletNFTReceives(user.wallet_address as Address, 25).catch(() => []);
+    const { dbService: _db } = await import("../db");
+    for (const t of _db.getCachedNfts(userId).slice(0, 12)) {
+      try { cachedNfts.push({ collection: t.contract as Address, tokenId: BigInt(t.token_id) }); } catch { /* skip bad rows */ }
+    }
+  } catch { /* no cache yet */ }
+  const paintCard = async (nft: { collection: Address; tokenId: bigint }, offerLine = `\n🤝 *Offers:* \`checking…\``): Promise<number | null> => {
+    try {
+      const meta = nameOf(String(nft.collection));
+      const title = meta.symbol ? `${meta.name} ($${meta.symbol})` : meta.name === "#collection" ? `NFT #${String(nft.tokenId)}` : meta.name;
+      const text = `🖼️ *${escMd(title)} #${escMd(String(nft.tokenId))}*\n\`${nft.collection}\`${offerLine}`;
+      const kb = new InlineKeyboard();
+      kb.text(`🏷️ List`, `kalos_list_${nft.collection}_${nft.tokenId}`).text(`🔍 Collection`, `col_inspect_${nft.collection}`).row();
+      kb.text("🔙 Menu", "menu_main");
+      const sent = await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
+      return sent.message_id;
+    } catch {
+      try {
+        const kb = new InlineKeyboard();
+        kb.text(`List`, `kalos_list_${nft.collection}_${nft.tokenId}`).text(`Collection`, `col_inspect_${nft.collection}`).row();
+        const sent = await ctx.reply(`NFT #${String(nft.tokenId)} ${nft.collection}`, { reply_markup: kb });
+        return sent.message_id;
+      } catch { return null; }
+    }
+  };
+  // Track painted cards by key so the live pass edits in place / adds new ones.
+  const painted = new Map<string, number>();
+  for (const nft of cachedNfts) {
+    const id = await paintCard(nft);
+    if (id) painted.set(`${String(nft.collection).toLowerCase()}:${String(nft.tokenId)}`, id);
+  }
+
+  const nfts: Array<{ collection: Address; tokenId: bigint }> = [];
+  // 2) Live pass: fast receives check first (bounded, newest-first), then the
+  // directory probe with whatever budget is left. result saved to cache.
+  const priority: Array<{ collection: Address; tokenId: bigint }> = [];
+  if (getWalletNFTReceives) {
+  try {
+    const recents = await getWalletNFTReceives(user.wallet_address as Address, 12).catch(() => []);
     const seenP = new Set<string>();
     for (const r of recents) {
       const k = `${r.collection.toLowerCase()}:${r.tokenId.toString()}`;
@@ -1998,17 +2043,13 @@ async function renderNFTsMenu(ctx: Context) {
       if (priority.length >= 12) break;
     }
   } catch { /* best-effort: fall through to directory probe */ }
+  } // end if (getWalletNFTReceives)
   for (const p of priority) nfts.push(p);
   try {
-    // Indexer-first: every known collection (whatever count kalos.fun lists),
-    // then probe ownership. RPC event scan is the fallback (indexer down).
-    // Skip collections already covered by priority (your recent buys).
+    // Directory probe with whatever budget is left. Reuses the already-loaded
+    // dirCols — no second directory fetch.
     const haveCols = new Set(nfts.map((n) => n.collection.toLowerCase()));
-    let discovered: Address[] = [];
-    try {
-      const { getIndexDirectory } = await import("../engine/kalos");
-      discovered = (await getIndexDirectory()).cols.map((c) => c.address);
-    } catch { discovered = []; }
+    const discovered: Address[] = dirCols.map((c) => c.address);
     if (discovered.length === 0) {
       const shared = await kalosService.cachedScan({ blocksBack: 200_000 }).catch(() => []);
       const seenDisc = new Set<string>();
@@ -2029,6 +2070,11 @@ async function renderNFTsMenu(ctx: Context) {
       } catch {}
     }
   } catch {}
+  // 3) Save live result to cache so the NEXT /nfts paints instantly.
+  try {
+    const { dbService: _db2 } = await import("../db");
+    _db2.saveCachedNfts(userId, nfts.slice(0, 24).map((n) => ({ contract: String(n.collection), token_id: String(n.tokenId) })));
+  } catch { /* cache is best-effort */ }
   const activeListings: Array<never> = [];
 
   if (nfts.length === 0) {
@@ -2051,23 +2097,36 @@ async function renderNFTsMenu(ctx: Context) {
   let msg = `🖼 *My NFT Inventory*\n` +
             `*Wallet:* \`${user.wallet_address}\`\n\n`;
 
-  // Incoming live offers on YOUR tokens (verified via getTokenBid + ownership).
-  // Shows a checking line first so "none right now" only appears AFTER a real scan.
+  // Live offers pass: merge into the ALREADY-PAINTED cards — edit in place,
+  // paint only genuinely new NFTs. No second wall of cards, no resend.
   let incomingBids: Array<{ collection: Address; tokenId: bigint; bidder: Address; price: bigint; expiration: bigint; collectionWide?: boolean }> = [];
   let bidsScanned = false;
-  await ctx.reply(`🤝 Checking live offers on your NFTs…`, { parse_mode: "Markdown" }).catch(() => null);
   try {
     const myTokens = nfts.slice(0, 12).map((n) => ({ collection: n.collection as Address, tokenId: BigInt(n.tokenId) }));
     if (myTokens.length > 0) {
+      if (ctx.chat) {
+        try { await ctx.api.sendChatAction(ctx.chat.id, "typing"); } catch { /* ignore */ }
+      }
       incomingBids = await kalosService.getIncomingBids(myTokens, user.wallet_address as Address, { perToken: 4 });
     }
     bidsScanned = true;
   } catch { incomingBids = []; bidsScanned = true; }
 
    // ONE card per NFT: top 3 live offers with Accept + List on the card itself.
-  // No giant shared wall — each token carries its own actions. Cards send via
-  // safeReply so a Markdown entity crash can NEVER swallow them silently.
-  let cardsSent = 0;
+  // Cards already painted from cache get EDITED with offers; only new NFTs
+  // send fresh cards. safeReply so a Markdown crash can NEVER swallow them.
+  let cardsSent = painted.size;
+  const editCard = async (chatId: number, msgId: number, text: string, kb: InlineKeyboard): Promise<boolean> => {
+    try {
+      await ctx.api.editMessageText(chatId, msgId, text, { parse_mode: "Markdown", reply_markup: kb });
+      return true;
+    } catch {
+      try {
+        await ctx.api.editMessageText(chatId, msgId, text.replace(/[*_`[\]]/g, ""), { reply_markup: kb });
+        return true;
+      } catch { return false; }
+    }
+  };
   for (const nft of nfts.slice(0, 12) as Array<{ collection: Address; tokenId: bigint }>) {
     const nftBids = incomingBids.filter(
       (b) => b.collection.toLowerCase() === String(nft.collection).toLowerCase() && b.tokenId.toString() === String(nft.tokenId)
@@ -2080,17 +2139,12 @@ async function renderNFTsMenu(ctx: Context) {
         ? `\n🤝 *Top Offer:* \`${kalosService.formatPrice(best.price)} HYPE\` from \`${best.bidder.slice(0, 6)}…${best.bidder.slice(-4)}\`${tagFor(best)}`
         : `\n🤝 *Offers:* \`none right now — list it or wait for bids\``;
     const extraLine = nftBids.length > 1 ? ` (+${nftBids.length - 1} more)` : "";
-    let meta = { name: `#${String(nft.tokenId)}`, symbol: "" };
-    try {
-      const { getIndexDirectory } = await import("../engine/kalos");
-      const dir = await getIndexDirectory();
-      const hit = dir.cols.find((c) => c.address.toLowerCase() === String(nft.collection).toLowerCase());
-      if (hit) meta = { name: hit.name, symbol: hit.symbol };
-      else meta = await readCollectionMeta(nft.collection as Address);
-    } catch {
-      try { meta = await readCollectionMeta(nft.collection as Address); } catch { /* keep fallback */ }
-    }
-    const text = `🖼️ *${escMd(meta.name)} #${escMd(String(nft.tokenId))}*\n\`${nft.collection}\`${offerLine}${extraLine}`;
+    const meta = (() => {
+      const hit = dirCols.find((c) => c.address.toLowerCase() === String(nft.collection).toLowerCase());
+      return hit ? { name: hit.name, symbol: hit.symbol } : { name: `#${String(nft.tokenId)}`, symbol: "" };
+    })();
+    const title = meta.symbol ? `${meta.name} ($${meta.symbol})` : meta.name === `#${String(nft.tokenId)}` ? `NFT #${String(nft.tokenId)}` : meta.name;
+    const text = `🖼️ *${escMd(title)} #${escMd(String(nft.tokenId))}*\n\`${nft.collection}\`${offerLine}${extraLine}`;
     const cardKb = (() => {
       const kb = new InlineKeyboard();
       if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)}`, `kacc_${registerAcceptOffer(nft.collection as Address, nft.tokenId, best.bidder)}`).row();
@@ -2102,6 +2156,12 @@ async function renderNFTsMenu(ctx: Context) {
       kb.text("🔙 Menu", "menu_main");
       return kb;
     })();
+    const key = `${String(nft.collection).toLowerCase()}:${String(nft.tokenId)}`;
+    const existingId = painted.get(key);
+    if (existingId && ctx.chat) {
+      if (await editCard(ctx.chat.id, existingId, text, cardKb)) { cardsSent++; continue; }
+      // edit failed (message too old?) — fall through to fresh send
+    }
     const sent = await safeReply(ctx, text, { reply_markup: cardKb });
     if (sent) cardsSent++;
   }
@@ -2115,14 +2175,10 @@ async function renderNFTsMenu(ctx: Context) {
     );
   }
 
-  // Summary footer ONLY (counts + active listings with Cancel) — no per-NFT
-  // lines here anymore, each NFT already got its own card above.
-
-  // Summary footer: counts + ACTIVE listings, each with its own Cancel.
-  // (Your screenshot showed a listing with NO cancel path — now every listing
-  // gets one, and the cards above carry List/Accept per NFT.)
+  // Summary footer: compact count + refresh. Cards above already carry
+  // List/Accept per NFT — the footer never repeats per-token lines.
   if (nfts.length > 0) {
-    msg += `*Held NFTs: ${nfts.length} (each has its own card above with Accept/Offer buttons)*\n\n`;
+    msg += `*Held NFTs: ${nfts.length} — cards above ☝️ (each with List + Accept)*\n\n`;
   }
 
   const kb = new InlineKeyboard();
