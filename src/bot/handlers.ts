@@ -27,15 +27,40 @@ function escErr(input: unknown): string {
 }
 
 /** Reply with Markdown; if Telegram rejects the entities (dynamic text),
- * retry as plain text with formatting stripped. Never throws. */
-async function safeReply(ctx: Context, text: string, extra?: Record<string, unknown>): Promise<void> {
+ * retry as plain text with formatting stripped. Returns true if either send
+ * succeeded. Never throws. */
+async function safeReply(ctx: Context, text: string, extra?: Record<string, unknown>): Promise<boolean> {
   try {
     await ctx.reply(text, { parse_mode: "Markdown", ...(extra ?? {}) } as any);
+    return true;
   } catch {
     try {
       await ctx.reply(text.replace(/[*_`[\]]/g, ""), { ...(extra ?? {}) } as any);
-    } catch { /* give up silently — never crash a flow on a send */ }
+      return true;
+    } catch { return false; }
   }
+}
+
+// Short accept-button ids: Telegram callback_data is capped at 64 bytes, but
+// `kalos_accept_<40-hex>_<tid>_<40-hex>` is ~100 chars, so Telegram rejects
+// the ENTIRE card send (both Markdown + plain fallback) and /nfts shows the
+// footer with zero cards. Store the triple server-side, put only 8 chars on
+// the wire: `kacc_<id>` (13 bytes, always valid).
+const pendingAccepts = new Map<string, { contract: Address; tokenId: string; bidder: Address; expiresAt: number }>();
+function registerAcceptOffer(contract: Address, tokenId: string | bigint, bidder: Address): string {
+  // Purge expired (best-effort, avoids unbounded growth).
+  try {
+    const now = Date.now();
+    for (const [k, v] of pendingAccepts) if (v.expiresAt < now) pendingAccepts.delete(k);
+  } catch { /* ignore */ }
+  let id = "";
+  for (let i = 0; i < 5; i++) {
+    id = Math.random().toString(36).slice(2, 10);
+    if (id.length >= 6 && !pendingAccepts.has(id)) break;
+  }
+  if (!id || pendingAccepts.has(id)) id = `${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`.slice(0, 8);
+  pendingAccepts.set(id, { contract, tokenId: String(tokenId), bidder, expiresAt: Date.now() + 10 * 60_000 });
+  return id;
 }
 
 // Collection metadata cache: names rarely change — avoid re-hammering the RPC every menu open.
@@ -467,9 +492,20 @@ export function registerHandlers(bot: Bot) {
   // Listing-confirm callbacks removed — listings live on kalos.fun.
 
   // 1-tap Accept from an /nfts card: straight to the confirm quote, no typing.
+  // Legacy long form (pre-short-ids) kept for old messages still in chat.
   bot.callbackQuery(/^kalos_accept_(0x[a-fA-F0-9]{40})_(\d+)_(0x[a-fA-F0-9]{40})$/i, async (ctx) => {
     ctx.answerCallbackQuery().catch(() => {});
     await promptNftAccept(ctx, `${ctx.match[1]} ${ctx.match[2]} ${ctx.match[3]}`);
+  });
+  // Short form: kacc_<id> (13 bytes, under Telegram's 64-byte callback cap).
+  bot.callbackQuery(/^kacc_([a-z0-9]{6,12})$/i, async (ctx) => {
+    ctx.answerCallbackQuery().catch(() => {});
+    const hit = pendingAccepts.get(ctx.match[1]);
+    if (!hit || Date.now() > hit.expiresAt) {
+      await ctx.reply("That offer button expired (10 min). Run /nfts again for fresh offers.");
+      return;
+    }
+    await promptNftAccept(ctx, `${hit.contract} ${hit.tokenId} ${hit.bidder}`);
   });
 
   // Delist-confirm removed — cancel listings on kalos.fun.
@@ -2017,19 +2053,17 @@ async function renderNFTsMenu(ctx: Context) {
     const text = `🖼️ *${escMd(meta.name)} #${escMd(String(nft.tokenId))}*\n\`${nft.collection}\`${offerLine}${extraLine}`;
     const cardKb = (() => {
       const kb = new InlineKeyboard();
-      if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${best.bidder}`).row();
+      if (best) kb.text(`✅ Accept ${kalosService.formatPrice(best.price)}`, `kacc_${registerAcceptOffer(nft.collection as Address, nft.tokenId, best.bidder)}`).row();
       for (const b of nftBids) {
         const tag = b.collectionWide ? ` (any)` : ``;
-        kb.text(`🤝 ${kalosService.formatPrice(b.price)}${tag} from ${b.bidder.slice(0, 6)}…${b.bidder.slice(-4)}`, `kalos_accept_${nft.collection}_${nft.tokenId}_${b.bidder}`).row();
+        kb.text(`🤝 ${kalosService.formatPrice(b.price)}${tag} from ${b.bidder.slice(0, 6)}…${b.bidder.slice(-4)}`, `kacc_${registerAcceptOffer(nft.collection as Address, nft.tokenId, b.bidder)}`).row();
       }
       kb.text(`🏷️ List`, `kalos_list_${nft.collection}_${nft.tokenId}`).text(`🔍 Collection`, `col_inspect_${nft.collection}`).row();
       kb.text("🔙 Menu", "menu_main");
       return kb;
     })();
-    try {
-      await safeReply(ctx, text, { reply_markup: cardKb });
-      cardsSent++;
-    } catch { /* safeReply never throws; belt-and-braces */ }
+    const sent = await safeReply(ctx, text, { reply_markup: cardKb });
+    if (sent) cardsSent++;
   }
   // Self-heal: if we found NFTs but ZERO cards sent, say so loudly instead of
   // the lying "each has its own card above" footer your screenshot caught.
