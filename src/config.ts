@@ -70,9 +70,24 @@ export const ELYSIUM_MAINNET: ChainConfig = {
 
 export const SUPPORTED_CHAINS: ChainConfig[] = [ELYSIUM, ELYSIUM_MAINNET];
 const byKey = new Map<string, ChainConfig>(SUPPORTED_CHAINS.map((c) => [c.key, c]));
-export const DEFAULT_CHAIN_KEY = ELYSIUM.key;
-export function getChainConfig(key: string): ChainConfig { return byKey.get(key) ?? ELYSIUM; }
-export function resolveChainKey(input?: string | null): string { if (!input) return DEFAULT_CHAIN_KEY; return byKey.has(input) ? input : DEFAULT_CHAIN_KEY; }
+
+/**
+ * Ascend only exists on Elysium mainnet (99901), so that is the default.
+ * Defaulting to testnet made /start show a testnet balance while /buy traded
+ * mainnet — two different wallets' worth of confusion.
+ */
+export const DEFAULT_CHAIN_KEY = ELYSIUM_MAINNET.key;
+
+export function getChainConfig(key: string): ChainConfig {
+  return byKey.get(key) ?? ELYSIUM_MAINNET;
+}
+
+/** Anything that is not explicitly mainnet resolves to mainnet. */
+export function resolveChainKey(input?: string | null): string {
+  if (!input) return DEFAULT_CHAIN_KEY;
+  if (byKey.has(input)) return input;
+  return DEFAULT_CHAIN_KEY;
+}
 
 export const FEE_PERCENTAGE = Number(env("FEE_PERCENTAGE", "0.025"));
 export const FEE_RECIPIENT_WALLET = env("FEE_RECIPIENT_WALLET", "");

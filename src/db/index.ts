@@ -213,7 +213,11 @@ const store = new JsonStore(dbPath);
 export const dbService = {
   // --- Users ---
   getUser(userId: number): UserRow | undefined {
-    return store.schema.users[userId];
+    const row = store.schema.users[userId];
+    if (!row) return undefined;
+    // Rows written before Ascend existed may still say "elysium" (testnet).
+    // Ascend only lives on mainnet, so normalise on read rather than migrate.
+    return { ...row, selected_chain: resolveChainKey(row.selected_chain) };
   },
 
   upsertUser(userId: number, walletAddress: string, chainKey: string): UserRow {
