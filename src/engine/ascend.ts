@@ -879,59 +879,66 @@ export function quoteOutToUnit(raw: bigint, decimals: number): string {
 }
 
 /**
- * Ensure the wallet can pay the quote asset.
+ * Ensure the wallet can pay for a trade.
  *
- * The quote asset is a wrapped-HYPE ERC-20, so this:
- *   1. wraps native HYPE -> WHYPE up to `amount`,
- *   2. approves Permit2 on WHYPE (ERC-20 approve),
- *   3. approves the Universal Router as a Permit2 spender.
- * Returns the tx hashes that were sent (empty when nothing was needed).
+ * Buys pay in WHYPE (wrapped-HYPE ERC-20), so `wrapNative` wraps native HYPE
+ * first. Sells pay in the token itself and never wrap.
+ *
+ * Both paths clear the same two gates the Universal Router needs:
+ *   1. ERC-20 approve(Permit2) on the asset being spent,
+ *   2. Permit2 approve(router) for that asset.
+ * Returns the tx hashes sent (empty when nothing was needed).
  */
-export async function ensureQuoteAllowance(
+export async function ensureSpendApproval(
   pk: Hex,
   owner: Address,
-  amount: bigint
+  asset: Address,
+  amount: bigint,
+  wrapNative: boolean
 ): Promise<{ hashes: Hex[] }> {
   const client = walletFor(pk);
   const account = client.account!;
   const pubClient = pub();
-  const w = ASCEND_WHYPE;
   const hashes: Hex[] = [];
 
-  // 1. Wrap enough native HYPE into WHYPE.
-  const bal = (await pubClient.readContract({
-    address: w,
-    abi: whypeAbi,
-    functionName: "balanceOf",
-    args: [owner],
-  })) as bigint;
-  if (bal < amount) {
-    const h = await client.writeContract({
-      address: w,
+  // 1. Buys only: wrap enough native HYPE into WHYPE.
+  if (wrapNative) {
+    const bal = (await pubClient.readContract({
+      address: asset,
       abi: whypeAbi,
-      functionName: "deposit",
-      args: [],
-      value: amount - bal,
-      chain: cfg().viemChain,
-      account,
-    });
-    await pubClient.waitForTransactionReceipt({ hash: h });
-    hashes.push(h);
+      functionName: "balanceOf",
+      args: [owner],
+    })) as bigint;
+    if (bal < amount) {
+      const h = await client.writeContract({
+        address: asset,
+        abi: whypeAbi,
+        functionName: "deposit",
+        args: [],
+        value: amount - bal,
+        chain: cfg().viemChain,
+        account,
+      });
+      await pubClient.waitForTransactionReceipt({ hash: h });
+      hashes.push(h);
+    }
   }
 
-  // 2. ERC-20 approve Permit2 to spend WHYPE.
-  const ercAllow = (await pubClient.readContract({
-    address: w,
-    abi: erc20Abi,
-    functionName: "allowance",
-    args: [owner, ASCEND.permit2],
-  })) as bigint;
+  // 2. ERC-20 approve Permit2 to spend the asset.
+  const ercAllow = (await pubClient
+    .readContract({
+      address: asset,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [owner, ASCEND.permit2],
+    })
+    .catch(() => 0n)) as bigint;
   if (ercAllow < amount) {
     const h = await client.writeContract({
-      address: w,
+      address: asset,
       abi: erc20Abi,
       functionName: "approve",
-      args: [ASCEND.permit2, amount * 10n],
+      args: [ASCEND.permit2, 2n ** 256n - 1n],
       chain: cfg().viemChain,
       account,
     });
@@ -940,19 +947,27 @@ export async function ensureQuoteAllowance(
   }
 
   // 3. Permit2 approve the router as a spender.
-  const permitAllow = (await pubClient.readContract({
-    address: ASCEND.permit2,
-    abi: permit2Abi,
-    functionName: "allowance",
-    args: [owner, w, ASCEND.universalRouter],
-  })) as readonly [bigint, number, number];
+  let permitAmount = 0n;
+  let permitExpiry = 0;
+  try {
+    const a = (await pubClient.readContract({
+      address: ASCEND.permit2,
+      abi: permit2Abi,
+      functionName: "allowance",
+      args: [owner, asset, ASCEND.universalRouter],
+    })) as readonly [bigint, number, number];
+    permitAmount = a[0];
+    permitExpiry = Number(a[1]);
+  } catch {
+    /* unset */
+  }
   const now = Math.floor(Date.now() / 1000);
-  if (permitAllow[0] < amount || permitAllow[1] < now) {
+  if (permitAmount < amount || permitExpiry < now) {
     const h = await client.writeContract({
       address: ASCEND.permit2,
       abi: permit2Abi,
       functionName: "approve",
-      args: [w, ASCEND.universalRouter, 2n ** 160n - 1n, Number(now) + 30 * 86400],
+      args: [asset, ASCEND.universalRouter, 2n ** 160n - 1n, now + 30 * 86400],
       chain: cfg().viemChain,
       account,
     });
@@ -961,6 +976,66 @@ export async function ensureQuoteAllowance(
   }
 
   return { hashes };
+}
+
+/** Back-compat: a buy is just an approval on WHYPE with wrapping enabled. */
+export async function ensureQuoteAllowance(pk: Hex, owner: Address, amount: bigint) {
+  return ensureSpendApproval(pk, owner, ASCEND_WHYPE, amount, true);
+}
+
+/**
+ * Read-only readiness check — does NOT send anything.
+ *
+ * A buy pays in WHYPE through Permit2, so a fresh wallet is not ready even
+ * though its native HYPE balance looks fine. Reporting this up front is much
+ * friendlier than a raw AllowanceExpired revert at confirm time.
+ */
+export async function checkSpendReadiness(owner: Address, asset: Address, amount: bigint): Promise<{
+  ready: boolean;
+  assetBalance: bigint;
+  needsErc20Approval: boolean;
+  needsPermit2Approval: boolean;
+}> {
+  const pubClient = pub();
+
+  const assetBalance = (await pubClient
+    .readContract({ address: asset, abi: erc20Abi, functionName: "balanceOf", args: [owner] })
+    .catch(() => 0n)) as bigint;
+
+  const ercAllow = (await pubClient
+    .readContract({ address: asset, abi: erc20Abi, functionName: "allowance", args: [owner, ASCEND.permit2] })
+    .catch(() => 0n)) as bigint;
+
+  let permitAmount = 0n;
+  let permitExpiry = 0;
+  try {
+    const a = (await pubClient.readContract({
+      address: ASCEND.permit2,
+      abi: permit2Abi,
+      functionName: "allowance",
+      args: [owner, asset, ASCEND.universalRouter],
+    })) as readonly [bigint, number, number];
+    permitAmount = a[0];
+    permitExpiry = Number(a[1]);
+  } catch {
+    /* unset */
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const needsErc20Approval = ercAllow < amount;
+  const needsPermit2Approval = permitAmount < amount || permitExpiry < now;
+
+  return {
+    ready: !needsErc20Approval && !needsPermit2Approval && assetBalance >= amount,
+    assetBalance,
+    needsErc20Approval,
+    needsPermit2Approval,
+  };
+}
+
+/** Buy-specific shim: the spend asset is always WHYPE. */
+export async function checkBuyReadiness(owner: Address, amount: bigint) {
+  return checkSpendReadiness(owner, ASCEND_WHYPE, amount);
 }
 
 /** Do the contracts actually have code on this chain? Guards against wrong-network sends. */

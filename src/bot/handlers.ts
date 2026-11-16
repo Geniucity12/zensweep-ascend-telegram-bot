@@ -202,6 +202,25 @@ export function registerHandlers(bot: Bot) {
 
     try {
       const info = await ascend.getPoolInfo(p.token);
+
+      // Clear the Permit2 gates first. A first trade needs up to 3 extra txs
+      // (wrap, ERC-20 approve, Permit2 approve); later trades need none.
+      const spendAsset = p.kind === "buy" ? ascend.ASCEND_WHYPE : p.token;
+      const approvals = await ascend.ensureSpendApproval(
+        wallet.privateKey,
+        wallet.address,
+        spendAsset,
+        p.amountIn,
+        p.kind === "buy"
+      );
+      if (approvals.hashes.length > 0) {
+        await ctx
+          .editMessageText(
+            `🔓 Sent ${approvals.hashes.length} approval${approvals.hashes.length > 1 ? "s" : ""} — now swapping…`
+          )
+          .catch(() => {});
+      }
+
       const plan = p.kind === "buy"
         ? ascend.buildBuyPlan(info, p.amountIn, p.minOut, wallet.address, true)
         : ascend.buildSellPlan(info, p.amountIn, p.minOut, wallet.address, true);
@@ -3619,6 +3638,16 @@ async function prepareAscendTrade(
   // Simulate the exact transaction. No gas is spent on failure.
   const sim = await ascend.simulatePlan(plan, wallet.address);
 
+  // A buy pays in WHYPE through Permit2, so a fresh wallet fails the sim even
+  // with plenty of native HYPE. Check readiness so the card can say what is
+  // missing instead of showing a raw AllowanceExpired revert.
+  const spendAsset = kind === "buy" ? ascend.ASCEND_WHYPE : token;
+  const readiness = await ascend
+    .checkSpendReadiness(wallet.address, spendAsset, amountIn)
+    .catch(() => null);
+  const needsApproval = !!readiness && !readiness.ready;
+  const canProceed = sim.ok || needsApproval;
+
   const id = newAscendId();
   pendingAscend.set(id, { kind, token, amountIn, minOut, userId, expiresAt: Date.now() + 3 * 60_000 });
 
@@ -3645,13 +3674,27 @@ async function prepareAscendTrade(
   L.push("");
   if (sim.ok) {
     L.push("✅ *Simulation passed* — no gas spent, would succeed.");
+  } else if (needsApproval) {
+    L.push("🔓 *Approval needed first* — this is normal on a first trade.");
+    if (readiness!.needsErc20Approval) L.push("• approve Permit2 to spend the asset");
+    if (readiness!.needsPermit2Approval) L.push("• approve the router in Permit2");
+    if (readiness!.assetBalance < amountIn) {
+      L.push(kind === "buy" ? "• wrap HYPE → WHYPE" : "• you don't hold enough of this token");
+    }
+    L.push("");
+    L.push("_Tapping the button sends those approvals, then the swap._");
   } else {
     L.push("❌ *Simulation failed* — not sending.");
     L.push(`\`${escErr(sim.error)}\``);
   }
 
   const kb = new InlineKeyboard();
-  if (sim.ok) kb.text(kind === "buy" ? "✅ Buy" : "✅ Sell", `asc_go_${id}`).row();
+  if (canProceed) {
+    const label = sim.ok
+      ? kind === "buy" ? "✅ Buy" : "✅ Sell"
+      : "🔓 Approve & " + (kind === "buy" ? "Buy" : "Sell");
+    kb.text(label, `asc_go_${id}`).row();
+  }
   kb.text("✖ Cancel", "asc_no");
 
   const body = L.join("\n");
