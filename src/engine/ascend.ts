@@ -434,6 +434,51 @@ export async function findLaunchesForToken(token: Address, lookbackBlocks: bigin
   return out.sort((a, b) => Number(b.blockNumber - a.blockNumber));
 }
 
+/**
+ * Recent Ascend launches, newest first — the "live tokens" feed.
+ * Walks the launchpad's Launched events backwards in bounded chunks.
+ */
+export async function recentLaunches(limit: number = 8, lookbackBlocks: bigint = 400_000n): Promise<LaunchedInfo[]> {
+  const client = pub();
+  const head = await client.getBlockNumber();
+  const floor = head > lookbackBlocks ? head - lookbackBlocks : 0n;
+  const out: LaunchedInfo[] = [];
+
+  let to = head;
+  while (to > floor && out.length < limit) {
+    const from = to - LOG_CHUNK + 1n > floor ? to - LOG_CHUNK + 1n : floor;
+    try {
+      const logs = (await client.getLogs({
+        address: ASCEND.launchpad,
+        event: LAUNCHED_EVENT,
+        fromBlock: from,
+        toBlock: to,
+      })) as any[];
+      for (const l of logs) {
+        const a: any = l.args ?? {};
+        if (!a.poolId) continue;
+        out.push({
+          poolId: a.poolId,
+          token: a.token,
+          creator: a.creator,
+          quote: a.quote,
+          fee: Number(a.fee),
+          builderFee: Number(a.builderFee),
+          supplySeeded: a.supplySeeded,
+          devBuyTokens: a.devBuyTokens,
+          blockNumber: l.blockNumber ?? 0n,
+        });
+      }
+      if (out.length >= limit) break;
+    } catch {
+      /* skip a rejected range */
+    }
+    if (from <= floor) break;
+    to = from - 1n;
+  }
+
+  return out.sort((a, b) => Number(b.blockNumber - a.blockNumber)).slice(0, limit);
+}
 
 export interface Quote {
   amountIn: bigint;

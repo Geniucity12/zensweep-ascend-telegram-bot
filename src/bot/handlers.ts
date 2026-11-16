@@ -12,6 +12,7 @@ import {
   makeCollectionKeyboard,
 } from "./keyboards";
 import { formatEther, parseEther, type Address, type Hex } from "viem";
+import * as ascend from "../engine/ascend";
 
 /** Escape Telegram legacy-Markdown special chars in dynamic text (names, etc). */
 function escMd(input: string): string {
@@ -83,15 +84,19 @@ export function registerHandlers(bot: Bot) {
     const chain = user?.selected_chain || DEFAULT_CHAIN_KEY;
     const chainConfig = getChainConfig(chain);
 
-    let message = `🟢 *Zensweep — Kalos NFTs on Elysium*\n\n`;
-    message += `🌐 *Active Chain:* \`${chainConfig.name}\`\n`;
-    message += `🧭 *Focus:* live floors, 1-tap sweeps, fire-and-forget offers, floor-drop pings.\n\n`;
+    let message = `🟢 *Zensweep — Ascend trading on Elysium*\n\n`;
+    message += `🌐 *Chain:* \`${chainConfig.name}\`\n`;
+    message += `🧭 *What you can do:* check a CA, buy, sell, watch new launches.\n\n`;
 
     if (user) {
       const balance = await walletManager.getBalance(user.wallet_address as Address, chain, false);
       message += `💳 *Wallet:* \`${user.wallet_address}\`\n`;
       message += `💰 *Balance:* \`${balance.eth} ${balance.symbol}\`\n\n`;
-      message += `Use Zensweep to sweep floors, place bids, and track collections — fastest finger on Kalos.\n\n${BURNER_TIP}`;
+      message += `*Quick start*\n`;
+      message += `• \`/launches\` — new Ascend coins\n`;
+      message += `• \`/token 0x…\` — check a CA before you ape\n`;
+      message += `• \`/buy 0x… 0.5\` — spend 0.5 HYPE\n`;
+      message += `• \`/sell 0x… max\` — exit\n\n${BURNER_TIP}`;
       await ctx.reply(message, { parse_mode: "Markdown", reply_markup: mainKeyboard });
     } else {
       message += `🔴 *No wallet connected yet.*\n\nCreate a server-managed wallet to get started. Your signing key stays on-host and never leaves the bot server.\n\n${BURNER_TIP}`;
@@ -133,6 +138,88 @@ export function registerHandlers(bot: Bot) {
   bot.command("inventory", async (ctx) => {
     await renderNFTsMenu(ctx);
   });
+  // ---- Ascend trading (Elysium mainnet 99901) ----
+  bot.command("token", handleTokenCommand);
+  bot.command("buy", handleAscendBuy);
+  bot.command("sell", handleAscendSell);
+  bot.command("launches", handleLaunches);
+
+  // Menu buttons mirror the commands above.
+  bot.callbackQuery("menu_token", async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.reply("Paste the CA you want to check:\n`/token 0x…`", { parse_mode: "Markdown" }).catch(() => {});
+  });
+  bot.callbackQuery("menu_buy", async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.reply("`/buy 0x<CA> <HYPE amount>`\ne.g. `/buy 0x1234…abcd 0.5`", { parse_mode: "Markdown" }).catch(() => {});
+  });
+  bot.callbackQuery("menu_sell", async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.reply("`/sell 0x<CA> <amount|max>`", { parse_mode: "Markdown" }).catch(() => {});
+  });
+  bot.callbackQuery("menu_launches", async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    await handleLaunches(ctx);
+  });
+  bot.callbackQuery(/^asc_tok_(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
+    const ca = ctx.match?.[1];
+    if (!ca) return;
+    // Reuse the /token card by faking the match.
+    (ctx as any).match = ca;
+    await handleTokenCommand(ctx);
+  });
+
+  bot.callbackQuery("asc_no", async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Cancelled" }).catch(() => {});
+    await ctx.deleteMessage().catch(() => {});
+  });
+
+  bot.callbackQuery(/^asc_go_(.+)$/, async (ctx) => {
+    const id = ctx.match?.[1];
+    const p = id ? pendingAscend.get(id) : undefined;
+    if (!p || p.userId !== ctx.from.id || p.expiresAt < Date.now()) {
+      await ctx.answerCallbackQuery({ text: "Expired — run the command again.", show_alert: true }).catch(() => {});
+      if (id) pendingAscend.delete(id);
+      return;
+    }
+    pendingAscend.delete(id!);
+    await ctx.answerCallbackQuery({ text: "Sending…" }).catch(() => {});
+
+    if (!ascend.tradingEnabled()) {
+      await ctx.editMessageText(
+        "🔒 *Trading is disabled on this server.*\n\nSet `ASCEND_TRADING_ENABLED=true` to allow real swaps. Everything up to this point (quote, build, simulate) succeeded.",
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+      return;
+    }
+
+    const wallet = walletManager.getUserWallet(p.userId);
+    if (!wallet) {
+      await ctx.editMessageText("No wallet found.").catch(() => {});
+      return;
+    }
+
+    try {
+      const info = await ascend.getPoolInfo(p.token);
+      const plan = p.kind === "buy"
+        ? ascend.buildBuyPlan(info, p.amountIn, p.minOut, wallet.address, true)
+        : ascend.buildSellPlan(info, p.amountIn, p.minOut, wallet.address, true);
+      const { txHash } = await ascend.executePlan(wallet.privateKey, plan);
+
+      const url = `https://elysium.kinetiq.xyz/explorer/tx/${txHash}`;
+      await ctx.editMessageText(
+        `${p.kind === "buy" ? "✅ *Bought*" : "✅ *Sold*"}\n\nTx: \`${txHash}\`\n${url}`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+    } catch (e: any) {
+      const m = e?.shortMessage ?? e?.message ?? String(e);
+      await ctx.editMessageText(`❌ Transaction failed: \`${escErr(m)}\``, { parse_mode: "Markdown" }).catch(async () => {
+        await ctx.editMessageText(`Transaction failed: ${String(m).slice(0, 300)}`).catch(() => {});
+      });
+    }
+  });
+
   bot.command("addnft", async (ctx) => {
     const raw = ctx.message?.text?.split(/\s+/).slice(1).join(" ") ?? "";
     await handleAddNft(ctx, raw);
@@ -281,8 +368,8 @@ export function registerHandlers(bot: Bot) {
     const chain = user?.selected_chain || DEFAULT_CHAIN_KEY;
     const chainConfig = getChainConfig(chain);
 
-    let message = `🟢 *Zensweep — Kalos NFTs on Elysium*\n\n`;
-    message += `🌐 *Active Chain:* \`${chainConfig.name}\`\n`;
+    let message = `🟢 *Zensweep — Ascend trading on Elysium*\n\n`;
+    message += `🌐 *Chain:* \`${chainConfig.name}\`\n`;
 
     if (user) {
       const balance = await walletManager.getBalance(user.wallet_address as Address, chain, false);
@@ -3293,32 +3380,379 @@ async function handleUnwrap(ctx: Context, raw?: string) {
 
 
 async function renderHelpMenu(ctx: Context) {
-  let msg = `ℹ️ *Zensweep — fastest finger on Kalos (Elysium NFTs)*\n\n`;
-  msg += `*Find it:*\n`;
-  msg += `• \`/collections\` — live feed, real names + floors + top offers\n`;
-  msg += `• \`/sweep <contract> [maxTotalHYPE] [count]\` — cheapest live asks, total-budget capped\n`;
-  msg += `  e.g. \`/sweep 0x… 10 3\` — 3 cheapest, max 10 HYPE total\n`;
-  msg += `\n*Bid it (durations: 3 = 3 days, 6h = 6 hours, 30m = 30 mins):*\n`;
-  msg += `• \`/offer <collection> [tokenId] <price> [duration]\` — any-token or specific\n`;
-  msg += `  e.g. \`/offer 0x… 0.5 6h\` — 0.5 on any token, 6 hours\n`;
-  msg += `• \`/accept <collection> <tokenId> <bidder>\` — accept a bid on your NFT\n`;
-  msg += `\n*Sell it:*\n`;
-  msg += `• \`/nftlist <collection> <tokenId> <price> [duration]\` — list your NFT on Kalos\n`;
-  msg += `  e.g. \`/nftlist 0x… 824 0.55 6h\`\n`;
-  msg += `• \`/nftdelist <collection> <tokenId>\` — cancel your listing\n`;
-  msg += `\n*Track it:*\n`;
-  msg += `• \`/watch <0x…> [label]\` — floor-drop + pump pings on a collection\n`;
-  msg += `• \`/watchlist\` — your tracked collections (auto-named)\n`;
-  msg += `• \`/unwatch <watch_id>\` — stop tracking\n`;
-  msg += `• \`/alerts\` — ping settings\n`;
-  msg += `\n*Your stuff:*\n`;
-  msg += `• \`/nfts\` — what you own + live offers (tap to accept, tap to list)\n`;
-  msg += `• \`/wallet\` — HYPE + WHYPE balances, wrap/unwrap + faucet inside\n`;
-  msg += `• \`/wrap <amount|max>\` — wrap HYPE → WHYPE (bids escrow in WHYPE)\n`;
-  msg += `• \`/unwrap <amount|max>\` — unwrap WHYPE → HYPE\n`;
-  msg += `• \`/faucet\` — get testnet HYPE\n`;
-  msg += `\nBids escrow in *WHYPE* (wrapped HYPE) — convert inside \`/wallet\`. Kalos takes its marketplace fee on every trade; Zensweep adds nothing on testnet.`;
+  let msg = `ℹ️ *Zensweep — trade Ascend launches from Telegram*\n\n`;
+  msg += `*Check before you ape:*\n`;
+  msg += `• \`/launches\` — newest Ascend coins\n`;
+  msg += `• \`/token 0x…\` — pool, real fee, age, live quote\n`;
+  msg += `\n*Trade:*\n`;
+  msg += `• \`/buy 0x… 0.5\` — spend 0.5 HYPE on the coin\n`;
+  msg += `• \`/sell 0x… max\` — sell your whole bag back to HYPE\n`;
+  msg += `\nEvery trade is quoted and *simulated* first — if the simulation fails, nothing is sent.\n`;
+  msg += `\n*Wallet:*\n`;
+  msg += `• \`/wallet\` — HYPE + WHYPE balances\n`;
+  msg += `• \`/wrap <amount|max>\` — HYPE → WHYPE\n`;
+  msg += `• \`/unwrap <amount|max>\` — WHYPE → HYPE\n`;
+  msg += `• \`/export\` — your private key\n`;
+  msg += `\nAscend charges its pool fee (1–10%) on every trade, taken in the pair asset. Zensweep adds nothing.`;
   msg += `\n\n🆘 *Need help?* \`/support\` — questions, bugs, stuck funds.`;
   msg += `\n\n${BURNER_TIP}`;
   await ctx.reply(msg, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+}
+// ===========================================================================
+// Ascend trading — /token, /buy, /sell  (Elysium MAINNET, chain 99901)
+// ===========================================================================
+
+/**
+ * Pending Ascend trades, keyed by a short id so callbacks fit Telegram's
+ * 64-byte callback_data cap. `plan` is rebuilt at confirm time, never trusted
+ * from the button.
+ */
+const pendingAscend = new Map<
+  string,
+  {
+    kind: "buy" | "sell";
+    token: Address;
+    amountIn: bigint;
+    minOut: bigint;
+    userId: number;
+    expiresAt: number;
+  }
+>();
+
+function newAscendId(): string {
+  try {
+    const now = Date.now();
+    for (const [k, v] of pendingAscend) if (v.expiresAt < now) pendingAscend.delete(k);
+  } catch {}
+  for (let i = 0; i < 5; i++) {
+    const id = Math.random().toString(36).slice(2, 10);
+    if (id.length >= 6 && !pendingAscend.has(id)) return id;
+  }
+  return `${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`.slice(0, 10);
+}
+
+function isAddr(s: string): boolean {
+  return /^0x[a-fA-F0-9]{40}$/.test(s);
+}
+
+/** Human "4m ago" for a unix timestamp. */
+function ageAgo(unix: number | null): string {
+  if (!unix) return "unknown";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - unix);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+/** /launches — the live token feed: newest Ascend launches with fee + age. */
+export async function handleLaunches(ctx: Context) {
+  const loading = await ctx.reply("🔥 Loading recent launches…");
+  try {
+    const launches = await ascend.recentLaunches(8);
+    if (launches.length === 0) {
+      await ctx.api
+        .editMessageText(loading.chat.id, loading.message_id, "No recent Ascend launches found in the last window.")
+        .catch(() => {});
+      return;
+    }
+
+    const L: string[] = ["🔥 *Recent Ascend launches*", ""];
+    const kb = new InlineKeyboard();
+
+    for (const l of launches) {
+      const meta = await ascend.getTokenMeta(l.token).catch(() => null);
+      const sym = meta?.symbol ?? "?";
+      const nm = meta?.name ?? "Unknown";
+      L.push(`*${escMd(nm)}* (${escMd(sym)})`);
+      L.push(`\`${l.token}\``);
+      L.push(`fee \`${ascend.formatFeePct(l.fee)}\` · block ${l.blockNumber}`);
+      L.push("");
+      kb.text(`🪙 ${sym}`.slice(0, 30), `asc_tok_${l.token}`).row();
+    }
+
+    L.push("Tap a token to check it, or paste any CA with `/token 0x…`.");
+
+    const body = L.join("\n");
+    await ctx.api
+      .editMessageText(loading.chat.id, loading.message_id, body, { parse_mode: "Markdown", reply_markup: kb })
+      .catch(async () => {
+        await ctx.api
+          .editMessageText(loading.chat.id, loading.message_id, body.replace(/[*_`[\]]/g, ""), { reply_markup: kb })
+          .catch(() => {});
+      });
+  } catch (e: any) {
+    await ctx.api
+      .editMessageText(loading.chat.id, loading.message_id, `❌ ${escErr(e?.shortMessage ?? e?.message ?? e)}`, {
+        parse_mode: "Markdown",
+      })
+      .catch(() => {});
+  }
+}
+
+/** /token <CA> — the pre-trade card: pool, real fee, age, quote, safety. */
+/** /token <CA> — the pre-trade card: pool, real fee, age, quote, safety. */
+export async function handleTokenCommand(ctx: Context) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const raw = (ctx.match as string | undefined)?.trim() ?? "";
+  if (!raw) {
+    await safeReply(ctx, "Usage: `/token 0x…` — check an Ascend coin before you ape.");
+    return;
+  }
+  const ca = raw.split(/\s+/)[0];
+  if (!isAddr(ca)) {
+    await safeReply(ctx, "That doesn't look like a contract address. Paste the full `0x…` CA.");
+    return;
+  }
+  const token = ca as Address;
+
+  const loading = await ctx.reply("🔍 Reading pool on Elysium mainnet…");
+
+  try {
+    const [info, meta] = await Promise.all([ascend.getPoolInfo(token), ascend.getTokenMeta(token)]);
+    const api = await ascend.fetchAscendMetadata(token);
+
+    if (!info.exists) {
+      await ctx.api.editMessageText(
+        loading.chat.id,
+        loading.message_id,
+        [
+          `⚠️ *No Ascend pool for this CA*`,
+          ``,
+          `\`${token}\``,
+          ``,
+          meta.symbol ? `Token found on-chain: *${escMd(meta.name ?? "?")}* (${escMd(meta.symbol)})` : `No token contract found either.`,
+          ``,
+          `This CA was never launched through Ascend — so there's nothing to buy or sell here.`,
+        ].join("\n"),
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+      return;
+    }
+
+    // Live quote for a 0.1 quote-unit probe, purely to prove the pool is tradeable.
+    const probe = 10n ** BigInt(17);
+    const q = await ascend.quoteBuy(info, probe, meta.decimals);
+
+    const lines: string[] = [];
+    lines.push(`🪙 *${escMd(api?.name ?? meta.name ?? "Unknown")}* ${meta.symbol ? `(${escMd(meta.symbol)})` : ""}`);
+    if (api?.verified) lines.push(`✅ verified by Ascend`);
+    lines.push(``);
+    lines.push(`\`${token}\``);
+    lines.push(``);
+    lines.push(`*Pool*`);
+    lines.push(`• Fee: \`${info.feePct}\` ${info.fee >= 50000 ? "⚠️ high" : ""}`);
+    lines.push(`• Launched: ${ageAgo(info.launchedAt)}`);
+    lines.push(`• Status: ${info.paused ? "⏸ launchpad paused" : "🟢 trading"}`);
+    lines.push(`• Quote asset: \`${info.quote}\``);
+    lines.push(``);
+    lines.push(`*Liquidity check*`);
+    if (q) {
+      lines.push(`• 0.1 → \`${Number(q.amountOutFormatted).toLocaleString("en-US", { maximumFractionDigits: 4 })}\` ${meta.symbol ?? ""}`);
+    } else {
+      lines.push(`• 0.1 → ❌ quote reverted — pool may be empty or blocked`);
+    }
+    if (api?.website || api?.twitter || api?.telegram) {
+      lines.push(``);
+      lines.push(`*Links*`);
+      if (api.website) lines.push(`• ${api.website}`);
+      if (api.twitter) lines.push(`• ${api.twitter}`);
+      if (api.telegram) lines.push(`• ${api.telegram}`);
+    }
+    lines.push(``);
+    lines.push(`Buy: \`/buy ${token} <amount>\``);
+    lines.push(`Sell: \`/sell ${token} <amount|max>\``);
+    if (!ascend.tradingEnabled()) {
+      lines.push(``);
+      lines.push(`_Read-only mode — trading is disabled on this server._`);
+    }
+
+    await ctx.api
+      .editMessageText(loading.chat.id, loading.message_id, lines.join("\n"), { parse_mode: "Markdown" })
+      .catch(async () => {
+        await ctx.api
+          .editMessageText(loading.chat.id, loading.message_id, lines.join("\n").replace(/[*_`[\]]/g, ""))
+          .catch(() => {});
+      });
+  } catch (e: any) {
+    const msg = `❌ Couldn't read that CA: \`${escErr(e?.shortMessage ?? e?.message ?? e)}\``;
+    await ctx.api.editMessageText(loading.chat.id, loading.message_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+  }
+}
+
+
+/**
+ * Shared pre-trade builder for /buy and /sell.
+ * Quotes, applies slippage, builds the Universal Router plan, and SIMULATES it.
+ * Only a clean simulation is allowed to produce a confirm button.
+ */
+async function prepareAscendTrade(
+  ctx: Context,
+  userId: number,
+  kind: "buy" | "sell",
+  token: Address,
+  amountIn: bigint
+): Promise<{ ok: false; reason: string } | { ok: true; id: string }> {
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) return { ok: false, reason: "No wallet yet — run /start to create one." };
+
+  const info = await ascend.getPoolInfo(token);
+  if (!info.exists) return { ok: false, reason: "That CA has no Ascend pool — nothing to trade." };
+  if (info.paused) return { ok: false, reason: "The Ascend launchpad is paused right now." };
+
+  const meta = await ascend.getTokenMeta(token);
+  const SLIPPAGE_BPS = 1000; // 10% — launchpad pools are thin and move fast
+
+  const q = kind === "buy"
+    ? await ascend.quoteBuy(info, amountIn, meta.decimals)
+    : await ascend.quoteSell(info, amountIn, 18);
+  if (!q) return { ok: false, reason: "Quote reverted — the pool won't fill this size." };
+
+  const minOut = ascend.applySlippage(q.amountOut, SLIPPAGE_BPS);
+  const feeOnBuy = ascend.ascendFeeOn(amountIn, info.fee);
+
+  const plan = kind === "buy"
+    ? ascend.buildBuyPlan(info, amountIn, minOut, wallet.address, true)
+    : ascend.buildSellPlan(info, amountIn, minOut, wallet.address, true);
+
+  // Simulate the exact transaction. No gas is spent on failure.
+  const sim = await ascend.simulatePlan(plan, wallet.address);
+
+  const id = newAscendId();
+  pendingAscend.set(id, { kind, token, amountIn, minOut, userId, expiresAt: Date.now() + 3 * 60_000 });
+
+  const num = (v: bigint, dp: number) =>
+    Number(ascend.quoteOutToUnit(v, dp)).toLocaleString("en-US", { maximumFractionDigits: 4 });
+
+  const L: string[] = [];
+  L.push(kind === "buy" ? "🟢 *Confirm BUY*" : "🔴 *Confirm SELL*");
+  L.push("");
+  L.push(`*${escMd(meta.name ?? "?")}* ${meta.symbol ? `(${escMd(meta.symbol)})` : ""}`);
+  L.push(`\`${token}\``);
+  L.push("");
+  if (kind === "buy") {
+    L.push(`• Pay: \`${ascend.fmtHype(amountIn, 5)} HYPE\``);
+    L.push(`• Receive: \`~${num(q.amountOut, meta.decimals)}\` ${meta.symbol ?? ""}`);
+    L.push(`• Min out (10% slip): \`${num(minOut, meta.decimals)}\``);
+    L.push(`• Pool fee: \`${info.feePct}\` (\`${ascend.fmtHype(feeOnBuy, 6)} HYPE\`)`);
+  } else {
+    L.push(`• Sell: \`${num(amountIn, meta.decimals)}\` ${meta.symbol ?? ""}`);
+    L.push(`• Receive: \`~${ascend.fmtHype(q.amountOut, 6)} HYPE\``);
+    L.push(`• Min out (10% slip): \`${ascend.fmtHype(minOut, 6)} HYPE\``);
+    L.push(`• Pool fee: \`${info.feePct}\``);
+  }
+  L.push("");
+  if (sim.ok) {
+    L.push("✅ *Simulation passed* — no gas spent, would succeed.");
+  } else {
+    L.push("❌ *Simulation failed* — not sending.");
+    L.push(`\`${escErr(sim.error)}\``);
+  }
+
+  const kb = new InlineKeyboard();
+  if (sim.ok) kb.text(kind === "buy" ? "✅ Buy" : "✅ Sell", `asc_go_${id}`).row();
+  kb.text("✖ Cancel", "asc_no");
+
+  const body = L.join("\n");
+  const sent = await ctx.reply(body, { parse_mode: "Markdown", reply_markup: kb }).catch(async () => {
+    await ctx.reply(body.replace(/[*_`[\]]/g, ""), { reply_markup: kb }).catch(() => {});
+  });
+  if (!sent) return { ok: false, reason: "Couldn't send the confirmation card." };
+  return { ok: true, id };
+}
+
+
+/** /buy <CA> <HYPE amount> — spend `amount` HYPE on the coin. */
+export async function handleAscendBuy(ctx: Context) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const parts = ((ctx.match as string | undefined) ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2 || !isAddr(parts[0])) {
+    await safeReply(ctx, "Usage: `/buy 0x<CA> <HYPE amount>`\ne.g. `/buy 0x1234…abcd 0.5`");
+    return;
+  }
+  const token = parts[0] as Address;
+  const amt = Number(parts[1]);
+  if (!Number.isFinite(amt) || amt <= 0) {
+    await safeReply(ctx, "Amount must be a positive HYPE number.");
+    return;
+  }
+  if (amt > 100) {
+    await safeReply(ctx, "That's a big size — cap your first trades at 100 HYPE.");
+    return;
+  }
+
+  const loading = await ctx.reply("⚡ Quoting and simulating…");
+  try {
+    const res = await prepareAscendTrade(ctx, userId, "buy", token, parseEther(parts[1]));
+    if (!res.ok) {
+      await ctx.api
+        .editMessageText(loading.chat.id, loading.message_id, `⚠️ ${escMd(res.reason)}`, { parse_mode: "Markdown" })
+        .catch(() => {});
+    } else {
+      await ctx.api.deleteMessage(loading.chat.id, loading.message_id).catch(() => {});
+    }
+  } catch (e: any) {
+    await ctx.api
+      .editMessageText(loading.chat.id, loading.message_id, `❌ \`${escErr(e?.shortMessage ?? e?.message ?? e)}\``, {
+        parse_mode: "Markdown",
+      })
+      .catch(() => {});
+  }
+}
+
+/** /sell <CA> <amount|max> — sell the coin back into its pair. */
+export async function handleAscendSell(ctx: Context) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  const parts = ((ctx.match as string | undefined) ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2 || !isAddr(parts[0])) {
+    await safeReply(ctx, "Usage: `/sell 0x<CA> <amount|max>`");
+    return;
+  }
+  const token = parts[0] as Address;
+  const wallet = walletManager.getUserWallet(userId);
+  if (!wallet) {
+    await safeReply(ctx, "No wallet yet — run `/start` first.");
+    return;
+  }
+
+  const meta = await ascend.getTokenMeta(token);
+  const balance = await ascend.getTokenBalance(token, wallet.address);
+
+  let amountIn: bigint;
+  if (parts[1].toLowerCase() === "max") {
+    amountIn = balance;
+  } else {
+    const n = Number(parts[1]);
+    if (!Number.isFinite(n) || n <= 0) {
+      await safeReply(ctx, "Amount must be a positive number or `max`.");
+      return;
+    }
+    amountIn = parseEther(parts[1]);
+  }
+
+  if (amountIn <= 0n) {
+    await safeReply(ctx, `You hold no ${escMd(meta.symbol ?? "tokens")} in this wallet.`);
+    return;
+  }
+
+  const loading = await ctx.reply("⚡ Quoting and simulating…");
+  try {
+    const res = await prepareAscendTrade(ctx, userId, "sell", token, amountIn);
+    if (!res.ok) {
+      await ctx.api
+        .editMessageText(loading.chat.id, loading.message_id, `⚠️ ${escMd(res.reason)}`, { parse_mode: "Markdown" })
+        .catch(() => {});
+    } else {
+      await ctx.api.deleteMessage(loading.chat.id, loading.message_id).catch(() => {});
+    }
+  } catch (e: any) {
+    await ctx.api
+      .editMessageText(loading.chat.id, loading.message_id, `❌ \`${escErr(e?.shortMessage ?? e?.message ?? e)}\``, {
+        parse_mode: "Markdown",
+      })
+      .catch(() => {});
+  }
 }

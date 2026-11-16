@@ -32,24 +32,19 @@ async function main() {
 
   // Lean menu: feed, sweep, bids, listings, watches, inventory, wallet, help.
   // Keep in sync with renderHelpMenu + registered bot.command()s below.
+  // Ascend-only surface. The Kalos/NFT commands still exist in handlers.ts but
+  // are deliberately NOT listed here — frozen, not deleted.
   const kiwiCommands = [
-    { command: "start", description: "Open Zensweep — Kalos NFTs on Elysium" },
-    { command: "collections", description: "Live Kalos NFT collections & floors" },
-    { command: "sweep", description: "Sweep floor — /sweep [contract] [total] [n]" },
-    { command: "offer", description: "Place a bid — /offer [col] [id] [price]" },
-    { command: "accept", description: "Accept a bid — /accept [col] [id] [bidder]" },
-    { command: "nftlist", description: "List your NFT — /nftlist [col] [id] [price]" },
-    { command: "nftdelist", description: "Cancel listing — /nftdelist [col] [id]" },
-    { command: "watch", description: "Track a collection — /watch 0x…" },
-    { command: "watchlist", description: "Your tracked collections" },
-    { command: "unwatch", description: "Untrack — /unwatch [watch_id]" },
-    { command: "alerts", description: "Floor & deployment pings" },
-    { command: "nfts", description: "Your NFTs & live offers" },
-    { command: "addnft", description: "Pin a token — /addnft [contract] [id]" },
-    { command: "wallet", description: "HYPE + WHYPE balances & wrap" },
+    { command: "start", description: "Open Zensweep — Ascend trading on Elysium" },
+    { command: "launches", description: "New Ascend launches" },
+    { command: "token", description: "Check a CA — pool, fee, age, quote" },
+    { command: "buy", description: "Buy — /buy [CA] [HYPE]" },
+    { command: "sell", description: "Sell — /sell [CA] [amount|max]" },
+    { command: "wallet", description: "HYPE + WHYPE balances" },
     { command: "wrap", description: "Wrap HYPE → WHYPE — /wrap [amount|max]" },
     { command: "unwrap", description: "Unwrap WHYPE → HYPE — /unwrap [amount|max]" },
-    { command: "faucet", description: "Get testnet HYPE" },
+    { command: "export", description: "Export your private key" },
+    { command: "import", description: "Import an existing wallet" },
     { command: "support", description: "Help / support chat" },
     { command: "help", description: "How Zensweep works" },
   ];

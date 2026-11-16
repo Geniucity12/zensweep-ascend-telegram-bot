@@ -2,14 +2,16 @@ import { InlineKeyboard } from "grammy";
 import { SUPPORT_URL } from "../config";
 
 /**
- * Inline keyboards — lean bot: collections, sweep, bids, watches, inventory, wallet, help.
+ * Inline keyboards — Ascend trading bot.
+ *
+ * The Kalos/NFT surface is FROZEN: the code still exists in handlers.ts, but no
+ * NFT entry point is exposed here, in the command list, or in /start.
  */
-
 export const mainKeyboard = new InlineKeyboard()
-  .text("🖼️ Collections", "menu_collections")
-  .text("🖼️ My NFTs", "menu_nfts").row()
-  .text("👀 Watchlist", "menu_watchlist")
-  .text("🔔 Alerts", "menu_alerts").row()
+  .text("🪙 Check a CA", "menu_token")
+  .text("🟢 Buy", "menu_buy").row()
+  .text("🔴 Sell", "menu_sell")
+  .text("🔥 Launches", "menu_launches").row()
   .text("💰 Wallet", "menu_wallet")
   .text("ℹ️ Help", "menu_help").row()
   .url("🆘 Support", SUPPORT_URL);
