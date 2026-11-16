@@ -46,7 +46,29 @@ export const ELYSIUM: ChainConfig = {
   }),
 };
 
-export const SUPPORTED_CHAINS: ChainConfig[] = [ELYSIUM];
+/**
+ * Elysium MAINNET — chain 99901. Ascend's launchpad lives here (and only here);
+ * testnet 99801 has no Ascend contracts. Mainnet RPC is public:
+ * https://rpc.elysium.kinetiq.xyz  (verified: eth_chainId -> 0x1863d)
+ */
+export const ELYSIUM_MAINNET: ChainConfig = {
+  key: "elysium-mainnet",
+  name: "Elysium",
+  chainId: 99901,
+  rpcUrl: env("ELYSIUM_MAINNET_RPC_URL", "https://rpc.elysium.kinetiq.xyz"),
+  symbol: "HYPE",
+  explorerUrl: env("ELYSIUM_MAINNET_EXPLORER_URL", "https://elysium.kinetiq.xyz/explorer"),
+  testnet: false,
+  viemChain: defineChain({
+    id: 99901,
+    name: "Elysium",
+    nativeCurrency: { name: "HYPE", symbol: "HYPE", decimals: 18 },
+    rpcUrls: { default: { http: [env("ELYSIUM_MAINNET_RPC_URL", "https://rpc.elysium.kinetiq.xyz")] } },
+    blockExplorers: { default: { name: "Elysium Explorer", url: env("ELYSIUM_MAINNET_EXPLORER_URL", "https://elysium.kinetiq.xyz/explorer") } },
+  }),
+};
+
+export const SUPPORTED_CHAINS: ChainConfig[] = [ELYSIUM, ELYSIUM_MAINNET];
 const byKey = new Map<string, ChainConfig>(SUPPORTED_CHAINS.map((c) => [c.key, c]));
 export const DEFAULT_CHAIN_KEY = ELYSIUM.key;
 export function getChainConfig(key: string): ChainConfig { return byKey.get(key) ?? ELYSIUM; }
